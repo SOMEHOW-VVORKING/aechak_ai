@@ -1,0 +1,175 @@
+"""관점 정의와 툴 스키마.
+
+분류 11종을 한 프롬프트에 몰아넣지 않는다. 근거는 둘이다.
+
+첫째, 긴 지시 목록에서 개별 규칙의 준수율이 떨어진다. 지시 하나당 95%를 지켜도
+열 개를 동시에 지킬 확률은 그보다 훨씬 낮아진다.
+
+둘째가 더 중요하다. **관점 단위로 부분 실패를 추적할 수 있다.** 한 관점이 레이트 리밋으로
+돌지 못했을 때 그것을 "문제 없음"이 아니라 "미검사"로 기록해야 하고, 단일 호출에서는
+그 구분이 불가능하다.
+
+**관점을 분류 개수로 쪼개지 않고 참조 자료와 판단 양식으로 쪼갠다.** 라벨 이름만 다른
+근친 복제 프롬프트를 네 개 두면 실패 지점과 꼬리 지연만 늘어난다. 표시·광고는 정책 전문을
+읽어 의미를 판단하고, 행위·거래는 구조와 행위를 본다.
+
+성분 안전은 관점에서 뺐다. 금지 성분은 네거티브 리스트 매칭이라 0단 규칙이 결정론적으로
+판정하고, 모델에 맡길 근거가 없다.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from app.schemas.inspection import Perspective, TargetType, ViolationCategory
+
+
+@dataclass(frozen=True, slots=True)
+class PerspectiveSpec:
+    perspective: Perspective
+    categories: tuple[ViolationCategory, ...]
+    question: str
+
+
+_DISPLAY_ADS = PerspectiveSpec(
+    perspective=Perspective.DISPLAY_ADS,
+    categories=(
+        ViolationCategory.MEDICAL_CLAIM,
+        ViolationCategory.EFFICACY_OVERCLAIM,
+        ViolationCategory.FALSE_CLAIM,
+        ViolationCategory.DISPARAGEMENT,
+    ),
+    question=(
+        "당신의 관점은 **표시와 광고**입니다. 위 정책의 MEDICAL_CLAIM, EFFICACY_OVERCLAIM, "
+        "FALSE_CLAIM, DISPARAGEMENT 네 분류만 보십시오. 효능을 어디까지 말할 수 있는지가 "
+        "판단의 핵심이고, 도움을 줄 수 있다는 표현과 치료한다는 단정을 가르는 것이 당신의 일입니다."
+    ),
+)
+
+_CONDUCT_TRADE = PerspectiveSpec(
+    perspective=Perspective.CONDUCT_TRADE,
+    categories=(
+        ViolationCategory.CONTACT_INFO,
+        ViolationCategory.OFF_PLATFORM,
+        ViolationCategory.SPAM,
+        ViolationCategory.ABUSE,
+        ViolationCategory.PII,
+        ViolationCategory.IRRELEVANT,
+    ),
+    question=(
+        "당신의 관점은 **행위와 거래**입니다. 위 정책의 CONTACT_INFO, OFF_PLATFORM, SPAM, "
+        "ABUSE, PII, IRRELEVANT 여섯 분류만 보십시오. 효능 표현은 보지 마십시오. "
+        "명백한 연락처는 이미 규칙이 가렸으므로, 당신은 우회 표기와 맥락상의 유도를 찾으십시오."
+    ),
+)
+
+_SINGLE = PerspectiveSpec(
+    perspective=Perspective.ALL,
+    categories=tuple(c for c in ViolationCategory if c is not ViolationCategory.BANNED_INGREDIENT),
+    question=("분류 전체를 보십시오. 단 BANNED_INGREDIENT는 규칙 단계가 이미 판정했으므로 보지 마십시오."),
+)
+
+# 상품과 리뷰가 같은 두 관점을 쓴다. 리뷰도 효능을 주장할 수 있어서
+# ("이거 먹고 우리 아이 관절염 나았어요") 표시·광고 관점을 빼지 않는다.
+_BY_TARGET: dict[TargetType, tuple[PerspectiveSpec, ...]] = {
+    TargetType.PRODUCT: (_DISPLAY_ADS, _CONDUCT_TRADE),
+    TargetType.REVIEW: (_DISPLAY_ADS, _CONDUCT_TRADE),
+}
+
+
+def specs_for(target: TargetType, *, fanout: bool) -> tuple[PerspectiveSpec, ...]:
+    """팬아웃을 끄면 단일 판정으로 되돌린다. 기준선과 비교하기 위한 스위치다."""
+    if not fanout:
+        return (_SINGLE,)
+    return _BY_TARGET[target]
+
+
+def findings_tool(spec: PerspectiveSpec) -> dict[str, object]:
+    """``strict`` 툴로 구조화 출력을 강제한다. 본문 텍스트를 파싱하지 않는다.
+
+    열거에 반려가 없다. 모델이 낼 수 있는 최대치는 위반 보고이고, 상태를 바꾸는 것은 코드다.
+    """
+    return {
+        "name": "report_findings",
+        "description": "검수 결과를 보고한다. 위반이 없으면 findings를 빈 배열로 둔다.",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["findings"],
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["category", "quote", "reason", "suggestion"],
+                        "properties": {
+                            "category": {
+                                "type": "string",
+                                "enum": [c.value for c in spec.categories],
+                            },
+                            "quote": {
+                                "type": "string",
+                                "description": "검수 대상 텍스트에 실제로 있는 연속된 문자열",
+                            },
+                            "reason": {"type": "string"},
+                            "suggestion": {
+                                "type": ["string", "null"],
+                                "description": "상품이면 정책에 맞게 바꾼 문구. 리뷰는 null",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
+CRITIC_TOOL: dict[str, object] = {
+    "name": "review_finding",
+    "description": "앞선 판정이 오탐인지 판단한다.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["decision", "reason"],
+        "properties": {
+            "decision": {
+                "type": "string",
+                # UPHOLD 유지 / OVERTURN 오탐이라 뒤집음 / INSUFFICIENT 근거가 모자라 판단 불가
+                "enum": ["UPHOLD", "OVERTURN", "INSUFFICIENT"],
+            },
+            "reason": {"type": "string"},
+        },
+    },
+}
+
+REWRITE_TOOL: dict[str, object] = {
+    "name": "propose_rewrite",
+    "description": "정책을 지키면서 같은 뜻을 전하는 문구를 제안한다.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["sellerNotice", "rewrites"],
+        "properties": {
+            "sellerNotice": {
+                "type": "string",
+                "description": "셀러에게 보여 줄 한두 문장. 무엇을 왜 고쳐야 하는지",
+            },
+            "rewrites": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["original", "suggestion"],
+                    "properties": {
+                        "original": {"type": "string"},
+                        "suggestion": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
+}
