@@ -1,0 +1,119 @@
+# dev 배포: main 푸시 → 이미지 빌드·push → 태스크 정의 리비전 등록 → ECS 롤링 갱신
+#
+# uv 셋업이 없는 이유: 빌드는 Dockerfile 안(멀티스테이지)에서 돈다.
+# 테스트는 ci.yml이 PR에서 이미 통과시킨다.
+
+name: deploy-dev
+
+on:
+  push:
+    branches: [main] # AWS의 OIDC 신뢰 조건이 main 한정 — 다른 브랜치에선 인증 자체가 거부된다
+    # 이 워크플로는 필수 검사가 아니라 푸시 배포라서 경로 제외가 안전하다
+    # (필수 검사에 경로 제외를 걸면 "skipped라 머지 불가" 함정에 빠진다).
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch: # 시크릿·파라미터 등재 후 더미 커밋 없이 다시 돌릴 수 있게
+
+permissions:
+  id-token: write # OIDC 신분증 발급 — AWS 인증의 재료
+  contents: read
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false # 배포 직렬화 — 연속 푸시가 동시에 서비스를 건드리면 순서가 꼬인다
+
+env:
+  AWS_REGION: ap-northeast-2
+  # 아래 넷은 백엔드 레포 terraform이 소유하는 이름이다. 그쪽을 바꾸면 여기도 바꿔야 한다.
+  ECR_REPO: aechak-ai
+  ECS_CLUSTER: aechak-dev
+  ECS_SERVICE: aechak-ai-dev
+  TASK_FAMILY: aechak-ai-dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # 롤아웃 폴링(최대 25분) 보다 크게
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        # GitHub이 서명한 신분증으로 배포 전용 role의 임시 자격증명을 받는다 — 장기 access key가 없는 구조
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # 태그 == 커밋 해시 7자리 → 지금 떠 있는 이미지가 어느 커밋인지 되짚을 수 있다
+          IMAGE="$REGISTRY/$ECR_REPO:${GITHUB_SHA::7}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Register new task definition revision
+        id: taskdef
+        run: |
+          # 현재 taskdef를 복제해 image만 교체한다. environment·secrets 명세는 terraform 소관이라
+          # 여기서 건드리면 두 곳이 서로를 덮어쓴다.
+          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
+            --query taskDefinition > td.json
+          # del(...) — 조회 응답에만 붙는 읽기전용 필드. 남기면 등록 API가 거부한다.
+          jq --arg IMG "${{ steps.image.outputs.uri }}" \
+            '.containerDefinitions[0].image = $IMG
+             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                   .compatibilities, .registeredAt, .registeredBy)' td.json > td-new.json
+          NEW_ARN=$(aws ecs register-task-definition --cli-input-json file://td-new.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy (rolling update)
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.taskdef.outputs.arn }}"
+
+          # 이 서비스는 희망 태스크 수가 0으로 시작한다. taskdef의 초기 태그가 ECR에 없어서
+          # 1로 두면 존재하지 않는 이미지를 받으려는 태스크가 실패 루프에 빠지기 때문이다.
+          # 0인 동안에는 띄울 태스크가 없어 폴링할 것도 없는데, 그대로 성공으로 끝내면
+          # "아무 일도 일어나지 않음"과 "배포 성공"이 로그에서 구분되지 않는다. 그래서 명시한다.
+          DESIRED=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].desiredCount' --output text)
+          if [ "$DESIRED" = "0" ]; then
+            echo "::notice::희망 태스크 수가 0이라 이미지만 교체했고 태스크는 띄우지 않았다." \
+                 "백엔드 레포 terraform의 ai_desired_count를 1로 올려야 실제로 뜬다."
+            exit 0
+          fi
+
+          # 직접 폴링(30초×50=최대 25분)하는 이유 — `aws ecs wait services-stable`은 10분 하드 상한이라
+          # 서킷브레이커 롤백과 레이스가 나서 "실패인데 성공"으로 끝날 수 있다.
+          STATE=IN_PROGRESS
+          for i in $(seq 1 50); do
+            STATE=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].deployments[?status==`PRIMARY`].rolloutState | [0]' --output text)
+            echo "rollout: $STATE ($i/50)"
+            case "$STATE" in
+              COMPLETED) break ;;
+              FAILED) echo "::error::배포 실패 — 서킷브레이커가 롤백함"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          [ "$STATE" = "COMPLETED" ] || { echo "::error::25분 내 안정화 실패"; exit 1; }
+
+          # COMPLETED여도 롤백으로 옛 리비전이 안정화된 것일 수 있다 — 새 리비전이 맞는지 대조한다.
+          DEPLOYED=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].deployments[?status==`PRIMARY`].taskDefinition | [0]' --output text)
+          echo "PRIMARY taskdef: $DEPLOYED"
+          [ "$DEPLOYED" = "${{ steps.taskdef.outputs.arn }}" ] \
+            || { echo "::error::롤백됨 — 새 리비전이 헬스체크(/health)를 통과하지 못함"; exit 1; }
