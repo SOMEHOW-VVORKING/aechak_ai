@@ -94,7 +94,10 @@ async def test_요청_토픽에서_판정_토픽까지_흐른다(contract: Any) 
                         parsed = ContentVerdict.model_validate(envelope.payload_obj())
                         received[parsed.inspectionId] = parsed
 
-        assert received[1001].verdict is Verdict.PASS
+        # stub 모드라 모델 관점이 하나도 돌지 않는다. 그래서 깨끗한 상품도 통과가 아니라
+        # 판정 실패다 — 검사한 관점이 없으면 통과로 적지 않는다는 규칙을 그대로 받는다.
+        # 백엔드는 판정 실패를 받으면 노출을 건드리지 않으므로 상품은 그대로 보인다.
+        assert received[1001].verdict is Verdict.FAILED
         assert received[1002].verdict is Verdict.FLAG
         assert received[1002].sellerNotice is not None
         assert received[1002].calls == [], "규칙이 확정한 건에 모델을 부르면 안 된다"
