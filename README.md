@@ -77,6 +77,12 @@ cd ../ai && docker build -t aechak-ai:local .
 cd ../be && docker compose --profile ai up -d ai
 ```
 
+## 측정 하네스
+
+선별을 켤지 말지는 승급률로 정한다. 러너와 지표 정의, 손익분기표, 중단 규칙은
+`harness/README.md`에 있다. `harness/`는 `testpaths` 밖이라 pytest가 수집하지 않고,
+Dockerfile이 `app`과 `prompts`만 COPY하므로 이미지에도 들어가지 않는다.
+
 ## 계약
 
 `tests/contract/`의 표본은 **백엔드가 정본을 소유한다.** 출처는
