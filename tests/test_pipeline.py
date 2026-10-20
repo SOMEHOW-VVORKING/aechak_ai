@@ -361,3 +361,34 @@ async def test_비평을_타지_않은_판정은_뒤집힘_신호가_꺼진다(s
         verdict = await pipeline.run(request)
 
         assert verdict.criticOverturned is False, verdict.verdict
+
+
+async def test_뒤집힘_신호는_통과_판정에만_붙는다(settings: Settings) -> None:
+    """FLAG 와 뒤집힘이 함께 나가면 백엔드에서 완화가 사라진다.
+
+    백엔드 ``adminReviewReasonOf`` 의 when 순서가 ``criticOverturned`` 를 과탐 의심보다
+    먼저 보기 때문에, 그 조합이 가면 전건 금지 성분이어도 보류가 아니라 확정 반려가 된다.
+    여기서 그 조합을 만들지 않는 것이 그 결함을 잠복 상태로 묶어 둔다.
+    """
+    quote = "관절염 치료에 효과가 있습니다"
+    scripts = [
+        [ok(finding(quote)), ok(NO_FINDING), ok({"decision": "OVERTURN", "reason": "오탐"})],
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "UPHOLD", "reason": "타당"}),
+            ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
+        ],
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "INSUFFICIENT", "reason": "근거 부족"}),
+            ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
+        ],
+    ]
+    for scripted in scripts:
+        pipeline = InspectionPipeline(llm=FakeLlmClient(scripted), settings=settings)
+
+        verdict = await pipeline.run(product(quote))
+
+        assert not (verdict.criticOverturned and verdict.verdict is Verdict.FLAG), verdict.verdict
