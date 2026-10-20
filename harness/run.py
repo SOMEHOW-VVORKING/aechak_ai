@@ -31,10 +31,11 @@ from typing import Any
 import anthropic
 
 from app.inspection import rules, triage
+from app.inspection.perspectives import findings_tool, specs_for
 from app.inspection.pipeline import InspectionPipeline
 from app.inspection.policy import POLICY_PREFIX
 from app.llm.client import LlmClient
-from app.schemas.inspection import CallOutcome, Perspective, TargetType
+from app.schemas.inspection import CallOutcome, Perspective, PerspectiveOutcome, TargetType
 from app.settings import Settings
 from harness.cases import CASES, OVERBLOCK_SUSPECT, VIOLATING, Case, promotable
 
@@ -89,20 +90,27 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[index]
 
 
-def _triage_outcome(verdict: Any, triage_model: str) -> tuple[str, str | None]:
+def _triage_outcome(verdict: Any) -> tuple[str, str | None]:
     """판정 메시지만 보고 선별 결과를 되살린다.
 
-    원장과 관점 기록만으로 승급률을 셀 수 있다는 것을 여기서 쓴다. 선별 관점 행이 있으면
-    건너뛴 건이고, 선별 호출만 있으면 승급한 건이다.
+    선별 관점 행의 **유무**로 가르지 않는다. 승급 경로에도 행이 남기 때문이다
+    (``UNCHECKED`` + ``PROMOTED``). 유무로 가르면 승급 전건이 CLEAR로 분류되어 1순위 지표가
+    0%로 뒤집힌다. 행의 outcome이 판단 근거다.
+
+    호출을 모델 ID가 아니라 관점으로 고른다. 원장의 전용 관점이 선별을 식별하는 신호이고,
+    모델 ID는 설정으로 바뀐다.
     """
-    calls = [c for c in verdict.calls if c.modelId == triage_model]
+    calls = [c for c in verdict.calls if c.perspective is Perspective.TRIAGE]
     if not calls:
         return "OFF", None
     outcome = calls[0].outcome.value
-    if any(p.perspective is Perspective.TRIAGE for p in verdict.perspectives):
-        return "CLEAR", outcome
     if calls[0].outcome is not CallOutcome.SUCCESS:
+        # 끊긴 응답(TRUNCATED)도 여기로 떨어진다. 모델이 "더 보라"고 판단한 것과
+        # 아무 답도 못 한 것을 분자에서 뭉개면 승급률을 믿을 수 없다.
         return "FAILED", outcome
+    row = next((p for p in verdict.perspectives if p.perspective is Perspective.TRIAGE), None)
+    if row is not None and row.outcome is PerspectiveOutcome.CLEAR:
+        return "CLEAR", outcome
     return "PROMOTED", outcome
 
 
@@ -120,8 +128,8 @@ async def _run_pipeline_mode(
             verdict = await pipeline.run(request)
             elapsed = int((time.monotonic() - started) * 1000)
 
-            triage_outcome, call_outcome = _triage_outcome(verdict, tuned.triage_model)
-            triage_calls = [c for c in verdict.calls if c.modelId == tuned.triage_model]
+            triage_outcome, call_outcome = _triage_outcome(verdict)
+            triage_calls = [c for c in verdict.calls if c.perspective is Perspective.TRIAGE]
             records.append(
                 Record(
                     mode=mode,
@@ -198,54 +206,105 @@ async def _run_triage_only(
     return records
 
 
-async def _count_tokens(settings: Settings) -> dict[str, int]:
-    """접두부와 선별 프롬프트의 실제 토큰 수를 잰다. 거의 무료라 맨 먼저 돈다."""
+@dataclass(frozen=True, slots=True)
+class CachePrefixTarget:
+    """토큰을 재야 하는 캐시 접두부 하나.
+
+    접두부는 ``POLICY_PREFIX`` 문자열이 아니다. 캐시 렌더 순서가
+    ``tools -> system -> messages``이고 ``cache_control``이 마지막 system 블록에 있어서
+    **tools가 함께 캐시된다.** ``findings_tool``은 관점마다 enum 목록이 달라 tools가 다르고,
+    따라서 캐시 엔트리도 관점별로 갈라진다. system만 세면 둘 중 어느 것도 재지 않는 셈이다.
+    """
+
+    name: str
+    model: str
+    system: list[dict[str, Any]]
+    tools: list[dict[str, Any]]
+    min_tokens: int
+    required: bool
+
+
+def cache_prefix_targets(settings: Settings) -> list[CachePrefixTarget]:
+    """실제로 캐시되는 접두부들을 조립한다. 키 없이 도는 부분이라 테스트가 소유한다."""
+    targets = [
+        CachePrefixTarget(
+            name="triage_prompt_on_haiku",
+            model=settings.triage_model,
+            system=triage.triage_system_blocks(),
+            tools=[triage.TRIAGE_TOOL],
+            min_tokens=HAIKU_CACHE_MIN_TOKENS,
+            # 선별은 캐시를 안 쓰는 것이 채택안이다. 하한 미달이 실패가 아니라 근거다.
+            required=False,
+        )
+    ]
+    for spec in specs_for(TargetType.PRODUCT, fanout=settings.perspective_fanout):
+        targets.append(
+            CachePrefixTarget(
+                name=f"perspective_{spec.perspective.value.lower()}_on_sonnet",
+                model=settings.screening_model,
+                system=[{"type": "text", "text": POLICY_PREFIX}],
+                tools=[findings_tool(spec)],
+                min_tokens=SONNET_CACHE_MIN_TOKENS,
+                required=True,
+            )
+        )
+    return targets
+
+
+async def _count_tokens(settings: Settings) -> list[tuple[CachePrefixTarget, int]]:
+    """접두부들의 실제 토큰 수를 잰다. 거의 무료라 맨 먼저 돈다."""
     client = anthropic.AsyncAnthropic(
         api_key=settings.anthropic_api_key, timeout=settings.request_timeout_seconds
     )
-    counts: dict[str, int] = {}
+    counted: list[tuple[CachePrefixTarget, int]] = []
     try:
-        for name, model, text in (
-            ("policy_prefix_on_sonnet", settings.screening_model, POLICY_PREFIX),
-            ("triage_prompt_on_haiku", settings.triage_model, triage.TRIAGE_PROMPT),
-        ):
-            counted = await client.messages.count_tokens(
-                model=model,
-                system=[{"type": "text", "text": text}],
+        for target in cache_prefix_targets(settings):
+            result = await client.messages.count_tokens(
+                model=target.model,
+                system=target.system,
+                tools=target.tools,
                 messages=[{"role": "user", "content": [{"type": "text", "text": "x"}]}],
             )
-            counts[name] = counted.input_tokens
+            counted.append((target, result.input_tokens))
     finally:
         await client.close()
-    return counts
+    return counted
 
 
-def _report_tokens(counts: dict[str, int]) -> int:
-    policy = counts["policy_prefix_on_sonnet"]
-    triage_tokens = counts["triage_prompt_on_haiku"]
+def _report_tokens(counted: list[tuple[CachePrefixTarget, int]]) -> int:
+    """하한을 단언한다. 표의 토큰 전제를 **치환하지는 않는다.**
+
+    치환하려면 출력 토큰 전제까지 같이 재야 하고 그건 실호출이다. 여기서는 측정값과 가정값을
+    나란히 찍어 사람이 표를 고칠지 정한다 — 가정값 위에 선 숫자를 측정값처럼 쓰지 않는 것이
+    이 출력의 목적이다.
+    """
     print()
-    print(f"POLICY_PREFIX  {policy:>6} 토큰  (Sonnet 최소 {SONNET_CACHE_MIN_TOKENS})")
-    print(f"TRIAGE_PROMPT  {triage_tokens:>6} 토큰  (Haiku 최소 {HAIKU_CACHE_MIN_TOKENS})")
+    for target, tokens in counted:
+        margin = (tokens - target.min_tokens) / target.min_tokens
+        print(f"{target.name:40} {tokens:>6} 토큰  (최소 {target.min_tokens}, 여유 {margin:+.0%})")
     print()
 
     failed = False
-    if policy < SONNET_CACHE_MIN_TOKENS:
-        print(
-            f"[치명] POLICY_PREFIX가 {policy} 토큰으로 Sonnet 최소치 {SONNET_CACHE_MIN_TOKENS}에 못 미친다. "
-            "관점 호출의 캐시가 에러 없이 죽어 비용이 조용히 두 배 가까이 뛴다."
-        )
-        failed = True
-    else:
-        margin = (policy - SONNET_CACHE_MIN_TOKENS) / SONNET_CACHE_MIN_TOKENS
-        print(f"POLICY_PREFIX는 Sonnet 최소치 위다. 여유 {margin:.0%}. 정책 문구를 줄이면 캐시가 죽는다.")
+    for target, tokens in counted:
+        if tokens >= target.min_tokens:
+            continue
+        if target.required:
+            print(
+                f"[치명] {target.name}이 {tokens} 토큰으로 최소치 {target.min_tokens}에 못 미친다. "
+                "캐시가 에러 없이 죽어 관점 호출 비용이 조용히 두 배 가까이 뛴다."
+            )
+            failed = True
+        else:
+            print(
+                f"{target.name}은 최소치 {target.min_tokens}에 못 미친다. "
+                "cache_control을 붙여도 에러 없이 무시된다 — 선별이 캐시를 안 쓰는 근거다."
+            )
 
-    if policy < HAIKU_CACHE_MIN_TOKENS:
-        print(
-            f"POLICY_PREFIX는 Haiku 최소치 {HAIKU_CACHE_MIN_TOKENS}에 못 미친다. "
-            "Haiku에 붙이면 cache_control이 에러 없이 무시된다. 선별이 접두부를 재사용하지 않는 근거다."
-        )
-    if triage_tokens >= HAIKU_CACHE_MIN_TOKENS:
-        print("[확인 필요] 선별 프롬프트가 Haiku 최소치를 넘었다. 캐시를 켜는 쪽을 다시 계산할 것.")
+    print()
+    print(
+        f"손익분기표의 토큰 전제는 {_ESTIMATE_MICRO_USD}를 만든 가정이고 이 명령은 그것을 "
+        "치환하지 않는다. 위 측정값과 어긋나면 harness/README.md의 표를 손으로 고칠 것."
+    )
     return 1 if failed else 0
 
 

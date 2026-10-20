@@ -13,9 +13,11 @@ from typing import Any
 import anthropic
 import httpx2
 import pytest
+from pydantic import ValidationError
 
 from app.inspection.triage import TRIAGE_TOOL
 from app.llm.client import LlmClient, UnknownModelPricing, cost_micro_usd, validate_pricing
+from app.schemas.inspection import CallOutcome
 from app.settings import Settings
 
 TOOL: dict[str, Any] = {
@@ -206,3 +208,125 @@ def test_설정된_모든_모델이_가격표에_있다() -> None:
 
     with pytest.raises(UnknownModelPricing):
         validate_pricing(Settings(triage_model="없는모델").model_ids())
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+async def test_빈_effort는_output_config를_보내지_않는다(
+    client: LlmClient, recorder: BodyRecorder, blank: str
+) -> None:
+    """ECS taskdef·.env·SSM에서 "값을 비운다"가 None이 아니라 빈 문자열로 들어온다.
+
+    그걸 그대로 실으면 ``{"effort": ""}``가 전송돼 선별 전건이 400이고, SCHEMA_INVALID로
+    분류돼 스키마 오류로 숨는다. 모델 ID 오타는 부팅에서 잡히지만 effort 값은 아무도 안 본다.
+    """
+    await client.call_tool(
+        model="claude-haiku-4-5",
+        effort=blank,
+        max_tokens=512,
+        system_blocks=[{"type": "text", "text": "선별 프롬프트"}],
+        user_content=[{"type": "text", "text": "본문"}],
+        tool=TRIAGE_TOOL,
+        request_id="insp-blank",
+    )
+
+    assert "output_config" not in recorder.bodies[0], f"effort={blank!r}가 본문에 실렸다"
+
+
+def test_빈_환경변수는_선별_effort를_미지정으로_접는다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AECHAK_AI_TRIAGE_EFFORT", "")
+
+    assert Settings().triage_effort is None
+
+
+def test_모르는_effort_등급은_부팅에서_거부된다() -> None:
+    """``none``·``LOW``·오타가 조용히 400을 만들지 않게 설정 검증에서 떨어뜨린다."""
+    for bad in ("none", "null", "LOW", "lowish"):
+        with pytest.raises(ValidationError):
+            Settings(triage_effort=bad)
+
+
+def test_관점_effort를_비우면_부팅에서_거부된다() -> None:
+    """관점 호출의 등급을 비우면 모델 기본값(high)으로 조용히 올라간다. 400보다 더 조용하다."""
+    with pytest.raises(ValidationError):
+        Settings(screening_effort="")
+
+
+async def test_SDK_재시도를_끈다(recorder: BodyRecorder) -> None:
+    """선별은 재시도하지 않는다는 독스트링이 사실이어야 한다.
+
+    SDK 기본값이 ``max_retries=2``라서 두지 않으면 429 한 건이 HTTP 3회가 된다 —
+    근거로 든 레이트 리밋 상황에서 리밋을 3배로 미는 셈이다.
+    """
+    hits = 0
+
+    def rate_limited(request: httpx2.Request) -> httpx2.Response:
+        nonlocal hits
+        hits += 1
+        return httpx2.Response(429, json={"type": "error", "error": {"type": "rate_limit_error"}})
+
+    llm = LlmClient(api_key="test", timeout_seconds=60.0)
+    llm._client = llm._client.with_options(
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(rate_limited))
+    )
+
+    result = await llm.call_tool(
+        model="claude-haiku-4-5",
+        effort=None,
+        max_tokens=512,
+        system_blocks=[{"type": "text", "text": "선별 프롬프트"}],
+        user_content=[{"type": "text", "text": "본문"}],
+        tool=TRIAGE_TOOL,
+        request_id="insp-429",
+    )
+
+    assert result.outcome is CallOutcome.RATE_LIMITED
+    assert hits == 1, f"HTTP {hits}회. SDK 재시도가 살아 있다"
+
+
+async def test_상한에_걸려_끊긴_응답은_SUCCESS가_아니다() -> None:
+    """``stop_reason=max_tokens``면 ``tool_use.input``이 dict로 보여도 중간까지만 채워져 있다.
+
+    SUCCESS로 적으면 끊긴 호출이 승급률 분자에서 "모델이 더 보라고 했다"와 같아진다.
+    """
+
+    def truncated(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-haiku-4-5",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tu_1",
+                        "name": "triage_content",
+                        "input": {"reason": "효능 표현이 의"},
+                    }
+                ],
+                "stop_reason": "max_tokens",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 300, "output_tokens": 512},
+            },
+        )
+
+    llm = LlmClient(api_key="test", timeout_seconds=60.0)
+    llm._client = llm._client.with_options(
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(truncated))
+    )
+
+    result = await llm.call_tool(
+        model="claude-haiku-4-5",
+        effort=None,
+        max_tokens=512,
+        system_blocks=[{"type": "text", "text": "선별 프롬프트"}],
+        user_content=[{"type": "text", "text": "본문"}],
+        tool=TRIAGE_TOOL,
+        request_id="insp-trunc",
+    )
+
+    assert result.outcome is CallOutcome.TRUNCATED
+    assert result.ok is False, "끊긴 응답을 ok로 읽으면 반쪽 tool_input을 판정에 쓴다"

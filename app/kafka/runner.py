@@ -58,6 +58,9 @@ class InspectionRunner:
             # 수동 커밋이어야 발행 확인 후 커밋이라는 순서를 지킬 수 있다
             enable_auto_commit=False,
             auto_offset_reset="earliest",
+            # 한 건의 처리는 모델 호출 다섯 번까지 간다. 기본 300,000ms로는 재시도 폭풍 한 번이
+            # 리밸런스를 유발하고, 커밋 안 된 오프셋이 재배달돼 같은 상품을 전액 재검수한다.
+            max_poll_interval_ms=self._settings.kafka_max_poll_interval_ms,
         )
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self._settings.kafka_bootstrap_servers,

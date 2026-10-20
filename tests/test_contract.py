@@ -116,3 +116,44 @@ def test_우리가_감싼_엔벨로프도_페이로드가_문자열이다(contra
     )
     assert set(emitted) == set(contract("verdict-envelope.json")), "엔벨로프 필드는 여덟 개다"
     assert emitted["traceId"] == "trace-1", "상관키는 새로 만들지 않고 승계한다"
+
+
+def test_뒤집힘_신호를_백엔드_표본에서_읽고_같은_키로_되돌린다(contract: Any) -> None:
+    raw = contract("content-verdict-triage-promoted.json")
+
+    verdict = ContentVerdict.model_validate(raw)
+
+    assert verdict.criticOverturned is True, (
+        "이 필드가 없으면 백엔드의 어드민 '비평 뒤집음' 경로가 처음부터 발화하지 않는다"
+    )
+    emitted = json.loads(verdict.model_dump_json())
+    assert set(emitted) == set(raw), "키 집합이 다르면 백엔드가 에러 없이 일부를 떨어뜨린다"
+
+
+def test_뒤집히지_않은_표본은_신호가_꺼져_있다(contract: Any) -> None:
+    for name in ("content-verdict.json", "content-verdict-triage.json"):
+        verdict = ContentVerdict.model_validate(contract(name))
+
+        assert verdict.criticOverturned is False, f"{name}"
+
+
+def test_승급_표본은_선별_관점을_미검사로_남긴다(contract: Any) -> None:
+    """승급 경로의 TRIAGE 행이 백엔드 계약의 일부다.
+
+    승급은 판정을 내린 것이 아니라 더 보라고 넘긴 것이라 CLEAR로 적으면 거짓이 된다.
+    """
+    verdict = ContentVerdict.model_validate(contract("content-verdict-triage-promoted.json"))
+
+    rows = {p.perspective: p for p in verdict.perspectives}
+
+    assert rows[Perspective.TRIAGE].outcome is PerspectiveOutcome.UNCHECKED
+    assert rows[Perspective.TRIAGE].skipReason == "PROMOTED"
+
+
+def test_건너뛴_표본은_선별_관점이_통과다(contract: Any) -> None:
+    verdict = ContentVerdict.model_validate(contract("content-verdict-triage.json"))
+
+    rows = {p.perspective: p for p in verdict.perspectives}
+
+    assert rows[Perspective.TRIAGE].outcome is PerspectiveOutcome.CLEAR
+    assert Perspective.DISPLAY_ADS not in rows, "건너뛴 건에 관점 행이 있으면 호출을 쏜 것이다"

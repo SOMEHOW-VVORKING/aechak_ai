@@ -7,8 +7,9 @@ anthropic SDK 직접이다. 근거는 ``docs/adr-001-no-orchestration-framework.
     N0 규칙(코드, 호출 0)
       └ 결정론적 위반이 있으면 모델을 부르지 않고 확정한다
     N0.5 선별(Haiku 1회, 설정으로 켠다)
+      ├ 규칙이 비차단으로라도 적중한 건은 묻지 않고 바로 승급한다
       └ 깨끗하다고 하면 N1을 건너뛰고 통과로 조기 반환한다. 그 외는 전부 승급한다
-    N1a 표시·광고 판정 → N1b 행위·거래 판정   (순차. 캐시 접두부를 한 번만 쓴다)
+    N1a 표시·광고 판정 → N1b 행위·거래 판정   (순차. 레이트 리밋 압력을 분산한다)
     N2 집계(코드, 호출 0)  3상태 OR + 인용 검증
     N3 반박 critic(다른 모델)  위반 판정일 때만
     N4 수정 문구 제안  확정 위반이고 상품일 때만
@@ -51,15 +52,11 @@ from app.schemas.inspection import (
     Verdict,
     Violation,
 )
-from app.settings import Settings
+from app.settings import JUDGE_RETRY_DELAY_SECONDS, Settings
 
 log = logging.getLogger(__name__)
 
 InspectionRequest = ProductInspectionRequest | ReviewInspectionRequest
-
-# 관점 호출이 실패했을 때 한 번만 다시 시도한다. 두 번 넘게 매달리면
-# 카프카 파티션이 그만큼 막히고, 미검사로 기록하는 편이 안전하다.
-_RETRY_DELAY_SECONDS = 2.0
 
 
 class InspectionPipeline:
@@ -133,27 +130,55 @@ class InspectionPipeline:
             )
 
         if self._settings.enable_triage:
-            # N0.5 — 선별. 깨끗하다고 하면 관점 호출을 아예 쏘지 않는다.
-            outcome = await self._triage(request, rule_result.redacted, request_id, calls)
-            if outcome.skip:
-                # 집계를 타지 않고 조기 반환한다. 쏜 관점이 0건이라 집계에 넣으면 판정 실패가 된다.
+            # N0.5 — 선별. 어느 길로 가든 관점 한 줄을 남긴다. 그 줄이 백엔드의 누락률 측정과
+            # 하네스의 승급률 분모를 만든다. 아래 집계는 쏜 관점만 세므로 이 줄이 통과를
+            # 만들지는 않는다.
+            if rule_result.hits:
+                # 규칙이 비차단으로라도 적중했으면 선별에 묻지 않고 바로 승급한다. 물으면
+                # Haiku 1회로 CLEAR가 나올 수 있고, 그러면 결정론 계층이 의심한 건이
+                # 파이프라인에서 가장 약한 심사를 받는다. 규칙은 정규식이라 주입으로 뚫리지
+                # 않으므로 그 적중을 모델 판단보다 더 믿는다.
                 perspectives.append(
-                    PerspectiveResult(perspective=Perspective.TRIAGE, outcome=PerspectiveOutcome.CLEAR)
+                    PerspectiveResult(
+                        perspective=Perspective.TRIAGE,
+                        outcome=PerspectiveOutcome.UNCHECKED,
+                        skipReason="RULE_HIT",
+                    )
                 )
-                log.info("선별이 통과시켰다. 관점 호출을 건너뛴다. request_id=%s", request_id)
-                return self._finalize(
-                    request,
-                    verdict=Verdict.PASS,
-                    perspectives=perspectives,
-                    violations=violations,
-                    calls=calls,
-                    seller_notice=None,
+                log.info("규칙 적중으로 선별을 건너뛰고 승급한다. request_id=%s", request_id)
+            else:
+                outcome = await self._triage(request, rule_result.redacted, request_id, calls)
+                if outcome.skip:
+                    # 집계를 타지 않고 조기 반환한다. 쏜 관점이 0건이라 집계에 넣으면
+                    # 판정 실패가 된다.
+                    perspectives.append(
+                        PerspectiveResult(perspective=Perspective.TRIAGE, outcome=PerspectiveOutcome.CLEAR)
+                    )
+                    log.info("선별이 통과시켰다. 관점 호출을 건너뛴다. request_id=%s", request_id)
+                    return self._finalize(
+                        request,
+                        verdict=Verdict.PASS,
+                        perspectives=perspectives,
+                        violations=violations,
+                        calls=calls,
+                        seller_notice=None,
+                    )
+                # CLEAR로 적지 않는다. 그게 거짓이기 때문이다 — 선별은 판정한 것이 아니라
+                # 더 보라고 넘겼다.
+                perspectives.append(
+                    PerspectiveResult(
+                        perspective=Perspective.TRIAGE,
+                        outcome=PerspectiveOutcome.UNCHECKED,
+                        skipReason="PROMOTED",
+                    )
                 )
-            # 승급 경로는 perspectives에 선별 줄을 남기지 않는다. 이유는 PR 본문에 적었다.
 
-        # N1 — 관점 판정. 순차로 돌려 캐시 접두부를 한 번만 쓴다.
-        # 관점이 둘뿐이라 직렬 1라운드를 더 쓰는 대가가 작고, 병렬로 쏘면
-        # 두 호출이 동시에 캐시를 쓰려 해 접두부 과금이 두 번 난다.
+        # N1 — 관점 판정. 순차로 돈다.
+        #
+        # 캐시 접두부를 아낀다는 이유로 직렬인 것이 아니다. 캐시 렌더 순서가
+        # tools -> system -> messages이고 findings_tool이 관점마다 다른 enum을 싣기 때문에
+        # 두 호출의 접두부는 애초에 다르고, 캐시 엔트리도 관점별로 갈라진다.
+        # 직렬로 두는 이유는 레이트 리밋 압력을 한 요청 안에서 분산하는 것 하나다.
         specs = specs_for(request.target_type, fanout=self._settings.perspective_fanout)
         for spec in specs:
             result = await self._judge(spec, request, rule_result.redacted, request_id)
@@ -170,18 +195,14 @@ class InspectionPipeline:
         # 관점 하나만 실패한 경우는 다른 관점이 실제로 봤으므로 통과로 둔다.
         #
         # "봤다"로 세는 것은 이번 요청에서 실제로 쏜 관점뿐이다. 규칙과 선별은 specs에 없어
-        # 구조적으로 빠진다. 제외 목록이 아니라 포함 목록인 이유는 실패 방향이다 — 새 관점을
-        # 빠뜨리면 판정 실패로 떨어지고, 제외 목록은 새 비판정 관점을 빠뜨리면 통과가 샌다.
+        # 구조적으로 빠진다. 셈 규칙은 countable_perspectives가 소유한다.
         dispatched = {spec.perspective for spec in specs}
-        checked = [
-            p
-            for p in perspectives
-            if p.perspective in dispatched and p.outcome is not PerspectiveOutcome.UNCHECKED
-        ]
+        checked = countable_perspectives(perspectives, dispatched)
         # 위반 쪽은 반대로 제외 목록을 쓴다. 여기서 빠뜨리면 보류로 떨어져 안전한 방향이다.
         model_violations = [v for v in violations if v.perspective is not Perspective.RULE]
         verdict = Verdict.FLAG if model_violations else (Verdict.PASS if checked else Verdict.FAILED)
         seller_notice: str | None = None
+        critic_overturned = False
 
         if verdict is Verdict.FLAG:
             # N3 — 반박. 셀러를 잘못 막는 비용이 커서 다른 모델에게 오탐 여부를 묻는다.
@@ -190,6 +211,9 @@ class InspectionPipeline:
                 verdict = Verdict.PASS
                 violations = [v for v in violations if v.perspective is Perspective.RULE]
                 model_violations = []
+                # 뒤집었다는 사실을 계약에 싣는다. 이걸 빼면 백엔드가 깨끗한 통과와 구분할 수
+                # 없어 어드민 "비평 뒤집음" 경로가 아예 발화하지 않는다.
+                critic_overturned = True
 
         if verdict is Verdict.FLAG and request.target_type is TargetType.PRODUCT:
             # N4 — 수정 문구. 차단이 아니라 고칠 수 있게 안내하는 것이 이 기능의 목적이다.
@@ -204,6 +228,7 @@ class InspectionPipeline:
             violations=violations,
             calls=calls,
             seller_notice=seller_notice,
+            critic_overturned=critic_overturned,
         )
 
     async def _triage(
@@ -258,10 +283,14 @@ class InspectionPipeline:
             tool=tool,
             request_id=request_id,
         )
-        if result.ok or result.outcome is CallOutcome.BUDGET_EXHAUSTED:
+        # 예산 소진과 상한 초과는 다시 쏴도 같은 결과다. 재시도는 출력 토큰만 한 번 더 태운다.
+        if result.ok or result.outcome in (CallOutcome.BUDGET_EXHAUSTED, CallOutcome.TRUNCATED):
             return result
 
-        await asyncio.sleep(_RETRY_DELAY_SECONDS)
+        # 한 번만 다시 시도한다. 두 번 넘게 매달리면 카프카 파티션이 그만큼 막히고,
+        # 미검사로 기록하는 편이 안전하다. 대기 시간이 설정 모듈에 있는 이유는
+        # Settings.worst_case_handle_seconds()가 같은 값을 봐야 하기 때문이다.
+        await asyncio.sleep(JUDGE_RETRY_DELAY_SECONDS)
         return await self._llm.call_tool(
             model=self._settings.screening_model,
             effort=self._settings.screening_effort,
@@ -488,6 +517,7 @@ class InspectionPipeline:
         violations: list[Violation],
         calls: list[CallUsage],
         seller_notice: str | None,
+        critic_overturned: bool = False,
     ) -> ContentVerdict:
         return ContentVerdict(
             inspectionId=request.inspectionId,
@@ -499,14 +529,36 @@ class InspectionPipeline:
             violations=violations,
             sellerNotice=seller_notice if request.target_type is TargetType.PRODUCT else None,
             calls=calls,
+            criticOverturned=critic_overturned,
             promptVersion=self._prompt_version(),
             decidedAt=datetime.now(UTC),
         )
 
 
+def countable_perspectives(
+    perspectives: list[PerspectiveResult],
+    dispatched: set[Perspective],
+) -> list[PerspectiveResult]:
+    """모델이 실제로 봤다고 셀 수 있는 관점만 고른다.
+
+    제외 목록이 아니라 포함 목록인 이유는 실패 방향이다 — 새 관점을 빠뜨리면 판정 실패로
+    떨어지고, 제외 목록은 새 비판정 관점(규칙·선별)을 빠뜨리면 통과가 샌다.
+    """
+    return [
+        p
+        for p in perspectives
+        if p.perspective in dispatched and p.outcome is not PerspectiveOutcome.UNCHECKED
+    ]
+
+
 def _system_blocks() -> list[dict[str, Any]]:
-    """정책 접두부에 캐시 지점을 하나 둔다. 관점별로 쪼개지 않는다 —
-    쪼개면 캐시 이름공간이 관점 수만큼 갈라져 각각 최소 길이를 따로 넘겨야 한다."""
+    """정책 접두부에 캐시 지점을 하나 둔다. 관점 질문은 여기에 넣지 않는다.
+
+    접두부를 관점별로 쪼개면 각 엔트리가 최소 길이를 따로 넘겨야 한다. 다만 **지금도
+    엔트리는 관점별로 갈라져 있다** — 렌더 순서가 tools -> system이라 관점마다 다른
+    findings_tool이 같은 접두부에 함께 캐시된다. system을 공유하는 것은 그 조건에서
+    접두부를 최대한 길게 유지하는 선택이고, 접두부 공유로 과금이 한 번만 나지는 않는다.
+    """
     return [
         {
             "type": "text",
@@ -519,7 +571,8 @@ def _system_blocks() -> list[dict[str, Any]]:
 def _user_content(request: InspectionRequest, redacted: str, question: str) -> list[dict[str, Any]]:
     """대상 본문을 구분자로 감싸고 관점 질문을 뒤에 붙인다.
 
-    질문을 접두부에 넣으면 캐시가 관점마다 갈라진다. 그래서 반드시 접미부다.
+    질문을 system 접두부에 넣으면 캐시 지점 뒤의 바이트가 관점마다 달라져 접두부가
+    더 짧아진다. 그래서 반드시 접미부다.
     """
     header = f'<대상 종류="{request.target_type.value}">'
     if isinstance(request, ProductInspectionRequest):

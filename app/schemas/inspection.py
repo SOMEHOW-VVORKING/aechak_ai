@@ -65,6 +65,8 @@ class CallOutcome(StrEnum):
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     REFUSED = "REFUSED"
     SCHEMA_INVALID = "SCHEMA_INVALID"
+    # max_tokens에 걸려 끊긴 응답. 스키마 오류와 섞으면 상한 조정이 필요한 것을 모른다
+    TRUNCATED = "TRUNCATED"
     ERROR = "ERROR"
 
 
@@ -170,6 +172,8 @@ class ContentVerdict(BaseModel):
     violations: list[Violation]
     sellerNotice: str | None = None
     calls: list[CallUsage]
+    # 비평이 모델 위반을 뒤집어 통과로 바꿨는지. 백엔드 어드민 검수 라우팅이 보는 신호다
+    criticOverturned: bool = False
     promptVersion: str
     schemaVersion: int = SCHEMA_VERSION
     decidedAt: datetime

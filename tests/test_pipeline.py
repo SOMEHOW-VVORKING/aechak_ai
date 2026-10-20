@@ -307,3 +307,57 @@ async def test_팬아웃_스위치가_호출_수를_바꾼다(settings: Settings
     await pipeline.run(product("글루코사민 함유"))
 
     assert len(llm.calls) == (2 if fanout else 1)
+
+
+async def test_비평이_뒤집으면_그_사실을_판정에_싣는다(settings: Settings) -> None:
+    """뒤집었다는 사실이 메시지에 없으면 백엔드가 깨끗한 통과와 구분할 수 없다.
+
+    백엔드는 이 신호로 어드민 큐 등재와 보류를 정한다. 비지 않으면 조용히 통과한다.
+    """
+    quote = "관절 건강에 도움을 줄 수 있습니다"
+    llm = FakeLlmClient(
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "OVERTURN", "reason": "정상적인 표현"}),
+        ]
+    )
+    pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+    verdict = await pipeline.run(product(quote))
+
+    assert verdict.verdict is Verdict.PASS
+    assert verdict.criticOverturned is True
+
+
+async def test_비평이_유지하면_뒤집힘_신호가_꺼진다(settings: Settings) -> None:
+    quote = "관절염 치료에 효과가 있습니다"
+    llm = FakeLlmClient(
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "UPHOLD", "reason": "타당하다"}),
+            ok({"sellerNotice": "수정이 필요합니다.", "rewrites": []}),
+        ]
+    )
+    pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+    verdict = await pipeline.run(product(quote))
+
+    assert verdict.verdict is Verdict.FLAG
+    assert verdict.criticOverturned is False
+
+
+async def test_비평을_타지_않은_판정은_뒤집힘_신호가_꺼진다(settings: Settings) -> None:
+    """통과·규칙 확정·판정 실패는 비평을 타지 않는다. 그 셋에 신호가 켜지면 어드민 큐가 잡음으로 찬다."""
+    cases = [
+        (FakeLlmClient([ok(NO_FINDING), ok(NO_FINDING)]), product("글루코사민 함유 영양제입니다")),
+        (FakeLlmClient([]), product("문의는 010-1234-5678로 주세요")),
+        (FakeLlmClient([failed(), failed(), failed(), failed()]), product("글루코사민 함유")),
+    ]
+    for llm, request in cases:
+        pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+        verdict = await pipeline.run(request)
+
+        assert verdict.criticOverturned is False, verdict.verdict
