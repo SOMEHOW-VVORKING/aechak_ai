@@ -40,6 +40,8 @@ class Perspective(StrEnum):
     CONDUCT_TRADE = "CONDUCT_TRADE"
     # 결정론적 규칙 단계의 결과도 같은 테이블에 적는다
     RULE = "RULE"
+    # 선별 단계. 승급 여부만 정하고 판정하지 않으므로 집계에서 세지 않는다
+    TRIAGE = "TRIAGE"
 
 
 class PerspectiveOutcome(StrEnum):

@@ -293,7 +293,9 @@ async def test_샘플링_파라미터를_절대_보내지_않는다(settings: Se
     for call in llm.calls:
         for banned in ("temperature", "top_p", "top_k"):
             assert banned not in call, f"{banned}는 현세대 모델에서 400이다"
-        assert call["effort"] in ("low", "medium", "high", "xhigh", "max")
+        # None은 output_config를 아예 보내지 않는 경로다. 본문에 실제로 안 실리는지는
+        # tests/test_client_params.py가 전송 계층에서 단언한다.
+        assert call["effort"] is None or call["effort"] in ("low", "medium", "high", "xhigh", "max")
 
 
 @pytest.mark.parametrize("fanout", [True, False])

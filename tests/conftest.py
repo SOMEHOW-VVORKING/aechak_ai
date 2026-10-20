@@ -62,11 +62,15 @@ def ok(tool_input: dict[str, Any], *, model: str = "claude-sonnet-5") -> LlmResu
     )
 
 
-def failed(outcome: CallOutcome = CallOutcome.RATE_LIMITED) -> LlmResult:
+def failed(
+    outcome: CallOutcome = CallOutcome.RATE_LIMITED,
+    *,
+    model: str = "claude-sonnet-5",
+) -> LlmResult:
     return LlmResult(
         call_id="call-failed",
         outcome=outcome,
-        model_id="claude-sonnet-5",
+        model_id=model,
         tool_input=None,
         latency_ms=50,
     )

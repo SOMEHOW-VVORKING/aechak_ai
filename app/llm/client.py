@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,13 +26,33 @@ from app.schemas.inspection import CallOutcome
 log = logging.getLogger(__name__)
 
 # 100만 토큰당 USD. 설정이 아니라 상수로 두되 모델 확정 시 공식 단가로 재확인한다.
+# Haiku 4.5는 정식 ID와 날짜 접미 별칭이 둘 다 실재한다. 어느 쪽을 설정에 적어도
+# 비용이 0으로 기록되지 않게 둘 다 올려 둔다.
 _PRICING: dict[str, tuple[float, float]] = {
     "claude-sonnet-5": (2.0, 10.0),
     "claude-opus-5": (5.0, 25.0),
+    "claude-haiku-4-5": (1.0, 5.0),
     "claude-haiku-4-5-20251001": (1.0, 5.0),
 }
 _CACHE_WRITE_MULTIPLIER = 1.25
 _CACHE_READ_MULTIPLIER = 0.1
+
+# 미지 모델에 쓰는 단가. 가격표 최고값이다.
+_FALLBACK_PRICING: tuple[float, float] = (
+    max(p[0] for p in _PRICING.values()),
+    max(p[1] for p in _PRICING.values()),
+)
+
+
+class UnknownModelPricing(RuntimeError):
+    """가격표에 없는 모델 ID. 부팅에서 기동을 거부하는 데 쓴다."""
+
+
+def validate_pricing(model_ids: Iterable[str]) -> None:
+    """설정된 모델 ID 전부가 가격표에 있는지 본다. 모르면 예외를 던진다."""
+    unknown = sorted({model_id for model_id in model_ids if model_id not in _PRICING})
+    if unknown:
+        raise UnknownModelPricing(f"가격표에 없는 모델이 설정됐다: {', '.join(unknown)}")
 
 
 @dataclass(slots=True)
@@ -67,8 +88,15 @@ def cost_micro_usd(
 
     전체 입력이 세 값의 합이라서 나누지 않으면 비용을 되살릴 수 없다.
     캐시 쓰기는 1.25배, 캐시 읽기는 0.1배로 과금된다.
+
+    가격표에 없는 모델은 0이 아니라 최고 단가로 과대 계상한다. 0으로 적으면 비용 경보가
+    영원히 침묵한다.
     """
-    in_price, out_price = _PRICING.get(model_id, (0.0, 0.0))
+    pricing = _PRICING.get(model_id)
+    if pricing is None:
+        log.error("가격표에 없는 모델이다. 최고 단가로 과대 계상한다. model=%s", model_id)
+        pricing = _FALLBACK_PRICING
+    in_price, out_price = pricing
     usd = (
         input_tokens * in_price
         + cache_creation * in_price * _CACHE_WRITE_MULTIPLIER
@@ -119,25 +147,41 @@ class LlmClient:
         self,
         *,
         model: str,
-        effort: str,
+        effort: str | None,
         max_tokens: int,
         system_blocks: list[dict[str, Any]],
         user_content: list[dict[str, Any]],
         tool: dict[str, Any],
         request_id: str,
+        timeout_seconds: float | None = None,
     ) -> LlmResult:
+        """``effort``에 기본값을 두지 않는다. 호출부가 반드시 등급을 명시하거나 None을 준다.
+
+        ``thinking``을 보내지 않는다. Sonnet 5와 Opus 5는 생략이 곧 adaptive이고,
+        Haiku 4.5는 생략하면 사고하지 않는다 -- 그 세대는 budget_tokens를 받아 adaptive가 400이다.
+        """
         call_id = f"{request_id}-{uuid.uuid4().hex[:8]}"
         started = time.monotonic()
+        # output_config를 조건부로 조립한다. effort=None을 그냥 넘기면 SDK가 키를 생략하지 않고
+        # {"effort": null}을 본문에 실어 400이 된다.
+        options: dict[str, Any] = {}
+        if effort is not None:
+            # temperature를 넣지 않는다. 결정성은 effort로만 조절한다.
+            options["output_config"] = {"effort": effort}
+
+        client = self._client
+        if timeout_seconds is not None:
+            client = client.with_options(timeout=timeout_seconds)
+
         try:
-            response = await self._client.messages.create(
+            response = await client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
-                # temperature를 넣지 않는다. 결정성은 effort로만 조절한다.
-                output_config={"effort": effort},
                 system=system_blocks,
                 messages=[{"role": "user", "content": user_content}],
                 tools=[tool],
                 tool_choice={"type": "tool", "name": tool["name"]},
+                **options,
             )
         except Exception as error:
             outcome, detail = _classify(error)
