@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from conftest import FakeLlmClient, failed, ok
 
-from app.inspection import banned
+from app.inspection import banned, triage
 from app.inspection.perspectives import specs_for
 from app.inspection.pipeline import InspectionPipeline, countable_perspectives
 from app.inspection.triage import TRIAGE_PROMPT, TRIAGE_VERSION
@@ -64,10 +64,17 @@ async def test_선별이_깨끗하면_Sonnet을_건너뛴다(triage_on: Settings
 
     assert verdict.verdict is Verdict.PASS
     assert len(llm.calls) == 1, "건너뛴다는 것은 Sonnet 호출을 쏘지 않는다는 뜻이다"
-    outcomes = {p.perspective: p.outcome for p in verdict.perspectives}
-    assert outcomes[Perspective.TRIAGE] is PerspectiveOutcome.CLEAR
-    assert Perspective.DISPLAY_ADS not in outcomes
-    assert Perspective.CONDUCT_TRADE not in outcomes
+    rows = {p.perspective: p for p in verdict.perspectives}
+    assert rows[Perspective.TRIAGE].outcome is PerspectiveOutcome.CLEAR
+
+    # 건너뛴 관점도 행을 남기고, 왜 안 봤는지를 사유로 적는다.
+    #
+    # 행을 생략하면 백엔드는 "선별이 일부러 안 본 것"과 "호출이 죽어서 못 본 것"을 구분할
+    # 수 없다. 둘 다 모델 판정이 없는 상태로 보이기 때문이다. 그러면 백엔드가 통과를
+    # 받아들이지 못해 건너뛴 건을 전건 사람에게 넘기고, 선별이 비용만 더하는 장치가 된다.
+    for perspective in (Perspective.DISPLAY_ADS, Perspective.CONDUCT_TRADE):
+        assert rows[perspective].outcome is PerspectiveOutcome.UNCHECKED
+        assert rows[perspective].skipReason == triage.TRIAGE_SKIP_REASON
 
 
 async def test_선별이_더_보라고_하면_Sonnet_두_관점을_탄다(triage_on: Settings) -> None:

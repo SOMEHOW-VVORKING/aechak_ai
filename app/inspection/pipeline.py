@@ -154,6 +154,17 @@ class InspectionPipeline:
                     perspectives.append(
                         PerspectiveResult(perspective=Perspective.TRIAGE, outcome=PerspectiveOutcome.CLEAR)
                     )
+                    # 건너뛴 관점을 "선별이 깨끗하다고 해서 안 봤다"로 남긴다. 이 사유가 없으면
+                    # 백엔드는 호출이 죽어서 못 본 것과 구분할 수 없어 통과를 받아들이지 못하고,
+                    # 선별이 건너뛴 건을 전건 사람에게 넘긴다. 그러면 선별이 비용만 더한다.
+                    perspectives.extend(
+                        PerspectiveResult(
+                            perspective=spec.perspective,
+                            outcome=PerspectiveOutcome.UNCHECKED,
+                            skipReason=triage.TRIAGE_SKIP_REASON,
+                        )
+                        for spec in specs_for(request.target_type, fanout=self._settings.perspective_fanout)
+                    )
                     log.info("선별이 통과시켰다. 관점 호출을 건너뛴다. request_id=%s", request_id)
                     return self._finalize(
                         request,
