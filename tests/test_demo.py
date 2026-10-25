@@ -553,3 +553,234 @@ async def test_게이트_배지가_통과에만_적용된다() -> None:
     cleared_view = built(passed, passed_recorder)
     assert cleared_view.backend_gate_applies is True
     assert cleared_view.backend_accepts is True
+
+
+# --- 부분 미검사 통과, 모의 판정기 경고, 재생 재현성 ----------------------------------
+
+
+async def test_관점_하나가_미검사인_통과를_다_읽은_통과로_단정하지_않는다() -> None:
+    """콘솔이 통과와 미검사를 **머리줄에서** 섞지 않아야 한다.
+
+    종전에는 PASS 이고 TRIAGE 가 CLEAR 가 아니면 무조건 MODEL_CLEAR 였고, 그 설명문이
+    "관점이 실제로 읽고 위반을 찾지 못했다. 이 통과는 미검사가 아니다."였다. 쏜 관점
+    가운데 몇이 미검사인지는 보지 않았다. 의료·효능 주장을 보는 유일한 관점이 아무 판정도
+    못 했는데 머리줄이 그 반대를 단정하는 상태다. 발표장에서 읽히는 것은 N2 집계 줄이
+    아니라 배지와 그 밑 한 줄이다.
+    """
+    verdict, recorder, _ = await run_scenario(BY_ID["evidence-unverified"])
+    console = built(verdict, recorder)
+
+    assert console.verdict == Verdict.PASS.value
+    assert console.exit_point == ExitPoint.MODEL_PARTIAL.value
+    assert "미검사가 아니다" not in console.exit_note, console.exit_note
+    assert "1" in console.exit_note and "2" in console.exit_note, (
+        f"몇 건 중 몇 건을 읽었는지 수치로 적어야 한다: {console.exit_note}"
+    )
+
+
+async def test_관점_하나가_죽은_통과도_부분_미검사로_그린다() -> None:
+    """운영에서 더 흔한 모양이다. 하나가 레이트 리밋으로 죽고 하나가 통과하는 경우."""
+    from app.schemas.inspection import CallOutcome
+    from demo.replay import ScriptedCall
+
+    scenario = BY_ID["model-clear"]
+    entries = dict(scenario.entries)
+    entries[("report_findings", Perspective.DISPLAY_ADS)] = ScriptedCall(
+        tool_input=None,
+        outcome=CallOutcome.RATE_LIMITED,
+        latency_ms=90,
+    )
+    settings = Settings(anthropic_api_key="test", enable_triage=scenario.enable_triage)
+    recorder = TraceRecorder()
+    pipeline = InspectionPipeline(llm=ReplayLlmClient(entries=entries), settings=settings, recorder=recorder)
+    verdict = await pipeline.run(scenario.to_request())
+    console = built(verdict, recorder)
+
+    assert console.verdict == Verdict.PASS.value
+    assert console.exit_point == ExitPoint.MODEL_PARTIAL.value
+    assert "미검사가 아니다" not in console.exit_note
+
+
+async def test_두_관점이_다_읽은_통과는_여전히_미검사가_아니다() -> None:
+    """부분 미검사를 가르느라 온전한 통과의 뜻을 흐리지 않는다."""
+    verdict, recorder, _ = await run_scenario(BY_ID["model-clear"])
+    console = built(verdict, recorder)
+
+    assert console.exit_point == ExitPoint.MODEL_CLEAR.value
+    assert "미검사가 아니다" in console.exit_note
+
+
+async def test_모의_모드는_판정이_키워드_표에서_나온_것임을_배지로_알린다() -> None:
+    """모의 모드는 README 가 '사람이 자기 문장을 넣어 보는 자리'로 규정한 모드다.
+
+    종전에는 모의임을 알리는 표시가 원장 밑의 '토큰과 비용은 추정값이다' 한 줄뿐이라
+    **판정**이 추정이라는 경고가 어디에도 없었다. 심사위원이 자기 문장을 넣으면
+    '이 시스템은 개인정보 노출 리뷰를 자동 승인한다'로 읽힌다.
+    """
+    verdict, recorder, _ = await run_scenario(BY_ID["model-clear"])
+
+    mock_view = built(verdict, recorder, mode="mock")
+    assert mock_view.judgment_simulated is True
+    assert "키워드 표" in mock_view.simulated_note
+    assert "모델 판단이 아니" in mock_view.simulated_note
+
+    replay_view = built(verdict, recorder, mode="replay")
+    assert replay_view.judgment_simulated is False
+
+
+async def test_모의_선별은_표에_안_걸리면_더_보라고_넘긴다() -> None:
+    """실제 프롬프트의 '확신이 서지 않으면 NEEDS_REVIEW' 와 같은 방향이어야 한다.
+
+    13행 키워드 표에는 ABUSE·PII·IRRELEVANT 항목이 0개였고 SPAM 은 하나였다. 표에 안
+    걸리면 CLEAR 를 내므로, 정책의 위반 **예시 그대로** 넣은 문장 셋이 전부 선별 통과 +
+    백엔드 게이트 통과로 떨어졌다.
+    """
+    from app.schemas.inspection import ReviewInspectionRequest
+
+    settings = Settings(anthropic_api_key="", enable_triage=True)
+    for text in (
+        "배송기사 김철수님이 서울시 강남구 101동 202호에 잘못 두고 갔어요",
+        "오늘 날씨 참 좋네요",
+        "모든 강아지에게 효과 있습니다. 부작용은 전혀 없습니다.",
+    ):
+        request = ReviewInspectionRequest(
+            inspectionId=1,
+            reviewId=77,
+            productId=42,
+            contentHash="a" * 64,
+            content=text,
+            rating=5,
+            categoryPath=["강아지"],
+        )
+        recorder = TraceRecorder()
+        pipeline = InspectionPipeline(llm=MockLlmClient(), settings=settings, recorder=recorder)
+        verdict = await pipeline.run(request)
+        console = built(verdict, recorder, mode="mock")
+
+        assert console.exit_point != ExitPoint.TRIAGE_CLEARED.value, (
+            f"표에 안 걸리는 문장이 선별 통과로 떨어진다: {text!r}"
+        )
+
+
+def test_모의_키워드_표에_분류_축이_비어_있지_않다() -> None:
+    from app.schemas.inspection import ViolationCategory
+    from demo.mock import KEYWORD_TABLE
+
+    covered = {category for _k, category, _r, _s in KEYWORD_TABLE}
+    for category in (
+        ViolationCategory.ABUSE,
+        ViolationCategory.PII,
+        ViolationCategory.IRRELEVANT,
+    ):
+        assert category in covered, f"{category.value} 축이 비어 있다"
+
+
+def test_시나리오가_파이프라인_모양을_전부_들고_있다() -> None:
+    """앰비언트 환경이 재생을 흔들면 콘솔이 자기가 안 지난 경로를 지났다고 보여 준다."""
+    for scenario in SCENARIOS:
+        settings = scenario.settings()
+        assert settings.enable_triage == scenario.enable_triage
+        # 리터럴에서 조립해야 환경변수가 섞이지 않는다
+        assert settings.anthropic_api_key == ""
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"AECHAK_AI_PERSPECTIVE_FANOUT": "false"},
+        {"AECHAK_AI_ENABLE_ESCALATION": "false"},
+        {"AECHAK_AI_ENABLE_NOTICE": "false"},
+        {"AECHAK_AI_ENABLE_TRIAGE": "true"},
+        {"AECHAK_AI_SCREENING_MODEL": "claude-haiku-4-5"},
+    ],
+)
+def test_환경변수가_있어도_시나리오가_같은_탈출_지점을_낸다(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+) -> None:
+    """실측으로 ``PERSPECTIVE_FANOUT=false`` 는 네 시나리오를 400으로 죽였고,
+    ``ENABLE_ESCALATION=false`` + ``ENABLE_NOTICE=false`` 는 critic-overturn 을 오류 없이
+    MODEL_FLAGGED / '확정 위반' 으로 그렸다 -- 사이드바에는 그 시나리오의 note 와
+    expected_exit=CRITIC_OVERTURNED 가 그대로 떠 있는 채로.
+    """
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    for scenario in SCENARIOS:
+        response = client.post("/api/inspect", json={"mode": "replay", "scenario": scenario.id})
+        assert response.status_code == 200, (scenario.id, response.json())
+        assert response.json()["view"]["exit_point"] == scenario.expected_exit, scenario.id
+
+
+def test_시나리오가_적어_둔_경로와_다르게_돌면_그림을_내보내지_않는다(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """틀린 그림이 정상 응답으로 나가는 것이 가장 나쁘다."""
+    from demo import app as demo_module
+
+    monkeypatch.setattr(demo_module, "_verify_expected_exit", lambda *_a, **_k: "일부러 어긋남")
+    response = client.post("/api/inspect", json={"mode": "replay", "scenario": "model-clear"})
+
+    assert response.status_code == 400
+    assert "view" not in response.json()
+
+
+def test_게이트_술어_사본이_하나다() -> None:
+    """같은 규칙을 파이썬에 두 번 베껴 두고 둘끼리 같은지만 보는 테스트는 항진명제였다.
+
+    백엔드가 ``modelVerified()`` 를 바꾸면 두 사본은 여전히 서로 같아 전부 녹색이고,
+    콘솔은 백엔드가 거부할 통과에 초록 배지를 계속 띄운다. 사본을 하나로 줄이고, 갈라짐은
+    계약 표본에 대한 기대값으로 잡는다.
+    """
+    import conftest
+
+    assert conftest.backend_model_verified is view.backend_accepts, (
+        "사본이 둘이면 둘끼리 같은지 보는 테스트는 아무것도 지키지 않는다"
+    )
+
+
+def test_계약_표본마다_게이트_통과_여부를_표로_고정한다() -> None:
+    """정본이 바뀌면 사본끼리가 아니라 **표본에 대한 기대**가 깨져야 한다."""
+    expected = {
+        "content-verdict.json": True,
+        "content-verdict-triage.json": False,
+        "content-verdict-triage-promoted.json": True,
+    }
+    found = {p.name for p in CONTRACT_DIR.glob("content-verdict*.json")}
+    assert found == set(expected), f"표본이 늘거나 줄었다. 표를 고쳐라: {found}"
+
+    for name, accepts in expected.items():
+        sample = ContentVerdict.model_validate(json.loads((CONTRACT_DIR / name).read_text()))
+        assert view.backend_accepts(sample) is accepts, name
+
+
+def test_콘솔이_선별_체크박스를_운영_기본값으로_맞춘다() -> None:
+    """실제 배포는 선별이 꺼져 있어 전건이 Sonnet 두 관점을 탄다.
+
+    종전에는 ``checked`` 가 하드코딩이고 ``boot()`` 가 ``defaults.enableTriage`` 를 읽지
+    않아서, 발표를 보는 사람이 선별 통과를 현재 배포된 동작으로 이해했다.
+    """
+    html = (REPO / "demo" / "console.html").read_text(encoding="utf-8")
+
+    assert 'id="enableTriage" checked' not in html, "운영 기본값이 아닌 구성을 데모한다"
+    assert "defaults.enableTriage" in html, "boot() 가 운영 기본값을 반영해야 한다"
+    assert "운영 기본값" in html, "체크박스 옆에 운영 기본값을 적어야 한다"
+
+
+def test_요청_본문의_선별_기본값이_설정과_같다() -> None:
+    """두 자리의 기본값이 갈라지면 콘솔과 API 가 서로 다른 동작을 한다."""
+    from demo.app import InspectBody
+
+    assert InspectBody().enableTriage == Settings().enable_triage
+
+
+def test_캐시_배지가_통과_미검사와_색_어휘를_겹치지_않는다() -> None:
+    """이 프로젝트가 가장 피하려는 혼동이 통과와 미검사의 색 혼동이다.
+
+    선별 캐시는 Haiku 최소 접두부 미달로 **항상** 미적중이라, 캐시 축에 미검사 색을 쓰면
+    선별 시나리오마다 '미검사(회색 점선)'와 '미적중(회색 점선)'이 한 화면에 같이 선다.
+    """
+    html = (REPO / "demo" / "console.html").read_text(encoding="utf-8")
+
+    assert 'pill(call.cache_hit ? "CLEAR" : "UNCHECKED"' not in html
+    assert ".pill.cache-hit" in html
+    assert ".pill.cache-miss" in html
