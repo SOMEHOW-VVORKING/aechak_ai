@@ -149,3 +149,127 @@ def test_토큰_실측_대상이_실제_캐시_접두부다() -> None:
     assert judged[0].tools != judged[1].tools, (
         "관점마다 tools가 같다면 접두부를 공유할 수 있다는 뜻이고, 직렬 실행의 근거가 달라진다"
     )
+
+
+def test_규칙이_비차단으로_적중해_선별을_안_물은_건은_OFF와_다르다() -> None:
+    """승급률 분모를 '규칙이 차단하지 않은 전건'으로 두려면 이 둘을 가려야 한다.
+
+    선별이 꺼진 건(OFF)은 분모 밖이고, 규칙 적중으로 묻지 않고 승급한 건은 분모 안이다
+    (파이프라인이 실제로 하는 일이 '묻지 않고 승급'이므로 그것이 사실에 맞는 셈이다).
+    둘을 같은 값으로 접으면 full 모드와 triage-only 모드의 분모가 어긋난다.
+    """
+    verdict = verdict_of(
+        [
+            PerspectiveResult(
+                perspective=Perspective.TRIAGE,
+                outcome=PerspectiveOutcome.UNCHECKED,
+                skipReason="RULE_HIT",
+            )
+        ],
+        [sonnet_call()],
+    )
+
+    assert _triage_outcome(verdict) == ("SKIPPED_RULE_HIT", None)
+
+
+def test_승급률_분모가_규칙_비차단_적중_건을_승급으로_센다() -> None:
+    """분모에서 빼면 '선별이 아무것도 아끼지 못하는 건'의 비중이 지표에서 사라진다.
+
+    코코넛오일·우유·아보카도처럼 반려동물 상품에 흔한 성분 한 단어가 그 상태를 만들 수
+    있어서, 실코퍼스에서는 이 비중이 코퍼스보다 훨씬 크다.
+    """
+    from harness.run import Record, _summarize
+
+    def record(case_id: str, outcome: str) -> Record:
+        return Record(
+            mode="full",
+            repeat=1,
+            case_id=case_id,
+            label="VIOLATING",
+            target=TargetType.PRODUCT.value,
+            text_len=20,
+            expect_rule_block=False,
+            verdict=Verdict.PASS.value,
+            triage_outcome=outcome,
+            perspectives={},
+            cost_micro_usd=0,
+            triage_cost_micro_usd=0,
+            latency_ms=0,
+            haiku_cache_read=0,
+            triage_call_outcome=None,
+        )
+
+    rows = dict(
+        _summarize(
+            [record("a", "CLEAR"), record("b", "SKIPPED_RULE_HIT")],
+            baseline={},
+        )
+    )
+
+    assert "2" in rows["승급률 전체"], f"분모가 2건이어야 한다: {rows['승급률 전체']}"
+    assert "50.0%" in rows["승급률 전체"], rows["승급률 전체"]
+
+
+def test_끊긴_선별_호출을_실패_안에_묻지_않는다() -> None:
+    """상한을 올려야 하는 신호와 모델이 더 보라고 한 신호가 같은 칸에 있으면 안 된다."""
+    from harness.run import Record, _summarize
+
+    truncated = Record(
+        mode="full",
+        repeat=1,
+        case_id="t",
+        label="CLEAN",
+        target=TargetType.PRODUCT.value,
+        text_len=20,
+        expect_rule_block=False,
+        verdict=Verdict.PASS.value,
+        triage_outcome="FAILED",
+        perspectives={},
+        cost_micro_usd=0,
+        triage_cost_micro_usd=0,
+        latency_ms=0,
+        haiku_cache_read=0,
+        triage_call_outcome=CallOutcome.TRUNCATED.value,
+    )
+
+    rows = dict(_summarize([truncated], baseline={}))
+
+    assert "선별 상한 초과" in rows, f"TRUNCATED 를 따로 세지 않는다: {sorted(rows)}"
+    assert "1" in rows["선별 상한 초과"]
+
+
+def test_하네스가_운영이_보내지_않는_입력을_선별에_태우지_않는다() -> None:
+    """triage-only 모드가 ``hits`` 를 건너뛰어야 full 모드와 분모가 같아진다."""
+    import inspect
+
+    from harness import run
+
+    source = inspect.getsource(run._run_triage_only)
+    assert "rule_result.triage_trumping" in source, (
+        "파이프라인이 선별을 부르는 조건과 같아야 두 모드의 분모가 같다"
+    )
+
+
+def test_코퍼스에_선별이_못_아끼는_건이_들어있다() -> None:
+    """advisory 성분 적중은 선별을 건너뛰게 하므로 표에 그 비중이 드러나야 한다."""
+    from app.inspection import rules
+    from harness.cases import CASES
+
+    skipped = [
+        c
+        for c in CASES
+        if not c.expect_rule_block and rules.screen(c.text).hits and not rules.screen(c.text).blocking
+    ]
+    advisory = [
+        c for c in skipped if any(h.category.value == "BANNED_INGREDIENT" for h in rules.screen(c.text).hits)
+    ]
+    assert len(advisory) >= 2, f"advisory 성분 케이스가 모자라다: {[c.id for c in skipped]}"
+
+
+def test_케이스의_차단_기대가_실제_규칙과_맞는다() -> None:
+    """``expect_rule_block`` 이 틀어지면 승급률 분모가 조용히 어긋난다."""
+    from app.inspection import rules
+    from harness.cases import CASES
+
+    mismatched = [c.id for c in CASES if bool(rules.screen(c.text).blocking) != c.expect_rule_block]
+    assert mismatched == [], mismatched
