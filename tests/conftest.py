@@ -84,7 +84,7 @@ def failed(
 
 # 백엔드 게이트 규칙을 그대로 옮긴 술어.
 #
-# 정본은 백엔드 ``InspectionFacade.modelVerified()`` 다. 선별이 건너뛴 통과를 관리자 손을
+# 정본은 백엔드 ``ContentVerdictMessage.hasModelEvidence()`` 다. 선별이 건너뛴 통과를 관리자 손을
 # 거치지 않고 받으려면 셋이 동시에 참이어야 한다 -- ``TRIAGE`` 행이 ``CLEAR``, 모델 관점 행이
 # 비어 있지 않음, 그 행 전부의 사유가 ``TRIAGE_CLEAR``.
 #

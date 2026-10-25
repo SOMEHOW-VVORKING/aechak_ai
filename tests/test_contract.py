@@ -11,6 +11,7 @@ from typing import Any
 
 from conftest import backend_model_verified
 
+from app.inspection import triage
 from app.schemas.envelope import Envelope
 from app.schemas.inspection import (
     SCHEMA_VERSION,
@@ -152,30 +153,20 @@ def test_승급_표본은_선별_관점을_미검사로_남긴다(contract: Any)
     assert rows[Perspective.TRIAGE].skipReason == "PROMOTED"
 
 
-def test_건너뛴_표본은_선별_관점이_통과다(contract: Any) -> None:
+def test_건너뛴_표본은_선별_관점이_통과이고_게이트를_넘는다(contract: Any) -> None:
+    """선별이 건너뛴 통과가 사람 손을 거치지 않고 받아들여지는 모양을 고정한다.
+
+    건너뛴 관점에 행을 남기는 것은 호출을 쏜 증거가 아니라 왜 안 쐈는지를 적는 자리이고,
+    백엔드 게이트가 통과를 받아들이는 조건이 바로 그 행의 존재다. 그 행이 빠지면 백엔드는
+    선별이 건너뛴 건을 전건 관리자 검토 큐로 보내고, 그러면 선별은 Sonnet 호출만 아끼고
+    사람 손은 그만큼 더 쓰는 장치가 된다.
+    """
     verdict = ContentVerdict.model_validate(contract("content-verdict-triage.json"))
 
     rows = {p.perspective: p for p in verdict.perspectives}
 
     assert rows[Perspective.TRIAGE].outcome is PerspectiveOutcome.CLEAR
-
-
-def test_건너뛴_표본이_백엔드_게이트_조건에_아직_못_미친다(contract: Any) -> None:
-    """표본이 생산자보다 뒤처져 있다는 사실을 실행 가능하게 남긴다.
-
-    종전에는 이 자리에 "건너뛴 건에 관점 행이 있으면 호출을 쏜 것이다"가 단언으로 적혀
-    있었다. 그 문장이 틀렸다. 건너뛴 관점에 행을 남기는 것은 호출을 쏜 증거가 아니라 왜 안
-    쐈는지를 적는 자리이고, 백엔드 ``modelVerified()`` 가 통과를 받아들이는 조건이 바로 그
-    행의 존재다. 생산자는 그 행을 남기는데 표본은 남기지 않아서, 같은 경로를 두고 이 파일과
-    ``test_triage`` 가 서로를 부정하고 있었다.
-
-    표본의 정본은 백엔드 레포가 소유하므로 여기서 바이트를 고치지 않는다. 대신 표본이 게이트를
-    통과하지 못한다는 것을 단언해 둔다. 백엔드가 표본에 ``DISPLAY_ADS/UNCHECKED/TRIAGE_CLEAR``
-    와 ``CONDUCT_TRADE/UNCHECKED/TRIAGE_CLEAR`` 두 행을 더하고 사본을 동기화하면 이 테스트가
-    실패한다. 그때 할 일은 이 테스트를 지우고 위 테스트에 두 행 단언을 옮겨 적는 것이다.
-    """
-    verdict = ContentVerdict.model_validate(contract("content-verdict-triage.json"))
-
-    assert not backend_model_verified(verdict), (
-        "표본이 갱신됐다. 이 테스트를 지우고 건너뛴 관점 행 단언을 위 테스트로 옮겨라"
-    )
+    for perspective in (Perspective.DISPLAY_ADS, Perspective.CONDUCT_TRADE):
+        assert rows[perspective].outcome is PerspectiveOutcome.UNCHECKED
+        assert rows[perspective].skipReason == triage.TRIAGE_SKIP_REASON
+    assert backend_model_verified(verdict)
