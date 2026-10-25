@@ -315,18 +315,20 @@ async def test_백엔드_게이트_술어가_테스트_사본과_같은_답을_�
         assert view.backend_accepts(sample) == backend_model_verified(sample), path.name
 
 
-def test_뒤처진_표본은_선별_통과로_보이지만_게이트를_넘지_못한다() -> None:
-    """백엔드 소유 표본이 생산자보다 뒤처져 있다는 사실을 콘솔이 그대로 보여 준다.
+def test_선별_통과_표본은_탈출_지점과_게이트_통과를_따로_보여_준다() -> None:
+    """탈출 지점(어디서 끝났는가)과 게이트 통과(그 모양이 증거로 인정되는가)는 다른 축이다.
 
-    탈출 지점(어디서 끝났는가)과 게이트 통과(그 모양이 증거로 인정되는가)는 다른 축이다.
     한 축으로 합치면 "선별이 통과시켰는데 전건이 관리자 큐로 간다"는 상태가 화면에서 사라진다.
+    표본이 생산자 모양과 맞는 지금은 두 축이 함께 참이고, 뒤처지면 탈출 지점만 참이 된다.
     """
     raw = json.loads((CONTRACT_DIR / "content-verdict-triage.json").read_text())
     console = view.build(ContentVerdict.model_validate(raw), mode="verdict", source="sample")
 
     assert console.exit_point == ExitPoint.TRIAGE_CLEARED.value
-    assert console.backend_accepts is False
-    assert "관리자 검토 큐" in console.backend_note
+    assert console.backend_accepts is True, (
+        "표본이 생산자 모양과 어긋나 게이트를 넘지 못한다. 관점 행과 사유를 대조해라"
+    )
+    assert "관리자 검토 큐" not in console.backend_note
 
 
 def test_판정만으로_다시_그려도_단계와_탈출_지점이_나온다() -> None:
@@ -742,7 +744,7 @@ def test_계약_표본마다_게이트_통과_여부를_표로_고정한다() ->
     """정본이 바뀌면 사본끼리가 아니라 **표본에 대한 기대**가 깨져야 한다."""
     expected = {
         "content-verdict.json": True,
-        "content-verdict-triage.json": False,
+        "content-verdict-triage.json": True,
         "content-verdict-triage-promoted.json": True,
     }
     found = {p.name for p in CONTRACT_DIR.glob("content-verdict*.json")}
