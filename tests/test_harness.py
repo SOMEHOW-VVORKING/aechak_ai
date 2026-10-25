@@ -273,3 +273,24 @@ def test_케이스의_차단_기대가_실제_규칙과_맞는다() -> None:
 
     mismatched = [c.id for c in CASES if bool(rules.screen(c.text).blocking) != c.expect_rule_block]
     assert mismatched == [], mismatched
+
+
+def test_손익분기가_비용표에서_파생된다() -> None:
+    """비용표를 실측으로 갈아 끼우면 손익분기도 따라 움직여야 한다.
+
+    둘이 따로 적혀 있던 동안 선별 1회 비용이 올라가도 손익분기는 그대로였고, 어느 테스트도
+    깨지지 않았다. 백엔드가 이 숫자의 사본을 들고 선별 on/off 판단에 쓰므로 어긋나면 양쪽이
+    반대 결론을 낸다.
+    """
+    from harness import run
+
+    assert run.BREAKEVEN_PROMOTION_RATE == run._breakeven_promotion_rate()
+
+    original = dict(run._ESTIMATE_MICRO_USD)
+    try:
+        run._ESTIMATE_MICRO_USD["triage"] = 2_000
+        # 1 - 2000/3680 = 0.4565... 를 셋째 자리로 올린다(적어 둔 0.620과 같은 규약)
+        assert run._breakeven_promotion_rate() == 0.457
+    finally:
+        run._ESTIMATE_MICRO_USD.clear()
+        run._ESTIMATE_MICRO_USD.update(original)

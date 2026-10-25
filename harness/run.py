@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import statistics
 import sys
 import time
@@ -44,15 +45,29 @@ OUT_ROOT = Path(__file__).parent / "out"
 # 원화 환산. 비용표와 같은 전제를 쓴다.
 KRW_PER_USD = 1_400
 
-# 채택안의 손익분기 승급률. 측정값이 이걸 넘으면 선별을 켜지 않는다.
-BREAKEVEN_PROMOTION_RATE = 0.620
-
 # 캐시 최소 접두부. Sonnet은 하한이고 Haiku는 넘지 못하는 벽이다.
 SONNET_CACHE_MIN_TOKENS = 1_024
 HAIKU_CACHE_MIN_TOKENS = 4_096
 
 # 예상 비용 계산에 쓰는 건당 microUSD. 토큰 전제는 --count-tokens가 실측으로 치환한다.
 _ESTIMATE_MICRO_USD = {"triage": 1_400, "sonnet_pair": 3_680, "critic_and_notice": 9_000}
+
+
+def _breakeven_promotion_rate() -> float:
+    """손익분기 승급률 — 비용표에서 파생한다.
+
+    선별 1회가 아끼려는 것은 Sonnet 2관점이고, 승급하면 둘 다 쓴다. 그래서
+    ``1 - triage/sonnet_pair`` 위로 가면 선별은 비용을 줄이는 장치가 아니라 더하는 장치다.
+
+    상수로 적어 두지 않는다. 적어 두면 비용표를 실측으로 갈아 끼울 때 이 숫자가 따라 움직이지
+    않고, 그래도 어느 테스트도 깨지지 않는다. 백엔드 사본은 여기서 나온 값을 손으로 받는다.
+    """
+    saved = _ESTIMATE_MICRO_USD["sonnet_pair"]
+    return math.ceil((1 - _ESTIMATE_MICRO_USD["triage"] / saved) * 1_000) / 1_000
+
+
+# 채택안의 손익분기 승급률. 측정값이 이걸 넘으면 선별을 켜지 않는다.
+BREAKEVEN_PROMOTION_RATE = _breakeven_promotion_rate()
 
 MODES = ("baseline", "triage-only", "full")
 
