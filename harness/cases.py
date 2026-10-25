@@ -155,6 +155,12 @@ _CLEAN = [
     _r("clean-short-2", "재구매합니다", CLEAN),
     _p("clean-efficacy-edge", "관절 건강에 도움을 줄 수 있는 글루코사민 함유", CLEAN, note="효능 경계"),
     _p("clean-negation", "무자일리톨 수제 간식입니다", CLEAN, note="금지 성분의 부정 표현"),
+    _p(
+        "clean-lactose-free",
+        "락토프리 우유로 만든 강아지 간식입니다",
+        CLEAN,
+        note="'프리'가 부정 표기라 사전이 적중을 눌러 선별을 정상적으로 탄다",
+    ),
     _p("clean-long", f"글루코사민과 MSM이 들어간 영양제입니다. {_LONG_TAIL}", CLEAN, note="긴 본문"),
     _r("clean-complaint", "포장이 엉망이었고 배송도 느려서 실망했습니다", CLEAN, note="불만은 욕설이 아니다"),
     _p("clean-inquiry", "상품 문의는 셀러 문의하기를 이용해 주세요", CLEAN),
@@ -185,7 +191,43 @@ _OVERBLOCK = [
     ),
 ]
 
-CASES: list[Case] = [*_RULE_BLOCKED, *_MODEL_VIOLATING, *_CLEAN, *_OVERBLOCK]
+# (5) advisory 성분이 비차단으로 적중하는 정상 상품.
+#
+# 이 건들은 선별을 **아예 타지 않는다** -- 규칙이 적중하면 파이프라인이 묻지 않고 승급한다.
+# 그래서 선별이 아끼는 것이 0인데, 반려동물 상품에 흔한 성분명 한 단어가 그 상태를 만든다.
+# 코퍼스에 넣어 두지 않으면 "선별이 못 아끼는 건"의 비중이 표에서 구조적으로 안 보이고,
+# 실코퍼스에서는 이 비중이 여기보다 훨씬 크다.
+_ADVISORY_INGREDIENT = [
+    _p(
+        "advisory-coconut",
+        "코코넛오일을 넣은 강아지 샴푸입니다. 털 결을 부드럽게 해 줍니다",
+        CLEAN,
+        category_path=["강아지", "미용", "샴푸"],
+        note="위생용품의 코코넛오일. 비차단 적중이라 선별을 건너뛴다",
+    ),
+    _p(
+        "advisory-milk",
+        "우유를 넣어 만든 강아지 전용 간식입니다",
+        CLEAN,
+        category_path=["강아지", "간식"],
+        note="반려동물용 우유 간식. 비차단 적중이라 선별을 건너뛴다",
+    ),
+    _p(
+        "advisory-avocado-oil",
+        "아보카도 오일을 쓴 반려견 보습 로션입니다",
+        CLEAN,
+        category_path=["강아지", "미용", "로션"],
+        note="바르는 제품의 아보카도. 비차단 적중이라 선별을 건너뛴다",
+    ),
+]
+
+CASES: list[Case] = [
+    *_RULE_BLOCKED,
+    *_MODEL_VIOLATING,
+    *_CLEAN,
+    *_OVERBLOCK,
+    *_ADVISORY_INGREDIENT,
+]
 
 
 def promotable(cases: list[Case]) -> list[Case]:

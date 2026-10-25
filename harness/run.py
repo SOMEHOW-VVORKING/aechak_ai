@@ -90,6 +90,25 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[index]
 
 
+# 선별 결과 분류. 승급률의 분자와 분모를 이 다섯 값이 만든다.
+#
+# OFF 와 SKIPPED_RULE_HIT 를 반드시 가른다. 선별이 꺼져 있던 건은 분모 **밖**이고, 규칙이
+# 적중해서 묻지 않고 승급한 건은 분모 **안**이다 -- 파이프라인이 실제로 하는 일이 "묻지 않고
+# 승급"이라 그것이 사실에 맞는 셈이고, 둘을 같은 값으로 접으면 full 모드가 그 건을 분모와
+# 분자 양쪽에서 잃는 동안 triage-only 모드는 분모에 넣어 두 모드의 분모가 어긋난다.
+TRIAGE_OFF = "OFF"
+TRIAGE_SKIPPED_RULE_HIT = "SKIPPED_RULE_HIT"
+TRIAGE_CLEARED = "CLEAR"
+TRIAGE_PROMOTED = "PROMOTED"
+TRIAGE_FAILED = "FAILED"
+
+# 승급 쪽으로 세는 값. 선별이 아무것도 아끼지 못한 건 전부다.
+_PROMOTING = (TRIAGE_PROMOTED, TRIAGE_FAILED, TRIAGE_SKIPPED_RULE_HIT)
+# 실제로 Haiku 에 물은 건. 실패율의 분모는 이쪽이어야 한다 -- 묻지 않은 건을 넣으면
+# 실패율이 희석된다.
+_ASKED = (TRIAGE_CLEARED, TRIAGE_PROMOTED, TRIAGE_FAILED)
+
+
 def _triage_outcome(verdict: Any) -> tuple[str, str | None]:
     """판정 메시지만 보고 선별 결과를 되살린다.
 
@@ -99,19 +118,26 @@ def _triage_outcome(verdict: Any) -> tuple[str, str | None]:
 
     호출을 모델 ID가 아니라 관점으로 고른다. 원장의 전용 관점이 선별을 식별하는 신호이고,
     모델 ID는 설정으로 바뀐다.
+
+    호출이 없는 경우가 둘이다. 선별이 꺼져 있으면 TRIAGE 행 자체가 없고, 규칙이 적중해
+    묻지 않고 승급했으면 행은 있고 사유가 ``RULE_HIT``다. 그 둘을 가른다.
     """
     calls = [c for c in verdict.calls if c.perspective is Perspective.TRIAGE]
+    row = next((p for p in verdict.perspectives if p.perspective is Perspective.TRIAGE), None)
     if not calls:
-        return "OFF", None
+        if row is not None and row.skipReason == "RULE_HIT":
+            return TRIAGE_SKIPPED_RULE_HIT, None
+        return TRIAGE_OFF, None
     outcome = calls[0].outcome.value
     if calls[0].outcome is not CallOutcome.SUCCESS:
         # 끊긴 응답(TRUNCATED)도 여기로 떨어진다. 모델이 "더 보라"고 판단한 것과
         # 아무 답도 못 한 것을 분자에서 뭉개면 승급률을 믿을 수 없다.
-        return "FAILED", outcome
-    row = next((p for p in verdict.perspectives if p.perspective is Perspective.TRIAGE), None)
+        # 표에서는 TRUNCATED 를 따로 센다 -- 상한을 올려야 하는 신호와 모델이 더 보라고 한
+        # 신호가 같은 칸에 있으면 어느 쪽인지 알 수 없다.
+        return TRIAGE_FAILED, outcome
     if row is not None and row.outcome is PerspectiveOutcome.CLEAR:
-        return "CLEAR", outcome
-    return "PROMOTED", outcome
+        return TRIAGE_CLEARED, outcome
+    return TRIAGE_PROMOTED, outcome
 
 
 async def _run_pipeline_mode(
@@ -164,6 +190,23 @@ async def _run_triage_only(
             rule_result = rules.screen(request.inspect_text())
             if rule_result.blocking:
                 continue
+            if rule_result.triage_trumping:
+                # 파이프라인이 선별을 부르는 조건과 같게 둔다. ``blocking``만 건너뛰면 운영이
+                # 보내지도 않는 입력으로 Haiku 를 태우고 그 결과가 지표에 섞인다. 호출은 하지
+                # 않고 분모용 한 줄만 남겨 full 모드와 분모를 맞춘다.
+                records.append(
+                    _record_of(
+                        case,
+                        round_no,
+                        outcome=TRIAGE_SKIPPED_RULE_HIT,
+                        cost_micro_usd=0,
+                        latency_ms=0,
+                        cache_read=0,
+                        call_outcome=None,
+                    )
+                )
+                print(f"  triage-only r{round_no} {case.id:24} {TRIAGE_SKIPPED_RULE_HIT} (묻지 않음)")
+                continue
 
             started = time.monotonic()
             result = await llm.call_tool(
@@ -179,31 +222,53 @@ async def _run_triage_only(
             elapsed = int((time.monotonic() - started) * 1000)
             decision = triage.decide(result)
             if not result.ok:
-                outcome = "FAILED"
+                outcome = TRIAGE_FAILED
             else:
-                outcome = "CLEAR" if decision.skip else "PROMOTED"
+                outcome = TRIAGE_CLEARED if decision.skip else TRIAGE_PROMOTED
 
             records.append(
-                Record(
-                    mode="triage-only",
-                    repeat=round_no,
-                    case_id=case.id,
-                    label=case.label,
-                    target=case.target.value,
-                    text_len=len(case.text),
-                    expect_rule_block=case.expect_rule_block,
-                    verdict="N/A",
-                    triage_outcome=outcome,
-                    perspectives={},
+                _record_of(
+                    case,
+                    round_no,
+                    outcome=outcome,
                     cost_micro_usd=result.cost_micro_usd,
-                    triage_cost_micro_usd=result.cost_micro_usd,
                     latency_ms=elapsed,
-                    haiku_cache_read=result.cache_read_input_tokens,
-                    triage_call_outcome=result.outcome.value,
+                    cache_read=result.cache_read_input_tokens,
+                    call_outcome=result.outcome.value,
                 )
             )
             print(f"  triage-only r{round_no} {case.id:24} {outcome} ({decision.decision})")
     return records
+
+
+def _record_of(
+    case: Case,
+    round_no: int,
+    *,
+    outcome: str,
+    cost_micro_usd: int,
+    latency_ms: int,
+    cache_read: int,
+    call_outcome: str | None,
+) -> Record:
+    """triage-only 모드의 한 줄. 물은 건과 묻지 않은 건이 같은 모양이어야 분모가 맞는다."""
+    return Record(
+        mode="triage-only",
+        repeat=round_no,
+        case_id=case.id,
+        label=case.label,
+        target=case.target.value,
+        text_len=len(case.text),
+        expect_rule_block=case.expect_rule_block,
+        verdict="N/A",
+        triage_outcome=outcome,
+        perspectives={},
+        cost_micro_usd=cost_micro_usd,
+        triage_cost_micro_usd=cost_micro_usd,
+        latency_ms=latency_ms,
+        haiku_cache_read=cache_read,
+        triage_call_outcome=call_outcome,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,23 +405,29 @@ def _summarize(records: list[Record], baseline: dict[tuple[str, int], str]) -> l
     rows: list[tuple[str, str]] = []
     scored = [r for r in records if not r.expect_rule_block]
 
-    # (1순위) 승급률. 분모는 규칙을 통과한 건이다.
+    # (1순위) 승급률. 분모는 **규칙이 차단하지 않은 전건**이다.
+    #
+    # 규칙이 비차단으로 적중해 선별에 묻지도 않고 승급한 건을 분모에서 빼면 안 된다.
+    # 운영은 그 건을 실제로 처리하고 Sonnet 2회를 그대로 태우므로, 빼면 "선별이 아무것도
+    # 아끼지 못하는 건"의 비중이 지표에서 구조적으로 사라진다 -- 코코넛오일·우유·아보카도처럼
+    # 반려동물 상품에 흔한 성분 한 단어가 그 상태를 만들 수 있어 실코퍼스에서는 이 비중이
+    # 이 케이스 세트보다 훨씬 크다.
     for label, subset in (
         ("전체", scored),
         (TargetType.PRODUCT.value, [r for r in scored if r.target == TargetType.PRODUCT.value]),
         (TargetType.REVIEW.value, [r for r in scored if r.target == TargetType.REVIEW.value]),
     ):
-        triaged = [r for r in subset if r.triage_outcome != "OFF"]
+        triaged = [r for r in subset if r.triage_outcome != TRIAGE_OFF]
         if not triaged:
             continue
-        promoted = [r for r in triaged if r.triage_outcome in ("PROMOTED", "FAILED")]
+        promoted = [r for r in triaged if r.triage_outcome in _PROMOTING]
         rate = len(promoted) / len(triaged)
         over = rate > BREAKEVEN_PROMOTION_RATE
         note = "손익분기 초과. 선별을 켜지 마라" if over else "손익분기 아래"
         rows.append((f"승급률 {label}", f"{rate:.1%} ({len(promoted)}/{len(triaged)}) — {note}"))
 
     # (2) 누락률 둘. 선별 때문에 생긴 누락은 net_miss 뿐이다.
-    violating = [r for r in scored if r.label == VIOLATING and r.triage_outcome == "CLEAR"]
+    violating = [r for r in scored if r.label == VIOLATING and r.triage_outcome == TRIAGE_CLEARED]
     rows.append(("triage_miss", f"{len(violating)}건 — 라벨이 위반인데 선별이 건너뛴 건"))
     net = [r for r in violating if baseline.get((r.case_id, r.repeat)) == "FLAG"]
     if baseline:
@@ -393,11 +464,31 @@ def _summarize(records: list[Record], baseline: dict[tuple[str, int], str]) -> l
         hit = sum(1 for r in haiku if r.haiku_cache_read > 0)
         rows.append(("선별 캐시 적중", f"{hit}/{len(haiku)}건 — 0이면 최소 접두부 미달이 확인된 것이다"))
 
-    # (6) 선별 실패율
-    triaged = [r for r in scored if r.triage_outcome != "OFF"]
+    # (5.5) 묻지 않고 승급한 건. 선별이 아끼지 못한 몫을 분모 안에서 따로 보여 준다.
+    triaged = [r for r in scored if r.triage_outcome != TRIAGE_OFF]
     if triaged:
-        failures = sum(1 for r in triaged if r.triage_outcome == "FAILED")
-        rows.append(("선별 실패율", f"{failures / len(triaged):.1%} ({failures}/{len(triaged)})"))
+        skipped = sum(1 for r in triaged if r.triage_outcome == TRIAGE_SKIPPED_RULE_HIT)
+        rows.append(
+            (
+                "묻지 않고 승급",
+                f"{skipped}/{len(triaged)}건 — 규칙이 적중해 선별을 건너뛴 건. 여기서는 절감이 0이다",
+            )
+        )
+
+    # (6) 선별 실패율. 분모는 **실제로 물은 건**이다. 묻지 않은 건을 넣으면 희석된다.
+    asked = [r for r in scored if r.triage_outcome in _ASKED]
+    if asked:
+        failures = sum(1 for r in asked if r.triage_outcome == TRIAGE_FAILED)
+        rows.append(("선별 실패율", f"{failures / len(asked):.1%} ({failures}/{len(asked)})"))
+        # 상한 초과는 실패 안에 묻지 않는다. 고칠 방법이 다르다 -- 이쪽은 max_tokens_triage 를
+        # 올리면 사라지고, 다른 실패는 레이트 리밋과 예산 쪽이다.
+        truncated = sum(1 for r in asked if r.triage_call_outcome == CallOutcome.TRUNCATED.value)
+        rows.append(
+            (
+                "선별 상한 초과",
+                f"{truncated}/{len(asked)}건 — 사유가 길어 끊긴 건. max_tokens_triage 를 올려야 하는 신호다",
+            )
+        )
 
     # (7) 반복 간 불일치율
     by_case: dict[str, set[str]] = defaultdict(set)
