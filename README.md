@@ -110,6 +110,24 @@ cd ../be && docker compose --profile ai up -d ai
 `harness/README.md`에 있다. `harness/`는 `testpaths` 밖이라 pytest가 수집하지 않고,
 Dockerfile이 `app`과 `prompts`만 COPY하므로 이미지에도 들어가지 않는다.
 
+## 데모 콘솔
+
+검수 한 건이 어느 단계를 지나는지 눈으로 따라가는 개발·데모용 화면이다. 별 프로세스로 띄우고
+운영 앱에 붙이지 않는다 — `app/main.py`가 공개 ALB 뒤에서 헬스체크만 공개하기 때문이다.
+
+```bash
+uv run python -m demo      # http://127.0.0.1:8100
+```
+
+기본 모드는 **모델을 부르지 않는 재생**이다. `call_tool`만 구현한 가짜를 끼워 실제 파이프라인을
+그대로 돌리므로 키 없이도 단계·비용·지연이 전부 나온다. 배치 근거와 모드 넷, 탈출 지점 판별표는
+`demo/README.md`에 있다. `harness/`와 마찬가지로 `demo/`도 `testpaths` 밖이고 Dockerfile이
+`app`과 `prompts`만 COPY하므로 이미지에 들어가지 않는다.
+
+콘솔이 보여 주는 "왜"(선별 사유, 비평 결정, 실패 상세, 가린 본문)는 판정 계약에 자리가 없어서
+`app/inspection/trace.py`의 인프로세스 추적 객체로 모은다. **추적기를 주지 않으면 아무 일도
+일어나지 않는다** — 카프카 경로는 주지 않으므로 운영 판정이 바뀌지 않고, 그것을 테스트가 지킨다.
+
 ## 계약
 
 `tests/contract/`의 표본은 **백엔드가 정본을 소유한다.** 출처는

@@ -379,11 +379,20 @@ class InspectionPipeline:
             label="N0.5 선별",
             perspective=Perspective.TRIAGE,
             outcome=(PerspectiveOutcome.CLEAR if outcome.skip else PerspectiveOutcome.UNCHECKED),
-            skip_reason=(triage.TRIAGE_SKIP_REASON if outcome.skip else "PROMOTED"),
+            # 판정 계약의 TRIAGE 행과 같은 모양으로 적는다 -- 건너뛸 때는 사유가 없고(선별이
+            # 스스로 판정했으므로), 승급할 때만 PROMOTED 다. TRIAGE_CLEAR 는 선별 자신의 사유가
+            # 아니라 **건너뛴 관점 행**에 적히는 값이라 여기 쓰면 단계 줄이 서로를 가린다.
+            skip_reason=None if outcome.skip else "PROMOTED",
             decision=outcome.decision,
             reason=outcome.reason,
             note=(
-                None if result.ok else "호출이 실패했다. 대안이 승급이라 재시도하지 않고 그대로 올려 보낸다"
+                "관점 호출을 건너뛴다. 건너뛴 관점 행에 TRIAGE_CLEAR 를 적어 백엔드가 통과를 받게 한다"
+                if outcome.skip
+                else (
+                    "호출이 실패했다. 대안이 승급이라 재시도하지 않고 그대로 올려 보낸다"
+                    if not result.ok
+                    else None
+                )
             ),
             result=result,
         )
