@@ -37,6 +37,12 @@ KRW_PER_USD = 1_400
 # 백엔드가 "모델이 내용을 읽었다"로 세는 관점. 정본은 InspectionFacade.MODEL_PERSPECTIVES 다.
 BACKEND_MODEL_PERSPECTIVES = (Perspective.ALL, Perspective.DISPLAY_ADS, Perspective.CONDUCT_TRADE)
 
+# 모의 모드의 결과 패널 머리줄에 띄우는 경고.
+SIMULATED_NOTE = (
+    "이 판정은 모의 판정기의 키워드 표가 낸 것이다. 모델 판단이 아니고 비용과 토큰도 추정값이다. "
+    "여기서 볼 것은 판정 품질이 아니라 파이프라인의 분기와 단계다."
+)
+
 # 단계 순서. 파이프라인이 도는 순서와 같고, 기록이 없는 단계는 "도달하지 않음"으로 채운다.
 CANONICAL_STAGES: tuple[tuple[Stage, str], ...] = (
     (Stage.RULE, "N0 규칙"),
@@ -91,6 +97,10 @@ class ExitPoint(StrEnum):
     RULE_BLOCKED = "RULE_BLOCKED"
     TRIAGE_CLEARED = "TRIAGE_CLEARED"
     MODEL_CLEAR = "MODEL_CLEAR"
+    # 쏜 관점 가운데 일부만 판정한 통과. MODEL_CLEAR 와 반드시 갈라야 한다 --
+    # 둘을 합치면 "의료·효능을 보는 유일한 관점이 아무 판정도 못 했다"가 머리줄에서
+    # "관점이 실제로 읽고 위반을 찾지 못했다"로 뒤집힌다.
+    MODEL_PARTIAL = "MODEL_PARTIAL"
     CRITIC_OVERTURNED = "CRITIC_OVERTURNED"
     MODEL_FLAGGED = "MODEL_FLAGGED"
     # 표에 없는 경로 둘. 같은 방식으로 판정 하나에서 구분된다
@@ -109,7 +119,13 @@ _EXIT_LABELS: dict[str, tuple[str, str]] = {
     ),
     ExitPoint.MODEL_CLEAR.value: (
         "모델 위반 없음",
-        "관점이 실제로 읽고 위반을 찾지 못했다. 이 통과는 미검사가 아니다.",
+        "쏜 관점이 전부 실제로 읽고 위반을 찾지 못했다. 이 통과는 미검사가 아니다.",
+    ),
+    # 설명문을 고정하지 않는다. 몇 건 중 몇 건을 읽었는지가 이 자리의 내용이고,
+    # build() 가 관점 행에서 세어 채운다. 아래 문장은 셀 수 없을 때의 대비값이다.
+    ExitPoint.MODEL_PARTIAL.value: (
+        "부분 미검사 통과",
+        "쏜 관점 가운데 일부만 판정했다. 나머지는 통과가 아니라 미검사다.",
     ),
     ExitPoint.CRITIC_OVERTURNED.value: (
         "비평 뒤집힘",
@@ -255,6 +271,10 @@ class ConsoleView:
     # 게이트가 이 판정에 적용되는가. 통과에만 적용된다
     backend_gate_applies: bool
     backend_note: str
+    # 이 판정이 모델의 판단인가, 대역의 키워드 표가 낸 것인가.
+    # 참이면 콘솔이 머리줄에 경고를 띄우고 백엔드 게이트 배지를 중립색으로 내린다.
+    judgment_simulated: bool
+    simulated_note: str
     critic_overturned: bool
     prompt_version: str
     seller_notice: str | None
@@ -298,6 +318,14 @@ def classify_exit(verdict: ContentVerdict) -> ExitPoint:
         # 선별이 통과시킨 것 자체가 탈출 지점이다. 그 모양이 백엔드 게이트를 넘는지는
         # 별 축이고 backend_accepts 가 답한다 -- 넘지 못하면 전건이 관리자 검토 큐로 간다.
         return ExitPoint.TRIAGE_CLEARED
+
+    # 통과이지만 쏜 관점 가운데 판정하지 못한 것이 있으면 "다 읽었다"로 적지 않는다.
+    #
+    # 집계가 통과를 내는 조건은 "**한** 관점이라도 판정했고 위반이 없다"다. 그래서 의료·효능
+    # 주장을 보는 유일한 관점이 인용 검증 실패나 레이트 리밋으로 죽어도 판정은 PASS 다.
+    # N2 집계 줄에 수치가 있지만 발표장에서 읽히는 것은 배지와 그 밑 한 줄이다.
+    if any(p.outcome is PerspectiveOutcome.UNCHECKED for p in model_rows):
+        return ExitPoint.MODEL_PARTIAL
     return ExitPoint.MODEL_CLEAR
 
 
@@ -327,7 +355,13 @@ def build(
 ) -> ConsoleView:
     exit_point = classify_exit(verdict)
     exit_label, exit_note = _EXIT_LABELS[exit_point.value]
+    if exit_point is ExitPoint.MODEL_PARTIAL:
+        exit_note = _partial_note(verdict)
     accepted = backend_accepts(verdict)
+    # 모의 모드의 판정은 키워드 표가 낸 것이고 모델의 판단이 아니다. 그 사실이 결과 패널
+    # 머리줄에 없으면, 사람이 자기 문장을 넣어 본 결과가 "이 시스템은 이것을 이렇게
+    # 판정한다"로 읽힌다. 비용·토큰이 추정값이라는 줄은 원장 밑에 따로 있다.
+    simulated = mode == "mock"
     # 게이트가 가르는 것은 **통과를 사람 손 없이 반영할지**다. 보류와 판정 실패는 어차피
     # 사람이 보므로 이 축이 적용되지 않는다. 적용되지 않는 자리에 불통과 배지를 띄우면
     # 규칙이 차단한 건이 마치 잘못된 것처럼 보인다.
@@ -350,6 +384,8 @@ def build(
         backend_accepts=accepted,
         backend_gate_applies=gate_applies,
         backend_note=_gate_note(gate_applies=gate_applies, accepted=accepted),
+        judgment_simulated=simulated,
+        simulated_note=SIMULATED_NOTE if simulated else "",
         critic_overturned=verdict.criticOverturned,
         prompt_version=verdict.promptVersion,
         seller_notice=verdict.sellerNotice,
@@ -383,6 +419,23 @@ def build(
             for v in verdict.violations
         ],
         ledger=_ledger(verdict),
+    )
+
+
+def _partial_note(verdict: ContentVerdict) -> str:
+    """부분 미검사 통과의 설명문을 관점 행에서 세어 만든다.
+
+    고정 문장을 쓰면 "몇 건이 미검사인지"가 빠지고, 그 수치가 이 배지의 내용 전부다.
+    """
+    model_rows = _model_rows(verdict.perspectives)
+    checked = [p for p in model_rows if p.outcome is not PerspectiveOutcome.UNCHECKED]
+    unchecked = [p for p in model_rows if p.outcome is PerspectiveOutcome.UNCHECKED]
+    reasons = sorted(
+        {_SKIP_REASON_LABELS.get(p.skipReason or "", p.skipReason or "사유 없음") for p in unchecked}
+    )
+    return (
+        f"쏜 관점 {len(model_rows)}건 중 {len(checked)}건만 읽었다. 나머지 {len(unchecked)}건은 "
+        f"통과가 아니라 미검사다 ({', '.join(reasons)})."
     )
 
 

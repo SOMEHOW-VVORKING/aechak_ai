@@ -16,6 +16,8 @@
     --text: #e6e8ef; --muted: #99a0b3; --accent: #6ea8fe;
     --ran: #6ea8fe; --skipped: #e8b339; --failed: #f2655c; --idle: #5c6478;
     --clear: #45c08a; --unchecked: #8d93a6; --violation: #f2655c;
+    /* 캐시 축과 모의 경고 전용. 통과·미검사 색과 겹치지 않게 따로 둔다. */
+    --cache: #6ea8fe; --warn: #e0a243;
   }
   * { box-sizing: border-box; }
   body {
@@ -59,6 +61,12 @@
   .pill.CLEAR { color: var(--clear); border-color: var(--clear); }
   .pill.UNCHECKED { color: var(--unchecked); border-color: var(--unchecked); border-style: dashed; }
   .pill.VIOLATION { color: var(--violation); border-color: var(--violation); }
+  /* 캐시 축 전용. 결과 축과 색 어휘가 겹치지 않게 정보성 파랑과 중립 테두리로 둔다. */
+  .pill.cache-hit { color: var(--cache); border-color: var(--cache); }
+  .pill.cache-miss { color: var(--muted); border-color: var(--line); }
+  .pill.simulated { color: var(--warn); border-color: var(--warn); }
+  /* 이름을 .warn 으로 두면 아래 .warn(단계 상세용, --skipped 색)과 겹쳐 뒤가 이긴다. */
+  .simulated-note { margin: 6px 0 0; font-size: 12.5px; color: var(--warn); }
   .exit { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
   .exit .badge {
     font-size: 15px; font-weight: 700; padding: 5px 12px; border-radius: 8px;
@@ -149,7 +157,8 @@
         </div>
         <label for="categoryPath">카테고리 (&gt; 로 구분)</label>
         <input id="categoryPath" type="text" value="강아지 > 건강관리 > 영양제" />
-        <label><input type="checkbox" id="enableTriage" checked /> 선별(N0.5) 켜기</label>
+        <label><input type="checkbox" id="enableTriage" /> 선별(N0.5) 켜기
+          <small id="triage-default">운영 기본값: 꺼짐</small></label>
       </div>
     </div>
 
@@ -212,6 +221,13 @@ async function boot() {
     list.appendChild(button);
   });
   if (meta.scenarios.length) list.children[0].click();
+
+  // 선별 체크박스를 **운영 기본값**으로 맞춘다. 하드코딩으로 켜 두면 발표를 보는 사람이
+  // 선별 통과를 현재 배포된 동작으로 이해한다 -- 실제 배포는 꺼져 있어 전건이 Sonnet 두
+  // 관점을 탄다. 켜서 보여 주려면 사람이 직접 켜는 것이 사실에 맞다.
+  $("enableTriage").checked = Boolean(meta.defaults.enableTriage);
+  $("triage-default").textContent =
+    "운영 기본값: " + (meta.defaults.enableTriage ? "켜짐" : "꺼짐");
 
   const sample = $("sample");
   meta.samples.forEach((name) => sample.appendChild(el("option", null, name)));
@@ -326,11 +342,22 @@ function renderHead(view) {
   panel.appendChild(row);
   panel.appendChild(el("p", "note", view.exit_note));
 
+  // 모의 모드에서는 판정 자체가 추정이다. 그 경고가 머리줄에 없으면 사람이 자기 문장을
+  // 넣어 본 결과가 "이 시스템은 이것을 이렇게 판정한다"로 읽힌다.
+  if (view.judgment_simulated) {
+    row.appendChild(pill("simulated", "모의 판정"));
+    panel.appendChild(el("p", "simulated-note", view.simulated_note));
+  }
+
   const applies = view.backend_gate_applies;
-  const gate = el("p", "gate " + (!applies ? "" : view.backend_accepts ? "ok" : "bad"));
+  // 모의 모드에서는 게이트 배지를 중립색으로 내린다. 키워드 표가 낸 판정에 초록 "관리자
+  // 확인 없이 상태가 바뀐다"를 띄우면 그 문장이 실제 동작으로 읽힌다.
+  const tone = !applies || view.judgment_simulated ? "" : view.backend_accepts ? "ok" : "bad";
+  const gate = el("p", "gate " + tone);
   gate.textContent = (!applies
     ? "백엔드 게이트 해당 없음"
     : view.backend_accepts ? "백엔드 게이트 통과" : "백엔드 게이트 불통과")
+    + (view.judgment_simulated ? " (모의 판정 기준)" : "")
     + " - " + view.backend_note;
   panel.appendChild(gate);
 
@@ -515,7 +542,10 @@ function renderLedger(view) {
     outcome.appendChild(pill(call.outcome === "SUCCESS" ? "ran" : "failed", call.outcome_label));
     tr.appendChild(outcome);
     const cache = el("td");
-    cache.appendChild(pill(call.cache_hit ? "CLEAR" : "UNCHECKED", call.cache_hit ? "적중" : "미적중"));
+    // 결과 축(CLEAR/UNCHECKED)의 색 클래스를 돌려 쓰지 않는다. 선별 캐시는 Haiku 최소
+    // 접두부 미달로 **항상** 미적중이라, 같은 색을 쓰면 선별 시나리오마다 한 화면에
+    // "미검사(회색 점선)"와 "미적중(회색 점선)"이 같이 선다.
+    cache.appendChild(pill(call.cache_hit ? "cache-hit" : "cache-miss", call.cache_hit ? "적중" : "미적중"));
     tr.appendChild(cache);
     tbody.appendChild(tr);
   });
