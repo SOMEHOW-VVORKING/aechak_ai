@@ -43,10 +43,15 @@ _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 #
 # 강한 신호는 정상적인 상품 설명에 나올 이유가 없다. 앞선 지시를 무시하라거나 시스템
 # 프롬프트를 거론하는 문장은 판정기를 겨냥한 것이고, 그 자체가 정책 위반이라 즉시 차단한다.
+# 데이터 봉투의 구분자를 흉내 내는 것도 강한 신호다. 상품 설명과 리뷰가 모델에 나갈 때
+# 아래 ``ENVELOPE_TOKENS``로 감싸이므로, 본문 안에 같은 토큰이 있으면 봉투를 닫고 그 밖에서
+# 운영자 지시처럼 보이는 문장을 끼울 수 있다. 반려동물 용품 문구에 이 토큰이 정당하게 들어갈
+# 이유가 없어서 차단으로 둔다. 대괄호를 두른 시스템 머리줄도 같은 모양의 공격이다.
 _INJECTION_STRONG = re.compile(
     r"(이전\s*지시|앞의?\s*지시|시스템\s*프롬프트|너는\s*이제"
     r"|ignore\s+(all\s+)?previous|disregard\s+(all\s+)?(previous|above)"
-    r"|you\s+are\s+now|new\s+instructions?)",
+    r"|you\s+are\s+now|new\s+instructions?"
+    r"|</?본문>|</대상>|<대상|\[시스템\]|\[system\])",
     re.I,
 )
 # 약한 신호는 다른 맥락에서도 나온다. 기록해 모델에게 넘기고 차단은 하지 않는다.
@@ -57,6 +62,28 @@ _INJECTION_WEAK = re.compile(
 )
 
 _REDACTION = "[가림]"
+
+# 모델에 보내는 본문을 감싸는 구분자. ``triage.py``와 ``pipeline.py``가 같은 토큰을 쓴다.
+#
+# 한 자리에 모아 두는 이유가 있다. 본문 안에 같은 토큰이 있으면 셀러 설명이 봉투를 **닫고**
+# 그 밖에서 새 봉투를 열 수 있고, 그러면 주입된 문장이 모델 입장에서 운영자가 끼운 지시와
+# 구별되지 않는다. 선별이 켜지면 그 한 번의 CLEAR가 Sonnet 두 관점과 백엔드 게이트를 모두
+# 건너뛰게 하므로, 성공한 인젝션이 곧 무검수 자동 승인이 된다.
+ENVELOPE_TOKENS: tuple[str, ...] = ("</본문>", "<본문>", "</대상>", "<대상")
+_NEUTRALIZED = "[태그]"
+
+
+def neutralize_envelope(text: str) -> str:
+    """본문에 들어 있는 봉투 구분자를 중성화한다. 프롬프트에 끼우기 **전에** 부른다.
+
+    정규식 계층이 이 토큰을 강한 신호로 이미 차단하지만, 방어를 그 한 줄에 걸지 않는다 --
+    정규식을 좁히거나 차단을 비차단으로 내리는 변경이 조용히 봉투를 다시 열기 때문이다.
+    긴 토큰부터 치환해야 ``</본문>``이 ``<본문>`` 규칙에 먼저 쪼개지지 않는다.
+    """
+    out = text
+    for token in ENVELOPE_TOKENS:
+        out = out.replace(token, _NEUTRALIZED)
+    return out
 
 
 @dataclass(slots=True)
@@ -89,6 +116,21 @@ class RuleResult:
     def blocking(self) -> list[RuleHit]:
         """즉시 반려까지 갈 수 있는 위반. 결정론적으로 확정된 것만이다."""
         return [h for h in self.hits if h.blocking]
+
+    @property
+    def triage_trumping(self) -> list[RuleHit]:
+        """선별에 묻지 않고 바로 승급시킬 적중. **적중 전부가 아니다.**
+
+        지시형 문장(비차단 인젝션)은 선별에 물으면 안 된다. 물으면 Haiku 1회로 CLEAR가 나올
+        수 있고, 그러면 결정론 계층이 의심한 건이 파이프라인에서 가장 약한 심사를 받는다.
+
+        성분 적중은 다르다. ``ADVISORY_TERMS``의 적중은 "위험하다"가 아니라 "카테고리를
+        함께 봐야 안다"는 뜻이고(``banned.py`` 머리 참조), 선별은 성분을 **판정하는** 것이
+        아니라 더 볼지만 정한다. 그래서 물어도 안전하다. 전부 승급시키면 코코넛오일·우유처럼
+        반려동물 상품에 흔한 성분명 한 단어로 셀러가 선별 절감을 0으로 만들고 Sonnet 2회를
+        강제할 수 있다.
+        """
+        return [h for h in self.hits if h.category is not ViolationCategory.BANNED_INGREDIENT]
 
 
 def normalize(text: str) -> str:

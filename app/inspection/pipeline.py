@@ -56,6 +56,14 @@ from app.settings import JUDGE_RETRY_DELAY_SECONDS, Settings
 
 log = logging.getLogger(__name__)
 
+# ``promptVersion``을 받는 백엔드 칼럼의 길이.
+#
+# 두 자리다 -- V33 의 ``content_inspections.prompt_version VARCHAR(40)`` 과
+# ``ai_call_ledger.prompt_version VARCHAR(40) NOT NULL``. 기본값으로 합성한 값이
+# "inspection-v1+policy-v1+triage-v2" 33자여서 여유가 7자뿐이다. 백엔드가 칼럼을 늘리면
+# 이 상수도 함께 올린다.
+PROMPT_VERSION_MAX_LENGTH = 40
+
 InspectionRequest = ProductInspectionRequest | ReviewInspectionRequest
 
 
@@ -133,11 +141,15 @@ class InspectionPipeline:
             # N0.5 — 선별. 어느 길로 가든 관점 한 줄을 남긴다. 그 줄이 백엔드의 누락률 측정과
             # 하네스의 승급률 분모를 만든다. 아래 집계는 쏜 관점만 세므로 이 줄이 통과를
             # 만들지는 않는다.
-            if rule_result.hits:
-                # 규칙이 비차단으로라도 적중했으면 선별에 묻지 않고 바로 승급한다. 물으면
-                # Haiku 1회로 CLEAR가 나올 수 있고, 그러면 결정론 계층이 의심한 건이
+            if rule_result.triage_trumping:
+                # 규칙 적중 가운데 **선별보다 더 믿을 것**이 있으면 묻지 않고 바로 승급한다.
+                # 물으면 Haiku 1회로 CLEAR가 나올 수 있고, 그러면 결정론 계층이 의심한 건이
                 # 파이프라인에서 가장 약한 심사를 받는다. 규칙은 정규식이라 주입으로 뚫리지
                 # 않으므로 그 적중을 모델 판단보다 더 믿는다.
+                #
+                # 성분 적중은 여기 들어오지 않는다. 그 근거는 RuleResult.triage_trumping 에
+                # 적었다 -- 요약하면 advisory 성분은 "카테고리를 함께 봐야 안다"는 뜻이고,
+                # 전부 승급시키면 흔한 성분명 한 단어로 선별 절감이 0이 된다.
                 perspectives.append(
                     PerspectiveResult(
                         perspective=Perspective.TRIAGE,
@@ -513,10 +525,23 @@ class InspectionPipeline:
         return "플랫폼 정책에 맞지 않는 내용이 있습니다."
 
     def _prompt_version(self) -> str:
-        """판정 재사용 키. 선별을 켜면 판정 경로가 달라지므로 선별 프롬프트 버전도 섞는다."""
+        """판정 재사용 키. 선별을 켜면 판정 경로가 달라지므로 선별 프롬프트 버전도 섞는다.
+
+        합성 문자열이라 세 조각이 각각 자유롭게 바뀌는데(``prompt_version``은 Settings 필드라
+        ``AECHAK_AI_PROMPT_VERSION``으로 외부 주입이 된다) 받는 칼럼은 좁다. 넘치면 MySQL
+        strict 모드가 Data too long 을 던져 저장 트랜잭션이 롤백되고, 판정은 적히지 않은 채
+        컨슈머가 같은 메시지를 되묻다 DLT 로 간다. 그 사이 상품은 기한 정리가 닫을 때까지
+        PENDING 에 남는다. 조용한 DLT 대신 그 자리에서 읽히는 실패로 바꾼다.
+        """
         version = f"{self._settings.prompt_version}+{POLICY_VERSION}"
         if self._settings.enable_triage:
             version = f"{version}+{triage.TRIAGE_VERSION}"
+        if len(version) > PROMPT_VERSION_MAX_LENGTH:
+            raise ValueError(
+                f"합성한 prompt_version 이 {len(version)}자로 백엔드 칼럼 상한"
+                f"({PROMPT_VERSION_MAX_LENGTH}자)을 넘는다: {version!r}. "
+                "AECHAK_AI_PROMPT_VERSION 을 줄이거나 양쪽 칼럼을 함께 늘려라"
+            )
         return version
 
     def _finalize(
@@ -584,6 +609,9 @@ def _user_content(request: InspectionRequest, redacted: str, question: str) -> l
 
     질문을 system 접두부에 넣으면 캐시 지점 뒤의 바이트가 관점마다 달라져 접두부가
     더 짧아진다. 그래서 반드시 접미부다.
+
+    본문을 끼우기 전에 구분자를 중성화한다. ``triage.triage_user_content``와 같은 함수를
+    쓴다 -- 봉투가 두 자리에서 열리고 한쪽만 막으면 선별을 꺼도 뚫린다.
     """
     header = f'<대상 종류="{request.target_type.value}">'
     if isinstance(request, ProductInspectionRequest):
@@ -591,10 +619,11 @@ def _user_content(request: InspectionRequest, redacted: str, question: str) -> l
     else:
         meta = f"별점: {request.rating}점 / 카테고리: {' > '.join(request.categoryPath)}"
 
+    body = rules.neutralize_envelope(redacted)
     return [
         {
             "type": "text",
-            "text": f"{header}\n{meta}\n<본문>\n{redacted}\n</본문>\n</대상>",
+            "text": f"{header}\n{meta}\n<본문>\n{body}\n</본문>\n</대상>",
         },
         {"type": "text", "text": question},
     ]

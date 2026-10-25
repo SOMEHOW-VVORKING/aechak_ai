@@ -65,7 +65,11 @@ class Settings(BaseSettings):
     max_tokens_screening: int = 8192
     max_tokens_escalation: int = 8192
     max_tokens_notice: int = 4096
-    max_tokens_triage: int = 512
+    # 선별도 좁게 두지 않는다. 툴의 ``reason``에 길이 제약을 걸 수 없어서(strict 모드가
+    # maxLength 를 받지 않는다) 사유가 길어지면 응답이 끊기고, 끊긴 호출은 TRUNCATED 승급이
+    # 되어 Haiku 비용을 쓰고도 Sonnet 2회를 그대로 태운다 -- 선별이 순수 손실인 건이다.
+    # 한국어 사유는 글자당 토큰이 1을 넘나든다.
+    max_tokens_triage: int = 1024
     # 선별이 전역 상한을 붙잡으면 깨끗한 건이 오히려 느려진다.
     triage_timeout_seconds: float = 15.0
 

@@ -13,8 +13,11 @@
 근친 복제 프롬프트를 네 개 두면 실패 지점과 꼬리 지연만 늘어난다. 표시·광고는 정책 전문을
 읽어 의미를 판단하고, 행위·거래는 구조와 행위를 본다.
 
-성분 안전은 관점에서 뺐다. 금지 성분은 네거티브 리스트 매칭이라 0단 규칙이 결정론적으로
-판정하고, 모델에 맡길 근거가 없다.
+성분 안전은 **표시·광고 관점이 함께 본다.** 0단 사전이 네거티브 리스트로 대부분을 잡지만
+그 사전이 스스로 적어 둔 사각이 있다 -- 자모 분리, 한영 혼용, 의미를 비틀어 지칭하는 우회가
+정규화로 모이지 않는다. 그 사각의 수신자가 모델 단계라고 ``banned.py``가 약속하는데, 관점
+열거에서 ``BANNED_INGREDIENT``를 빼면 모델이 그것을 **보고할 수단 자체가 없어** 사전이 놓친
+금지 성분이 어느 계층도 거치지 않고 통과한다. 중복 보고는 질문이 막는다.
 """
 
 from __future__ import annotations
@@ -38,11 +41,17 @@ _DISPLAY_ADS = PerspectiveSpec(
         ViolationCategory.EFFICACY_OVERCLAIM,
         ViolationCategory.FALSE_CLAIM,
         ViolationCategory.DISPARAGEMENT,
+        ViolationCategory.BANNED_INGREDIENT,
     ),
     question=(
         "당신의 관점은 **표시와 광고**입니다. 위 정책의 MEDICAL_CLAIM, EFFICACY_OVERCLAIM, "
-        "FALSE_CLAIM, DISPARAGEMENT 네 분류만 보십시오. 효능을 어디까지 말할 수 있는지가 "
-        "판단의 핵심이고, 도움을 줄 수 있다는 표현과 치료한다는 단정을 가르는 것이 당신의 일입니다."
+        "FALSE_CLAIM, DISPARAGEMENT, BANNED_INGREDIENT 다섯 분류만 보십시오. 효능을 어디까지 "
+        "말할 수 있는지가 판단의 핵심이고, 도움을 줄 수 있다는 표현과 치료한다는 단정을 가르는 "
+        "것이 당신의 일입니다.\n"
+        "BANNED_INGREDIENT 는 앞 단계의 사전이 이미 대부분을 차단했습니다. **사전이 차단한 것을 "
+        "중복 보고하지 마십시오.** 당신이 볼 것은 사전이 글자 모양으로 잡지 못하는 것 하나입니다 -- "
+        "성분명을 비틀어 지칭하거나 한글과 영문을 섞어 적은 표기, 그리고 섭취용 제품인지 "
+        "위생용품인지를 카테고리와 함께 봐야 가려지는 경우입니다."
     ),
 )
 
@@ -65,8 +74,12 @@ _CONDUCT_TRADE = PerspectiveSpec(
 
 _SINGLE = PerspectiveSpec(
     perspective=Perspective.ALL,
-    categories=tuple(c for c in ViolationCategory if c is not ViolationCategory.BANNED_INGREDIENT),
-    question=("분류 전체를 보십시오. 단 BANNED_INGREDIENT는 규칙 단계가 이미 판정했으므로 보지 마십시오."),
+    categories=tuple(ViolationCategory),
+    question=(
+        "분류 전체를 보십시오. BANNED_INGREDIENT 는 앞 단계의 사전이 이미 대부분을 차단했으므로 "
+        "사전이 차단한 것을 중복 보고하지 말고, 사전이 글자 모양으로 잡지 못하는 표기와 "
+        "카테고리를 함께 봐야 가려지는 경우만 보십시오."
+    ),
 )
 
 # 상품과 리뷰가 같은 두 관점을 쓴다. 리뷰도 효능을 주장할 수 있어서
