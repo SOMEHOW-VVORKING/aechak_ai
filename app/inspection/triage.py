@@ -102,6 +102,11 @@ class TriageOutcome:
 
     skip: bool
     decision: str | None
+    # 모델이 적은 사유. 분기에 쓰지 않는다 -- 분기 조건은 ``decision`` 하나이고 그게
+    # 불변식 1이다. 이 값은 추적(``app/inspection/trace.py``)으로만 나가고 판정 계약에는
+    # 실리지 않는다. 툴이 ``reason``을 필수로 받는데 여기서 버리면 선별이 왜 승급시켰는지를
+    # 아무 데서도 볼 수 없어 데모 콘솔이 그 단계를 설명할 수 없다.
+    reason: str | None = None
 
 
 def triage_system_blocks() -> list[dict[str, Any]]:
@@ -134,7 +139,10 @@ def decide(result: LlmResult) -> TriageOutcome:
 
     ``!= "NEEDS_REVIEW"``로 쓰면 모르는 값과 빈 값이 통과 방향으로 떨어진다.
     """
-    raw = (result.tool_input or {}).get("decision") if result.ok else None
+    tool_input = (result.tool_input or {}) if result.ok else {}
+    raw = tool_input.get("decision")
     decision = raw if isinstance(raw, str) else None
+    raw_reason = tool_input.get("reason")
+    reason = raw_reason if isinstance(raw_reason, str) else None
     skip = result.ok and decision == "CLEAR"
-    return TriageOutcome(skip=skip, decision=decision)
+    return TriageOutcome(skip=skip, decision=decision, reason=reason)

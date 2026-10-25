@@ -38,6 +38,15 @@ from app.inspection.perspectives import (
     specs_for,
 )
 from app.inspection.policy import POLICY_PREFIX, POLICY_VERSION
+from app.inspection.trace import (
+    FindingRecord,
+    RewritePair,
+    RuleHitRecord,
+    Stage,
+    StageRecord,
+    StageStatus,
+    TraceRecorder,
+)
 from app.llm.client import LlmClient, LlmResult
 from app.schemas.inspection import (
     CallOutcome,
@@ -68,14 +77,25 @@ InspectionRequest = ProductInspectionRequest | ReviewInspectionRequest
 
 
 class InspectionPipeline:
-    def __init__(self, *, llm: LlmClient | None, settings: Settings) -> None:
+    def __init__(
+        self,
+        *,
+        llm: LlmClient | None,
+        settings: Settings,
+        recorder: TraceRecorder | None = None,
+    ) -> None:
         self._llm = llm
         self._settings = settings
+        # 데모 콘솔(SCRUM-290)만 추적기를 준다. 카프카 경로는 주지 않으므로 운영 동작이
+        # 바뀌지 않는다. 판정 계약에 필드를 더하는 대신 이 객체에 모으는 이유는
+        # app/inspection/trace.py 머리에 적었다.
+        self._recorder = recorder
 
     async def run(self, request: InspectionRequest) -> ContentVerdict:
         request_id = f"insp-{request.inspectionId}"
         text = request.inspect_text()
         rule_result = rules.screen(text)
+        self._record_input(request_id, text, rule_result)
 
         perspectives: list[PerspectiveResult] = []
         violations: list[Violation] = []
@@ -95,11 +115,20 @@ class InspectionPipeline:
             for hit in rule_result.hits
         ]
         violations.extend(rule_violations)
-        perspectives.append(
-            PerspectiveResult(
-                perspective=Perspective.RULE,
-                outcome=(PerspectiveOutcome.VIOLATION if rule_result.hits else PerspectiveOutcome.CLEAR),
-            )
+        rule_outcome = PerspectiveOutcome.VIOLATION if rule_result.hits else PerspectiveOutcome.CLEAR
+        perspectives.append(PerspectiveResult(perspective=Perspective.RULE, outcome=rule_outcome))
+        self._record(
+            Stage.RULE,
+            StageStatus.RAN,
+            label="N0 규칙",
+            perspective=Perspective.RULE,
+            outcome=rule_outcome,
+            decision="BLOCKED" if rule_result.blocking else ("HIT" if rule_result.hits else "CLEAR"),
+            note=(
+                f"적중 {len(rule_result.hits)}건 중 차단 {len(rule_result.blocking)}건"
+                if rule_result.hits
+                else "적중 없음"
+            ),
         )
 
         if rule_result.blocking:
@@ -127,6 +156,15 @@ class InspectionPipeline:
                     outcome=PerspectiveOutcome.UNCHECKED,
                     skipReason="LLM_DISABLED",
                 )
+            )
+            self._record(
+                Stage.JUDGE,
+                StageStatus.SKIPPED,
+                label="N1 관점 판정",
+                perspective=Perspective.ALL,
+                outcome=PerspectiveOutcome.UNCHECKED,
+                skip_reason="LLM_DISABLED",
+                note="모델 클라이언트가 없다. stub 모드다",
             )
             return self._finalize(
                 request,
@@ -157,6 +195,15 @@ class InspectionPipeline:
                         skipReason="RULE_HIT",
                     )
                 )
+                self._record(
+                    Stage.TRIAGE,
+                    StageStatus.SKIPPED,
+                    label="N0.5 선별",
+                    perspective=Perspective.TRIAGE,
+                    outcome=PerspectiveOutcome.UNCHECKED,
+                    skip_reason="RULE_HIT",
+                    note="규칙이 비차단으로 적중했다. 묻지 않고 바로 승급한다",
+                )
                 log.info("규칙 적중으로 선별을 건너뛰고 승급한다. request_id=%s", request_id)
             else:
                 outcome = await self._triage(request, rule_result.redacted, request_id, calls)
@@ -169,14 +216,25 @@ class InspectionPipeline:
                     # 건너뛴 관점을 "선별이 깨끗하다고 해서 안 봤다"로 남긴다. 이 사유가 없으면
                     # 백엔드는 호출이 죽어서 못 본 것과 구분할 수 없어 통과를 받아들이지 못하고,
                     # 선별이 건너뛴 건을 전건 사람에게 넘긴다. 그러면 선별이 비용만 더한다.
+                    skipped = specs_for(request.target_type, fanout=self._settings.perspective_fanout)
                     perspectives.extend(
                         PerspectiveResult(
                             perspective=spec.perspective,
                             outcome=PerspectiveOutcome.UNCHECKED,
                             skipReason=triage.TRIAGE_SKIP_REASON,
                         )
-                        for spec in specs_for(request.target_type, fanout=self._settings.perspective_fanout)
+                        for spec in skipped
                     )
+                    for spec in skipped:
+                        self._record(
+                            Stage.JUDGE,
+                            StageStatus.SKIPPED,
+                            label=f"N1 {spec.perspective.value}",
+                            perspective=spec.perspective,
+                            outcome=PerspectiveOutcome.UNCHECKED,
+                            skip_reason=triage.TRIAGE_SKIP_REASON,
+                            note="선별이 깨끗하다고 해서 보지 않았다. 통과가 아니라 미검사다",
+                        )
                     log.info("선별이 통과시켰다. 관점 호출을 건너뛴다. request_id=%s", request_id)
                     return self._finalize(
                         request,
@@ -195,6 +253,17 @@ class InspectionPipeline:
                         skipReason="PROMOTED",
                     )
                 )
+        else:
+            # 꺼진 것과 도달하지 못한 것을 콘솔이 가를 수 있게 남긴다. 판정 계약에는
+            # 꺼진 선별의 행이 아예 없어서(그게 맞다) 추적만 이 사실을 안다.
+            self._record(
+                Stage.TRIAGE,
+                StageStatus.SKIPPED,
+                label="N0.5 선별",
+                perspective=Perspective.TRIAGE,
+                skip_reason="TRIAGE_DISABLED",
+                note="enable_triage 가 꺼져 있다",
+            )
 
         # N1 — 관점 판정. 순차로 돈다.
         #
@@ -206,9 +275,20 @@ class InspectionPipeline:
         for spec in specs:
             result = await self._judge(spec, request, rule_result.redacted, request_id)
             calls.extend(self._usage(result, request_id, perspective=spec.perspective))
-            perspective_result, found = self._interpret(spec, result, rule_result.redacted)
+            perspective_result, found, reported = self._interpret(spec, result, rule_result.redacted)
             perspectives.append(perspective_result)
             violations.extend(found)
+            self._record(
+                Stage.JUDGE,
+                StageStatus.RAN if result.ok else StageStatus.FAILED,
+                label=f"N1 {spec.perspective.value}",
+                perspective=spec.perspective,
+                outcome=perspective_result.outcome,
+                skip_reason=perspective_result.skipReason,
+                findings=reported,
+                evidence_dropped=sum(1 for f in reported if not f.verified),
+                result=result,
+            )
 
         # N2 — 집계. 3상태 OR이고 코드가 판정한다.
         #
@@ -226,6 +306,18 @@ class InspectionPipeline:
         verdict = Verdict.FLAG if model_violations else (Verdict.PASS if checked else Verdict.FAILED)
         seller_notice: str | None = None
         critic_overturned = False
+        self._record(
+            Stage.AGGREGATE,
+            StageStatus.RAN,
+            label="N2 집계",
+            decision=verdict.value,
+            dispatched=len(dispatched),
+            checked=len(checked),
+            note=(
+                f"쏜 관점 {len(dispatched)}건 중 {len(checked)}건이 실제로 판정했다. "
+                "0건이면 통과가 아니라 판정 실패다"
+            ),
+        )
 
         if verdict is Verdict.FLAG:
             # N3 — 반박. 셀러를 잘못 막는 비용이 커서 다른 모델에게 오탐 여부를 묻는다.
@@ -279,6 +371,22 @@ class InspectionPipeline:
         )
         calls.extend(self._usage(result, request_id, perspective=Perspective.TRIAGE))
         outcome = triage.decide(result)
+        # 선별이 적은 사유를 추적에 남긴다. 판정 계약에는 그것을 적을 자리가 없고,
+        # 승급의 이유는 콘솔이 보여 줘야 하는 것 가운데 가장 먼저 필요한 값이다.
+        self._record(
+            Stage.TRIAGE,
+            StageStatus.RAN if result.ok else StageStatus.FAILED,
+            label="N0.5 선별",
+            perspective=Perspective.TRIAGE,
+            outcome=(PerspectiveOutcome.CLEAR if outcome.skip else PerspectiveOutcome.UNCHECKED),
+            skip_reason=(triage.TRIAGE_SKIP_REASON if outcome.skip else "PROMOTED"),
+            decision=outcome.decision,
+            reason=outcome.reason,
+            note=(
+                None if result.ok else "호출이 실패했다. 대안이 승급이라 재시도하지 않고 그대로 올려 보낸다"
+            ),
+            result=result,
+        )
         if not result.ok:
             log.warning(
                 "선별 호출 실패. 승급한다. request_id=%s outcome=%s", request_id, result.outcome.value
@@ -329,7 +437,13 @@ class InspectionPipeline:
         spec: PerspectiveSpec,
         result: LlmResult,
         redacted: str,
-    ) -> tuple[PerspectiveResult, list[Violation]]:
+    ) -> tuple[PerspectiveResult, list[Violation], list[FindingRecord]]:
+        """관점 응답을 판정으로 바꾼다.
+
+        세 번째 반환값은 **보고된 전건**이다. 판정에 실리는 ``Violation``은 인용이 검증된
+        것만 남고 모델이 적은 ``reason``도 버리는데, 콘솔은 떨어진 인용과 그 사유를 보여 줘야
+        한다. 순수 함수로 두고 기록은 호출부가 한다.
+        """
         if not result.ok:
             return (
                 PerspectiveResult(
@@ -338,14 +452,25 @@ class InspectionPipeline:
                     skipReason=result.outcome.value,
                 ),
                 [],
+                [],
             )
 
         raw = (result.tool_input or {}).get("findings") or []
         verified: list[Violation] = []
+        reported: list[FindingRecord] = []
         unverified = 0
         for item in raw:
             quote = str(item.get("quote") or "")
             start = redacted.find(quote) if quote else -1
+            reported.append(
+                FindingRecord(
+                    category=str(item.get("category") or ""),
+                    quote=quote,
+                    reason=item.get("reason"),
+                    suggestion=item.get("suggestion"),
+                    verified=start >= 0,
+                )
+            )
             if start < 0:
                 # 모델이 원문에 없는 문장을 인용했다. 그 판정은 믿지 않는다.
                 unverified += 1
@@ -376,6 +501,7 @@ class InspectionPipeline:
                     skipReason="EVIDENCE_UNVERIFIED",
                 ),
                 [],
+                reported,
             )
 
         if unverified:
@@ -387,6 +513,7 @@ class InspectionPipeline:
                 outcome=(PerspectiveOutcome.VIOLATION if verified else PerspectiveOutcome.CLEAR),
             ),
             verified,
+            reported,
         )
 
     async def _criticize(
@@ -403,6 +530,13 @@ class InspectionPipeline:
         레이트 리밋을 유도하는 것만으로 검수를 끌 수 있게 되기 때문이다.
         """
         if self._llm is None or not self._settings.enable_escalation:
+            self._record(
+                Stage.CRITIC,
+                StageStatus.SKIPPED,
+                label="N3 비평",
+                skip_reason="ESCALATION_DISABLED",
+                note="비평을 끄면 1차 판정이 그대로 확정된다",
+            )
             return True
 
         issues = "\n".join(
@@ -440,10 +574,30 @@ class InspectionPipeline:
         calls.extend(self._usage(result, request_id, perspective=Perspective.ALL))
 
         if not result.ok:
+            # 원장에는 이 호출이 ``ALL`` 관점으로 적힌다. 백엔드 열거에 없는 값을 넣으면
+            # 역직렬화가 깨지므로 단계 라벨은 추적 쪽에만 둔다.
+            self._record(
+                Stage.CRITIC,
+                StageStatus.FAILED,
+                label="N3 비평",
+                note="호출이 실패했다. 1차 판정을 유지한다. 실패를 통과로 읽으면 비평이 가용성 공격면이 된다",
+                result=result,
+            )
             log.warning("반박 호출 실패. 1차 판정을 유지한다. outcome=%s", result.outcome.value)
             return True
 
-        decision = (result.tool_input or {}).get("decision")
+        tool_input = result.tool_input or {}
+        decision = tool_input.get("decision")
+        # UPHOLD 와 INSUFFICIENT 는 판정 메시지에서 구분되지 않는다. 둘 다 위반 유지이고
+        # ``criticOverturned`` 는 거짓이다. 그 구분은 추적만 안다.
+        self._record(
+            Stage.CRITIC,
+            StageStatus.RAN,
+            label="N3 비평",
+            decision=str(decision) if decision is not None else None,
+            reason=tool_input.get("reason"),
+            result=result,
+        )
         if decision == "OVERTURN":
             log.info("반박이 1차 판정을 뒤집었다. request_id=%s", request_id)
             return False
@@ -458,6 +612,12 @@ class InspectionPipeline:
         calls: list[CallUsage],
     ) -> str | None:
         if self._llm is None or not self._settings.enable_notice:
+            self._record(
+                Stage.NOTICE,
+                StageStatus.SKIPPED,
+                label="N4 수정 문구",
+                skip_reason="NOTICE_DISABLED",
+            )
             return None
 
         issues = "\n".join(f"- [{v.category}] {v.quote}" for v in violations)
@@ -488,9 +648,76 @@ class InspectionPipeline:
         calls.extend(self._usage(result, request_id, perspective=Perspective.ALL))
 
         if not result.ok:
+            self._record(
+                Stage.NOTICE,
+                StageStatus.FAILED,
+                label="N4 수정 문구",
+                note="호출이 실패했다. 안내 없이 보류만 내려간다",
+                result=result,
+            )
             return None
-        notice = (result.tool_input or {}).get("sellerNotice")
+        tool_input = result.tool_input or {}
+        notice = tool_input.get("sellerNotice")
+        # ``rewrites`` 배열은 판정에 실리지 않고 버려진다. 콘솔이 보여 줄 수 있게 추적에 남긴다.
+        self._record(
+            Stage.NOTICE,
+            StageStatus.RAN,
+            label="N4 수정 문구",
+            reason=str(notice) if notice else None,
+            rewrites=_rewrite_pairs(tool_input.get("rewrites")),
+            result=result,
+        )
         return str(notice) if notice else None
+
+    def _record(
+        self,
+        stage: Stage,
+        status: StageStatus,
+        *,
+        label: str,
+        result: LlmResult | None = None,
+        **fields: Any,
+    ) -> None:
+        """단계를 추적에 적는다. 추적기가 없으면 아무 일도 하지 않는다.
+
+        ``if`` 를 한 자리에 모은다. 호출부마다 조건을 쓰면 빠뜨린 자리가 생기고, 그보다
+        나쁜 것은 추적이 운영 경로의 분기에 섞여 들어가는 것이다. 여기서는 기록만 한다.
+        """
+        if self._recorder is None:
+            return
+        record = StageRecord(stage=stage, status=status, label=label, **fields)
+        if result is not None:
+            # ``LlmResult.detail`` 은 ``CallUsage`` 로 넘어가지 않는다. 열거값만 남으면
+            # max_tokens 초과와 스키마 오류 본문이 사라져 콘솔이 실패 이유를 설명할 수 없다.
+            record.call_id = result.call_id
+            record.model_id = result.model_id
+            record.latency_ms = result.latency_ms
+            record.cost_micro_usd = result.cost_micro_usd
+            record.detail = result.detail
+        self._recorder.add(record)
+
+    def _record_input(self, request_id: str, text: str, rule_result: rules.RuleResult) -> None:
+        """원문·가린 본문과 규칙 적중 상세를 적는다.
+
+        가린 본문을 함께 드는 이유가 중요하다. ``Violation.spanStart/spanEnd`` 는 **가린 본문
+        기준** 오프셋이라, 콘솔이 원문에 하이라이트를 찍으면 엉뚱한 구간을 가리킨다.
+        """
+        if self._recorder is None:
+            return
+        self._recorder.set_input(request_id=request_id, text=text, redacted=rule_result.redacted)
+        self._recorder.set_rule_hits(
+            [
+                RuleHitRecord(
+                    category=hit.category,
+                    quote=hit.quote,
+                    reason=hit.reason,
+                    blocking=hit.blocking,
+                    start=hit.start,
+                    end=hit.end,
+                )
+                for hit in rule_result.hits
+            ]
+        )
 
     def _usage(
         self,
@@ -585,6 +812,21 @@ def countable_perspectives(
         for p in perspectives
         if p.perspective in dispatched and p.outcome is not PerspectiveOutcome.UNCHECKED
     ]
+
+
+def _rewrite_pairs(raw: Any) -> list[RewritePair]:
+    """``propose_rewrite``의 ``rewrites`` 배열을 추적 레코드로 접는다. 모양이 틀리면 버린다."""
+    if not isinstance(raw, list):
+        return []
+    pairs: list[RewritePair] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        original = item.get("original")
+        suggestion = item.get("suggestion")
+        if isinstance(original, str) and isinstance(suggestion, str):
+            pairs.append(RewritePair(original=original, suggestion=suggestion))
+    return pairs
 
 
 def _system_blocks() -> list[dict[str, Any]]:
