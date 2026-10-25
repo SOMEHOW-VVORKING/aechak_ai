@@ -7,15 +7,10 @@ from typing import Any
 
 import pytest
 
-from app.inspection.triage import TRIAGE_SKIP_REASON
 from app.llm.client import LlmResult
-from app.schemas.inspection import (
-    CallOutcome,
-    ContentVerdict,
-    Perspective,
-    PerspectiveOutcome,
-)
+from app.schemas.inspection import CallOutcome
 from app.settings import Settings
+from demo import view
 
 CONTRACT_DIR = Path(__file__).parent / "contract"
 
@@ -82,31 +77,23 @@ def failed(
     )
 
 
-# 백엔드 게이트 규칙을 그대로 옮긴 술어.
+# 백엔드 게이트 술어. **사본을 여기 또 두지 않는다.**
 #
-# 정본은 백엔드 ``ContentVerdictMessage.hasModelEvidence()`` 다. 선별이 건너뛴 통과를 관리자 손을
-# 거치지 않고 받으려면 셋이 동시에 참이어야 한다 -- ``TRIAGE`` 행이 ``CLEAR``, 모델 관점 행이
-# 비어 있지 않음, 그 행 전부의 사유가 ``TRIAGE_CLEAR``.
+# 정본은 백엔드 ``ContentVerdictMessage.hasModelEvidence()`` 이고, 이 레포의 파이썬 거울은
+# ``demo/view.py`` 의 ``backend_accepts`` 하나다. 선별이 건너뛴 통과를 관리자 손을 거치지 않고
+# 받으려면 셋이 동시에 참이어야 한다 -- ``TRIAGE`` 행이 ``CLEAR``, 모델 관점 행이 비어 있지
+# 않음, 그 행 전부의 사유가 ``TRIAGE_CLEAR``.
 #
-# 가운데 조건을 여기 베껴 두는 이유가 전부다. 건너뛴 관점의 행을 생략하면 백엔드는 그것을
-# 증거 없는 통과로 보고 전건을 관리자 검토 큐로 보낸다. 그러면 선별은 Sonnet 호출만 아끼고
-# 사람 손은 그만큼 더 쓰는 장치가 된다. 생산자 쪽 테스트가 행의 존재만 보면 그 결과를 잡지
-# 못하므로, 소비자의 판단 규칙 자체를 테스트가 소유한다.
-BACKEND_MODEL_PERSPECTIVES = (
-    Perspective.ALL,
-    Perspective.DISPLAY_ADS,
-    Perspective.CONDUCT_TRADE,
-)
-
-
-def backend_model_verified(verdict: ContentVerdict) -> bool:
-    """백엔드가 이 판정을 "모델이 내용을 읽었다"로 받아들이는가."""
-    model_rows = [p for p in verdict.perspectives if p.perspective in BACKEND_MODEL_PERSPECTIVES]
-    if any(p.outcome is not PerspectiveOutcome.UNCHECKED for p in model_rows):
-        return True
-
-    triage_cleared = any(
-        p.perspective is Perspective.TRIAGE and p.outcome is PerspectiveOutcome.CLEAR
-        for p in verdict.perspectives
-    )
-    return triage_cleared and bool(model_rows) and all(p.skipReason == TRIAGE_SKIP_REASON for p in model_rows)
+# 종전에는 같은 규칙을 여기에도 손으로 베껴 두고 "두 사본이 같은 답을 내는지"를 테스트가
+# 단언했는데, 그 단언은 항진명제였다 -- 백엔드가 조건을 바꾸면 두 파이썬 사본은 여전히 서로
+# 같아 전부 녹색이고, 콘솔은 백엔드가 거부할 통과에 "관리자 확인 없이 상태가 바뀐다"는 초록
+# 배지를 계속 띄운다.
+#
+# 그래서 사본을 하나로 줄이고, 정본과의 어긋남은 **계약 표본에 대한 기대값**으로 잡는다
+# (``tests/test_demo.py`` 의 ``test_계약_표본마다_게이트_통과_여부를_표로_고정한다``).
+# 표본은 백엔드 레포가 소유하므로 정본이 바뀌면 그 표가 깨진다.
+#
+# 방향이 테스트 -> demo 인 이유: 거울이 필요한 쪽은 콘솔이고, 운영·데모 코드가 테스트
+# 코드를 import 하게 만들 수는 없다.
+BACKEND_MODEL_PERSPECTIVES = view.BACKEND_MODEL_PERSPECTIVES
+backend_model_verified = view.backend_accepts
