@@ -68,7 +68,9 @@ class InspectBody(BaseModel):
     categoryPath: list[str] = Field(default_factory=lambda: list(DEFAULT_CATEGORY_PATH))
     content: str = ""
     rating: int = 5
-    enableTriage: bool = True
+    # 운영 기본값을 그대로 쓴다. 여기에 True 를 박아 두면 콘솔이 보내지 않을 때 배포된
+    # 동작과 다른 경로가 돌고, 두 자리의 기본값이 갈라진다.
+    enableTriage: bool = Field(default_factory=lambda: Settings().enable_triage)
 
 
 class VerdictBody(BaseModel):
@@ -130,9 +132,11 @@ async def inspect(body: InspectBody) -> JSONResponse:
         return await _run(
             request=scenario.to_request(),
             llm=None if scenario.llm_disabled else ReplayLlmClient(entries=dict(scenario.entries)),
-            enable_triage=scenario.enable_triage,
+            # 시나리오가 파이프라인 모양 전부를 든다. 앰비언트 환경을 한 칸도 읽지 않는다.
+            settings=scenario.settings(),
             mode="replay",
             source=scenario.id,
+            expected_exit=scenario.expected_exit,
         )
 
     request = _request_from(body)
@@ -143,7 +147,7 @@ async def inspect(body: InspectBody) -> JSONResponse:
         return await _run(
             request=request,
             llm=MockLlmClient(),
-            enable_triage=body.enableTriage,
+            settings=Settings().model_copy(update={"enable_triage": body.enableTriage}),
             mode="mock",
             source="custom",
         )
@@ -157,7 +161,7 @@ async def inspect(body: InspectBody) -> JSONResponse:
         return await _run(
             request=request,
             llm=llm,
-            enable_triage=body.enableTriage,
+            settings=settings.model_copy(update={"enable_triage": body.enableTriage}),
             mode="live",
             source="custom",
         )
@@ -201,11 +205,11 @@ async def _run(
     *,
     request: ProductInspectionRequest | ReviewInspectionRequest,
     llm: Any,
-    enable_triage: bool,
+    settings: Settings,
     mode: str,
     source: str,
+    expected_exit: str | None = None,
 ) -> JSONResponse:
-    settings = Settings().model_copy(update={"enable_triage": enable_triage})
     recorder = TraceRecorder()
     pipeline = InspectionPipeline(llm=llm, settings=settings, recorder=recorder)
     try:
@@ -216,7 +220,22 @@ async def _run(
         return _error(str(miss))
 
     built = view.build(verdict, mode=mode, source=source, trace=recorder.trace)
+    mismatch = _verify_expected_exit(built.exit_point, expected_exit)
+    if mismatch is not None:
+        # 틀린 그림을 정상 응답으로 내보내지 않는다. 사이드바에는 시나리오의 설명과
+        # expected_exit 가 떠 있으므로, 다른 경로를 그리면 화면이 자기를 부정한다.
+        return _error(mismatch)
     return JSONResponse({"view": built.as_dict(), "verdict": json.loads(verdict.model_dump_json())})
+
+
+def _verify_expected_exit(actual: str, expected: str | None) -> str | None:
+    """시나리오가 적어 둔 경로로 돌았는지 본다. 어긋나면 오류 문구를, 맞으면 None."""
+    if expected is None or actual == expected:
+        return None
+    return (
+        f"시나리오가 적어 둔 경로와 다르게 돌았다. 적어 둔 곳={expected} 실제={actual}. "
+        "앰비언트 환경이 파이프라인 모양을 바꿨거나 카세트가 시나리오와 어긋났다"
+    )
 
 
 def _request_from(body: InspectBody) -> ProductInspectionRequest | ReviewInspectionRequest:

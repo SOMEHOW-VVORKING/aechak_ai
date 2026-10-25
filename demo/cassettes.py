@@ -28,6 +28,7 @@ from app.schemas.inspection import (
     ReviewInspectionRequest,
     TargetType,
 )
+from app.settings import Settings
 from demo.replay import CallKey, ScriptedCall
 
 InspectionRequest = ProductInspectionRequest | ReviewInspectionRequest
@@ -52,10 +53,47 @@ class Scenario:
     option_names: tuple[str, ...] = ("소형견 / 60정",)
     category_path: tuple[str, ...] = ("강아지", "건강관리", "영양제")
     rating: int = 5
+    # --- 파이프라인 모양. 재생이 앰비언트 환경에 흔들리지 않게 시나리오가 전부 들고 있다.
+    #
+    # 종전에는 ``enable_triage`` 하나만 고정하고 나머지는 환경에서 읽었다. 카세트 키가
+    # (툴 이름, 관점)이고 관점은 ``findings_tool`` 의 분류 enum 집합으로 역산되므로
+    # ``perspective_fanout`` 이 바뀌면 키가 바뀐다 -- 실측으로
+    # ``AECHAK_AI_PERSPECTIVE_FANOUT=false`` 를 셸에 둔 채 콘솔을 띄우면 네 시나리오가 전부
+    # 400으로 죽었고, 비평·수정문구를 함께 끄면 critic-overturn 이 오류 없이 '확정 위반'으로
+    # 그려졌다(사이드바에는 ``expected_exit=CRITIC_OVERTURNED`` 가 그대로 떠 있는 채로).
+    # .env 가 없어도 배포용 셸이나 direnv 가 켜진 디렉터리에서 그대로 재현된다.
     enable_triage: bool = True
+    perspective_fanout: bool = True
+    enable_escalation: bool = True
+    enable_notice: bool = True
+    # 모델 ID 도 묶는다. 원장의 모델 이름과 비용이 환경에 따라 달라지면 콘솔이 보여 주는
+    # 숫자로 손익분기를 이야기할 수 없다.
+    screening_model: str = "claude-sonnet-5"
+    escalation_model: str = "claude-opus-5"
+    notice_model: str = "claude-sonnet-5"
+    triage_model: str = "claude-haiku-4-5"
     # 모델 클라이언트 자체가 없는 경로(stub 모드)를 보여 주는 시나리오만 참이다.
     llm_disabled: bool = False
     entries: dict[CallKey, ScriptedCall] = field(default_factory=dict)
+
+    def settings(self) -> Settings:
+        """재생용 설정을 **리터럴에서** 조립한다. 환경변수를 한 칸도 읽지 않는다.
+
+        ``Settings()`` 를 쓰고 일부만 덮으면 덮지 않은 필드가 앰비언트 환경에서 들어온다.
+        키도 비운다 -- 재생은 네트워크를 타지 않으므로 키가 필요 없고, 있으면 실수로
+        유료 경로를 밟을 여지가 생긴다.
+        """
+        return Settings(
+            anthropic_api_key="",
+            enable_triage=self.enable_triage,
+            perspective_fanout=self.perspective_fanout,
+            enable_escalation=self.enable_escalation,
+            enable_notice=self.enable_notice,
+            screening_model=self.screening_model,
+            escalation_model=self.escalation_model,
+            notice_model=self.notice_model,
+            triage_model=self.triage_model,
+        )
 
     def to_request(self, inspection_id: int = 9001) -> InspectionRequest:
         if self.target is TargetType.PRODUCT:
@@ -300,11 +338,12 @@ SCENARIOS: tuple[Scenario, ...] = (
     ),
     Scenario(
         id="evidence-unverified",
-        title="인용 검증 실패 (판정을 버린다)",
-        expected_exit="MODEL_CLEAR",
+        title="인용 검증 실패 (부분 미검사 통과)",
+        expected_exit="MODEL_PARTIAL",
         note=(
             "모델이 본문에 없는 문장을 인용했다. 그 판정은 버리고 관점을 미검사로 적는다. "
-            "통과로 적으면 못 본 것을 봤다고 적는 셈이다. 나머지 관점이 봤으므로 통과다."
+            "나머지 관점이 봤으므로 판정은 통과이지만, 의료·효능을 보는 관점은 아무 판정도 "
+            "못 했다. 그래서 '다 읽은 통과'가 아니라 부분 미검사 통과로 그린다."
         ),
         text=_EDGE_TEXT,
         entries=dict(
