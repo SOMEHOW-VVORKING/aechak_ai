@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from conftest import FakeLlmClient, failed, ok
+from conftest import FakeLlmClient, backend_model_verified, failed, ok
 
 from app.inspection import banned, triage
 from app.inspection.perspectives import specs_for
@@ -75,6 +75,35 @@ async def test_선별이_깨끗하면_Sonnet을_건너뛴다(triage_on: Settings
     for perspective in (Perspective.DISPLAY_ADS, Perspective.CONDUCT_TRADE):
         assert rows[perspective].outcome is PerspectiveOutcome.UNCHECKED
         assert rows[perspective].skipReason == triage.TRIAGE_SKIP_REASON
+
+
+async def test_선별이_건너뛴_통과가_백엔드_게이트를_그대로_통과한다(triage_on: Settings) -> None:
+    """건너뛴 관점에 행을 남기는 이유는 백엔드가 통과를 받아들이게 하는 것 하나다.
+
+    행의 존재와 사유만 보는 단언은 이 결과를 잡지 못한다. 모델 관점 행을 하나도 남기지 않는
+    모양도, 사유를 다른 문자열로 적은 모양도 생산자 쪽에서는 멀쩡해 보이는데 백엔드에서는
+    둘 다 증거 없는 통과가 되어 전건이 관리자 검토 큐로 간다. 그래서 소비자의 판단 규칙을
+    그대로 옮긴 술어로 단언한다.
+    """
+    llm = FakeLlmClient([triage_ok(CLEAR, triage_on)])
+    pipeline = InspectionPipeline(llm=llm, settings=triage_on)
+
+    verdict = await pipeline.run(product("글루코사민 함유 영양제입니다"))
+
+    assert backend_model_verified(verdict), (
+        "백엔드가 이 통과를 증거 없는 통과로 보면 선별이 건너뛴 건이 전건 관리자 검토 큐로 가고, "
+        "선별은 Sonnet 호출만 아끼고 사람 손은 그만큼 더 쓰는 장치가 된다"
+    )
+
+
+async def test_승급한_건도_백엔드_게이트를_통과한다(triage_on: Settings) -> None:
+    """승급 경로는 모델이 실제로 읽으므로 사유 규약과 무관하게 통과해야 한다."""
+    llm = FakeLlmClient([triage_ok(NEEDS_REVIEW, triage_on), ok(NO_FINDING), ok(NO_FINDING)])
+    pipeline = InspectionPipeline(llm=llm, settings=triage_on)
+
+    verdict = await pipeline.run(product("글루코사민 함유 영양제입니다"))
+
+    assert backend_model_verified(verdict)
 
 
 async def test_선별이_더_보라고_하면_Sonnet_두_관점을_탄다(triage_on: Settings) -> None:

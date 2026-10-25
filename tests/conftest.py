@@ -7,8 +7,14 @@ from typing import Any
 
 import pytest
 
+from app.inspection.triage import TRIAGE_SKIP_REASON
 from app.llm.client import LlmResult
-from app.schemas.inspection import CallOutcome
+from app.schemas.inspection import (
+    CallOutcome,
+    ContentVerdict,
+    Perspective,
+    PerspectiveOutcome,
+)
 from app.settings import Settings
 
 CONTRACT_DIR = Path(__file__).parent / "contract"
@@ -74,3 +80,33 @@ def failed(
         tool_input=None,
         latency_ms=50,
     )
+
+
+# 백엔드 게이트 규칙을 그대로 옮긴 술어.
+#
+# 정본은 백엔드 ``InspectionFacade.modelVerified()`` 다. 선별이 건너뛴 통과를 관리자 손을
+# 거치지 않고 받으려면 셋이 동시에 참이어야 한다 -- ``TRIAGE`` 행이 ``CLEAR``, 모델 관점 행이
+# 비어 있지 않음, 그 행 전부의 사유가 ``TRIAGE_CLEAR``.
+#
+# 가운데 조건을 여기 베껴 두는 이유가 전부다. 건너뛴 관점의 행을 생략하면 백엔드는 그것을
+# 증거 없는 통과로 보고 전건을 관리자 검토 큐로 보낸다. 그러면 선별은 Sonnet 호출만 아끼고
+# 사람 손은 그만큼 더 쓰는 장치가 된다. 생산자 쪽 테스트가 행의 존재만 보면 그 결과를 잡지
+# 못하므로, 소비자의 판단 규칙 자체를 테스트가 소유한다.
+BACKEND_MODEL_PERSPECTIVES = (
+    Perspective.ALL,
+    Perspective.DISPLAY_ADS,
+    Perspective.CONDUCT_TRADE,
+)
+
+
+def backend_model_verified(verdict: ContentVerdict) -> bool:
+    """백엔드가 이 판정을 "모델이 내용을 읽었다"로 받아들이는가."""
+    model_rows = [p for p in verdict.perspectives if p.perspective in BACKEND_MODEL_PERSPECTIVES]
+    if any(p.outcome is not PerspectiveOutcome.UNCHECKED for p in model_rows):
+        return True
+
+    triage_cleared = any(
+        p.perspective is Perspective.TRIAGE and p.outcome is PerspectiveOutcome.CLEAR
+        for p in verdict.perspectives
+    )
+    return triage_cleared and bool(model_rows) and all(p.skipReason == TRIAGE_SKIP_REASON for p in model_rows)
