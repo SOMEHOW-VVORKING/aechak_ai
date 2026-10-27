@@ -478,7 +478,10 @@ async def test_산문에_연락처가_섞이면_그_항목만_버린다() -> Non
     message = await SummaryService(llm=client, settings=_settings()).run(_request(_THREE))
 
     assert message.summaries[0].pros == []
-    assert message.dropped.piiRedacted >= 1
+    # **출력 게이트 탈락은 ``piiRedacted`` 가 아니라 ``outputGateBlocked`` 가 센다.**
+    # 한 필드로 세면 "입력에 연락처가 많았다"(정상)와 "모델이 산문에 썼다"(사고)가 섞인다.
+    assert message.dropped.outputGateBlocked >= 1
+    assert message.dropped.piiRedacted == 0
     assert message.state is SummaryState.OK, "요약 전체를 버렸다"
 
 
@@ -878,3 +881,244 @@ async def test_서술_실패도_센_항목을_들고_나간다() -> None:
     summary = message.summaries[0]
     assert summary.narrateFailure is not None
     assert [row.aspectCode for row in summary.unnarratedAspects] == [AspectCode.PALATABILITY]
+
+
+# --- 못 읽은 것을 "없음"으로 적지 않는다 ------------------------------------------------
+
+
+_TEN_NEGATIVE = [_review(100 + i, 1, f"냄새가 너무 심해서 버렸어요 {i}번째 구매") for i in range(10)]
+_NINE_PRO_TALLY = [
+    AspectTallyRow(
+        aspectCode=AspectCode.PALATABILITY,
+        polarity=Polarity.PRO,
+        mentionCount=9,
+        labelSamples=["기호성"],
+        quoteSamples=[QuoteSample(reviewId=1, text="잘 먹어요")],
+    )
+]
+
+
+async def test_이번_회차에_못_읽은_리뷰가_분모와_미검사_수에_반영된다() -> None:
+    """**이 프로젝트의 1번 불변식이다.** 모델이 한 글자도 읽지 않은 리뷰를 분석한 것으로
+    세고 "단점 언급 없음"을 적으면 거짓이다.
+
+    ``unextractedReviewCount`` 가 요청값을 되읊기만 해서, 신규 10건이 전건 추출 실패했는데
+    응답이 "20건을 분석했고 단점이 없었다"로 읽혔다. 진실은 ``extracted[]`` 에만 있었다.
+    """
+    client = _client(
+        extract0=ScriptedCall(outcome=CallOutcome.ERROR, detail="boom"),
+        extract1=ScriptedCall(outcome=CallOutcome.ERROR, detail="boom"),
+        narrate0=ScriptedCall(
+            tool_input={
+                "pros": [
+                    {
+                        "aspectCode": AspectCode.PALATABILITY.value,
+                        "headline": "잘 먹는다는 후기가 반복됩니다",
+                        "quotes": [{"reviewId": 1, "text": "잘 먹어요"}],
+                    }
+                ],
+                "cons": [],
+            }
+        ),
+    )
+    import app.review_summary.service as service_module
+
+    original = service_module.JUDGE_RETRY_DELAY_SECONDS
+    service_module.JUDGE_RETRY_DELAY_SECONDS = 0.0
+    try:
+        message = await SummaryService(llm=client, settings=_settings()).run(
+            _request(_TEN_NEGATIVE, basis=20, tally=_NINE_PRO_TALLY)
+        )
+    finally:
+        service_module.JUDGE_RETRY_DELAY_SECONDS = original
+
+    summary = message.summaries[0]
+    assert summary.unextractedReviewCount == 10, "이번 회차 실패가 미검사 수에 안 들어갔다"
+    # 분석된 건수는 20 - 10 = 10 건이다. 비율의 분모도 그것이어야 한다.
+    assert summary.analyzedReviewCount == 10
+    assert summary.pros[0].mentionShare == 0.9
+    # **"단점 언급이 없었다"를 적을 수 없는 상태다.** 10건을 읽지 못했다.
+    assert summary.consAbsenceReason is ConsAbsenceReason.PARTIALLY_UNEXTRACTED
+
+
+async def test_미검사가_분모를_깎아_최소_건수에_못_미치면_모델을_부르지_않는다() -> None:
+    """분석된 건수가 3건인데 "반복되는 장점"을 적는 일이 가능했다.
+
+    ``basisReviewCount`` 만 보고 최소 10건 게이트를 통과시켰기 때문이다.
+    """
+    client = _client(
+        extract0=ScriptedCall(outcome=CallOutcome.ERROR, detail="boom"),
+        extract1=ScriptedCall(outcome=CallOutcome.ERROR, detail="boom"),
+    )
+    import app.review_summary.service as service_module
+
+    original = service_module.JUDGE_RETRY_DELAY_SECONDS
+    service_module.JUDGE_RETRY_DELAY_SECONDS = 0.0
+    try:
+        message = await SummaryService(llm=client, settings=_settings()).run(
+            _request(_TEN_NEGATIVE, basis=20, tally=_NINE_PRO_TALLY, unextracted=7)
+        )
+    finally:
+        service_module.JUDGE_RETRY_DELAY_SECONDS = original
+
+    summary = message.summaries[0]
+    assert summary.unextractedReviewCount == 17
+    assert summary.analyzedReviewCount == 3
+    assert summary.pros == []
+    assert summary.notEnoughReason is not None and "3건" in summary.notEnoughReason
+    assert summary.consAbsenceReason is ConsAbsenceReason.NOT_ENOUGH_REVIEWS
+
+
+async def test_모델이_쓴_단점_부재_사유가_코드가_센_숫자를_이기지_못한다() -> None:
+    """ "반복된다"의 판정을 모델에게서 빼앗은 설계에 그 보완집합으로 구멍이 있었다.
+
+    집계표에 CON 4건이 있는데 모델이 ``consAbsenceReason`` 을 적어 보내면 그 값이
+    그대로 출력에 실렸다. 한 메시지가 스스로 모순된다 -- 같은 응답의
+    ``unnarratedAspects`` 에는 그 CON 이 들어 있다.
+    """
+    tally = [
+        AspectTallyRow(
+            aspectCode=AspectCode.SMELL,
+            polarity=Polarity.CON,
+            mentionCount=4,
+            labelSamples=["비린 냄새"],
+            quoteSamples=[QuoteSample(reviewId=5, text="냄새가 나요")],
+        )
+    ]
+    client = _client(
+        narrate0=ScriptedCall(
+            tool_input={
+                "pros": [],
+                "cons": [],
+                # 스키마에서 뺐지만 모델이 보내더라도 코드가 읽지 않는 것을 고정한다.
+                "consAbsenceReason": ConsAbsenceReason.NO_NEGATIVE_MENTIONS_FOUND.value,
+            }
+        )
+    )
+    message = await SummaryService(llm=client, settings=_settings()).run(_request([], basis=20, tally=tally))
+
+    summary = message.summaries[0]
+    assert summary.consAbsenceReason is ConsAbsenceReason.NARRATION_MISSING
+    assert [row.aspectCode for row in summary.unnarratedAspects] == [AspectCode.SMELL]
+    assert message.dropped.narrationMissing == 1
+
+
+async def test_단점_부재_사유가_툴_스키마에_없다() -> None:
+    """적을 수 있으면 판정이 모델에게 넘어간다. ``mentionCount`` 를 뺀 것과 같은 이유다."""
+    from app.review_summary.narrate_tool import NARRATE_TOOL
+
+    assert "consAbsenceReason" not in NARRATE_TOOL["input_schema"]["properties"]
+    assert "consAbsenceReason" not in NARRATE_TOOL["input_schema"]["required"]
+
+
+async def test_언급_비율이_1을_넘지_않는다() -> None:
+    """집계는 누적이고 재배달이 한 번이면 같은 리뷰가 두 번 세어진다.
+
+    클램프가 없어 ``mentionShare=2.4`` 가 나왔고 콘솔이 "240%"를 그렸다. 고치는 것은
+    백엔드의 ``eventId`` 멱등 소비이고(계약에 적었다), 여기서는 거짓 비율을 화면에
+    보내지 않는 것이 일이다.
+    """
+    tally = [
+        AspectTallyRow(
+            aspectCode=AspectCode.SMELL,
+            polarity=Polarity.CON,
+            mentionCount=24,
+            labelSamples=["냄새"],
+            quoteSamples=[QuoteSample(reviewId=5, text="냄새가 나요")],
+        )
+    ]
+    client = _client(
+        narrate0=ScriptedCall(
+            tool_input={
+                "pros": [],
+                "cons": [
+                    {
+                        "aspectCode": AspectCode.SMELL.value,
+                        "headline": "냄새가 난다는 후기가 반복됩니다",
+                        "quotes": [{"reviewId": 5, "text": "냄새가 나요"}],
+                    }
+                ],
+            }
+        )
+    )
+    message = await SummaryService(llm=client, settings=_settings()).run(_request([], basis=10, tally=tally))
+
+    # **그 줄을 버리지 않는다.** 버리면 실재하는 반복 단점이 사라지고 그 손해 방향이
+    # 이 설계가 가장 피하는 실패(부정 리뷰 누락)다. 비율만 자르고 손상 사실을 센다.
+    assert message.summaries[0].cons[0].mentionShare == 1.0
+    assert message.summaries[0].cons[0].mentionCount == 24
+    assert message.dropped.tallyInconsistent == 1
+
+
+async def test_상한을_넘겨_버린_스코프를_응답에_적는다() -> None:
+    """백엔드가 "그 세그먼트에 요약이 없다"와 "상한에 걸려 버렸다"를 구분해야 한다.
+
+    구분하지 못하면 저장 로직이 전자로 읽어 그 세그먼트가 영구히 빈 채로 캐시된다.
+    """
+    message = await SummaryService(llm=None, settings=_settings()).run(
+        _request(
+            [],
+            scopes=[
+                RequestedScope(scope=SummaryScope.PRODUCT, basisReviewCount=5),
+                RequestedScope(scope=SummaryScope.SEGMENT, segmentKey="DOG:DOG_UNDER_5", basisReviewCount=3),
+                RequestedScope(scope=SummaryScope.SEGMENT, segmentKey="CAT:CAT_4_6", basisReviewCount=3),
+            ],
+        )
+    )
+
+    assert [item.segmentKey for item in message.summaries] == [None, "DOG:DOG_UNDER_5"]
+    assert [item.segmentKey for item in message.droppedScopes] == ["CAT:CAT_4_6"]
+    assert message.droppedScopes[0].notProcessedReason is not None
+
+
+async def test_입력_레닥션과_출력_게이트_탈락을_한_필드로_세지_않는다() -> None:
+    """``piiRedacted`` 가 올랐을 때 "입력에 연락처가 많았다"인지 "모델이 산문에 썼다"인지
+    구분할 수 없었다. 전자는 정상이고 후자는 사고다.
+    """
+    reviews = [
+        _review(1, 5, "잘 먹어요. 기호성이 좋습니다. 급하면 010-1234-5678 로 연락 주세요"),
+        _review(2, 4, "아주 잘 먹습니다."),
+        _review(3, 3, "잘 먹는 편이에요."),
+    ]
+    client = _client(
+        extract0=ScriptedCall(tool_input=_THREE_EXTRACT),
+        narrate0=ScriptedCall(
+            tool_input={
+                "pros": [
+                    {
+                        "aspectCode": AspectCode.PALATABILITY.value,
+                        "headline": "문의는 010-1234-5678 로 주세요",
+                        "quotes": [],
+                    }
+                ],
+                "cons": [],
+            }
+        ),
+    )
+    message = await SummaryService(llm=client, settings=_settings()).run(_request(reviews))
+
+    assert message.dropped.piiRedacted == 1, "입력 레닥션 건수만 세야 한다"
+    assert message.dropped.outputGateBlocked == 1, "출력 게이트 탈락은 별 계수다"
+
+
+async def test_한_줄_요약도_길이와_마스킹_게이트를_지난다() -> None:
+    """``headline`` 이 차단 적중 하나만 보고 통과했다. 길이 상한도 ``mask_heavy`` 도 없었다."""
+    client = _client(
+        extract0=ScriptedCall(tool_input=_THREE_EXTRACT),
+        narrate0=ScriptedCall(
+            tool_input={
+                "pros": [
+                    {
+                        "aspectCode": AspectCode.PALATABILITY.value,
+                        "headline": "잘" * 200,
+                        "quotes": [],
+                    }
+                ],
+                "cons": [],
+            }
+        ),
+    )
+    message = await SummaryService(llm=client, settings=_settings()).run(_request(_THREE))
+
+    assert message.summaries[0].pros == []
+    assert message.dropped.outputGateBlocked == 1

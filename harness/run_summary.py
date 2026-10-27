@@ -172,19 +172,25 @@ def _self_check() -> int:
                     f"/ 실제 {item.truncated}"
                 )
 
-        # (3) 봉투에 중성화되지 않은 토큰이 남아 있는가. **적대적 본문이 있는 이유다.**
+        # (3) 조립된 봉투에 **여분의** 토큰이 없는가. **적대적 본문·옵션명이 있는 이유다.**
+        #
+        # 전에는 ``split("<본문>")`` 으로 본문 구간만 봤다. 그 창은 **머리줄과 메타줄을
+        # 구조적으로 보지 못한다** -- 위조 토큰이 첫 조각에 들어가 검사 밖으로 빠지고,
+        # 그래서 옵션명 탈출이 "봉투 중성화 전부 통과"로 찍혔다. 창을 좁히는 대신 전문의
+        # 토큰 수를 센다.
         text = env.render_envelope(list(case.category_path), batch.prepared)
-        bodies = text.split("<본문>")
-        for index, chunk in enumerate(bodies[1:], start=1):
-            body = chunk.split("</본문>")[0]
-            if env.envelope_escaped(body):
-                problems.append(f"{case.id}: {index}번째 본문에 중성화되지 않은 봉투 토큰이 남았다")
+        if not env.envelope_wellformed(text, review_count=len(batch.prepared)):
+            problems.append(f"{case.id}: 조립된 봉투에 여분의 봉투 토큰이 있다(머리줄·메타줄 포함)")
 
         # (4) 산문 생성 가능 여부 기대가 임계와 맞는가.
-        enough = case.total_visible() >= settings.summary_min_reviews
+        #
+        # **분모는 전수가 아니라 분석된 건수다.** 제외된 리뷰를 분모에 남기면 못 읽은
+        # 리뷰가 분석된 것으로 세어진다 -- 서비스에서 고친 결함과 같은 산수다.
+        analyzed = len(batch.prepared)
+        enough = analyzed >= settings.summary_min_reviews
         if enough != case.expect_narrated:
             problems.append(
-                f"{case.id}: 산문 기대 {case.expect_narrated} / 실제 분모 {case.total_visible()}"
+                f"{case.id}: 산문 기대 {case.expect_narrated} / 실제 분석 건수 {analyzed}"
                 f" (최소 {settings.summary_min_reviews})"
             )
 
@@ -422,8 +428,15 @@ def _report_polarity_band() -> list[tuple[str, str]]:
     return rows
 
 
+# ``classify`` 가 **라벨만으로** 낼 수 있는 사유. ``NARRATION_MISSING`` 은 여기 없다 --
+# 그것은 "코드가 센 단점에 모델이 한 줄을 안 붙였다"는 **모델 행동**의 갈래이고, 집계
+# 단계에는 그 입력이 없다. 하네스가 그것까지 덮어야 한다고 적으면 영구히 못 덮는 항목이
+# 리포트에 남아 다른 미달과 섞인다. 모델 쪽 갈래는 ``tests/test_summary_service.py`` 가 고정한다.
+_TALLY_ABSENCE_REASONS = tuple(r for r in ConsAbsenceReason if r is not ConsAbsenceReason.NARRATION_MISSING)
+
+
 def _report_thresholds() -> list[tuple[str, str]]:
-    """임계 세 갈래가 각각 나오는 케이스가 있는가."""
+    """임계 갈래가 각각 나오는 케이스가 있는가."""
     settings = Settings()
     seen: dict[str, list[str]] = defaultdict(list)
     for case in PRODUCTS:
@@ -448,6 +461,10 @@ def _report_thresholds() -> list[tuple[str, str]]:
             tally,
             basis_review_count=case.total_visible(),
             thresholds=_thresholds(settings),
+            # **제외된 리뷰는 미검사다.** 집계에서 빼면서 분모에 남기면 못 읽은 리뷰가
+            # 분석된 것으로 세어진다 -- 서비스에서 고친 결함과 같은 산수이고, 하네스가
+            # 같은 틀린 산수를 쓰고 있었다.
+            unextracted_review_count=len(excluded),
         )
         key = classified.cons_absence_reason.value if classified.cons_absence_reason else "CONS_PRESENT"
         seen[key].append(case.id)
@@ -458,7 +475,7 @@ def _report_thresholds() -> list[tuple[str, str]]:
             ", ".join(f"{k}={','.join(v)}" for k, v in sorted(seen.items())),
         )
     ]
-    missing = [r.value for r in ConsAbsenceReason if r.value not in seen]
+    missing = [r.value for r in _TALLY_ABSENCE_REASONS if r.value not in seen]
     if missing:
         rows.append(
             (

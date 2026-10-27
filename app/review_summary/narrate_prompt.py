@@ -18,7 +18,7 @@ from __future__ import annotations
 
 # 프롬프트를 고치면 올린다. 서술 재사용 키의 일부라 올리지 않으면 바뀐 양식으로 다시 쓰지
 # 않고 옛 산문을 재사용한다.
-NARRATE_VERSION = "narrate-v1"
+NARRATE_VERSION = "narrate-v2"
 
 NARRATE_PROMPT = """\
 당신은 반려동물 용품 오픈마켓 '애착'의 리뷰 요약 작성자입니다. **리뷰 본문을 받지
@@ -34,8 +34,9 @@ NARRATE_PROMPT = """\
    인용은 폐기됩니다. 주어지지 않은 인용을 만들어 쓰면 그 항목 전체가 폐기됩니다.
 3. **개인정보를 옮기지 마십시오.** 사람 이름, 연락처, 주소, 동호수를 한 줄 요약에 쓰지
    말고, `[가림]` 이 적힌 구간은 그대로 둡니다.
-4. **단점을 올릴 수 없으면 `consAbsenceReason` 을 적습니다.** 비워 두고 "단점 없음"이라고
-   쓰지 마십시오 -- 단점이 없는 것과 단점을 찾지 못한 것은 다른 사실입니다.
+4. **집계표에 CON 줄이 있으면 반드시 한 줄을 붙이십시오.** 단점을 비우는 판단은 당신의
+   것이 아닙니다 -- 코드가 이미 "반복된다"로 센 줄이고, 비우면 코드가 "문장이 없다"로
+   적습니다. 단점이 없는 것과 단점을 쓰지 않은 것은 다른 사실입니다.
 5. **효능과 의료 표현을 쓰지 마십시오.** "치료", "완치", "100%", "부작용 없음" 같은 단정형
    대신 **"~라는 후기가 있다", "~했다는 보호자가 많았다"** 로만 적습니다. 이 요약은
    플랫폼의 문장으로 남으므로 셀러 문구와 같은 책임이 걸립니다.
@@ -50,7 +51,7 @@ def render_tally_block(
     *,
     category_path: list[str],
     scope_label: str,
-    basis_review_count: int,
+    analyzed_review_count: int,
     unextracted_review_count: int,
     rows: list[str],
 ) -> str:
@@ -58,11 +59,15 @@ def render_tally_block(
 
     분석되지 않은 리뷰 수를 함께 적는다. 적지 않으면 모델이 분모를 전수로 읽고
     "대부분의 보호자가" 같은 문장을 쓴다.
+
+    **"분석한 리뷰"에 전수를 적지 않는다.** 전에는 백엔드가 보낸 ``basisReviewCount`` 를
+    그대로 적었고, 그래서 신규 10건이 전건 추출 실패한 실행에서 이 두 줄이 "분석한 리뷰
+    20건 / 아직 분석되지 않은 리뷰 0건"으로 **둘 다 거짓**이었다.
     """
     head = [
         f'<집계표 범위="{scope_label}">',
         f"카테고리: {' > '.join(category_path) if category_path else '미지정'}",
-        f"분석한 리뷰: {basis_review_count}건",
+        f"분석한 리뷰: {analyzed_review_count}건",
         f"아직 분석되지 않은 리뷰: {unextracted_review_count}건",
         "",
     ]

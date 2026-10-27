@@ -32,6 +32,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 SUMMARY_SCHEMA_VERSION = 1
 
+# 메시지당 신규 리뷰 상한. 정본은 ``Settings.summary_max_new_reviews`` 다 -- 여기서
+# import 하는 것은 ``app.settings`` 가 스키마를 import 하지 않아 순환이 생기지 않기 때문이고,
+# 테스트가 두 값이 같은 것을 단언한다.
+_MAX_NEW_REVIEWS = 40
+
 SUMMARY_AGGREGATE_TYPE = "reviewSummary"
 SUMMARY_REQUEST_EVENT_TYPE = "ReviewSummaryRequestedMessage"
 SUMMARY_RESULT_EVENT_TYPE = "ReviewSummaryMessage"
@@ -105,13 +110,23 @@ class SummaryScope(StrEnum):
 class ConsAbsenceReason(StrEnum):
     """단점이 비어 있는 사유. "없음" 한 가지로 접지 않는다.
 
-    세 값이 화면에서 서로 다른 문장이 된다. 뭉개면 "분석한 12건에 단점 언급이 없었다"와
+    다섯 값이 화면에서 서로 다른 문장이 된다. 뭉개면 "분석한 12건에 단점 언급이 없었다"와
     "요약하기에 리뷰가 아직 적다"가 같은 말로 읽힌다.
+
+    **``NO_NEGATIVE_MENTIONS_FOUND`` 가 올 수 있는 경로를 코드에서 좁혔다.** 그 값은
+    "분석한 n건 전부를 읽었고 거기 단점 언급이 없었다"는 **강한 주장**이다. 못 읽은 리뷰가
+    한 건이라도 있으면 그 주장을 할 수 없고, 반복으로 센 단점이 있는데 산문만 없을 때도
+    할 수 없다. 그 두 경로에 전용 값을 둔다 -- 아래 둘이 그것이고, 없으면 거짓이 그 자리로
+    흘러 들어간다.
     """
 
     NO_NEGATIVE_MENTIONS_FOUND = "NO_NEGATIVE_MENTIONS_FOUND"
     BELOW_MENTION_THRESHOLD = "BELOW_MENTION_THRESHOLD"
     NOT_ENOUGH_REVIEWS = "NOT_ENOUGH_REVIEWS"
+    # 단점 언급이 0 이지만 **못 읽은 리뷰가 있다.** "없었다"로 적으면 거짓이다.
+    PARTIALLY_UNEXTRACTED = "PARTIALLY_UNEXTRACTED"
+    # 코드가 반복으로 센 단점이 있는데 **모델이 한 줄을 쓰지 않았다.** 건수는 남아 있다.
+    NARRATION_MISSING = "NARRATION_MISSING"
 
 
 class ExcludeReason(StrEnum):
@@ -195,6 +210,8 @@ class RequestedScope(BaseModel):
     # 1 을 넘을 수 있다. 세그먼트 스코프는 사정이 다르다 -- AI 는 리뷰가 어느 세그먼트에
     # 속하는지 모르므로(펫 스냅샷을 받지 않는다) 세그먼트 집계는 **보낸 그대로** 쓴다.
     basisReviewCount: int = 0
+    # 백엔드가 "추출 결과를 아직 받지 못한" 리뷰로 센 수다. **AI 가 이번 회차에 못 읽은
+    # 리뷰는 여기 들어 있지 않다** -- 그것은 AI 가 더한다(``ScopeSummary`` 주석 참조).
     unextractedReviewCount: int = 0
     tally: list[AspectTallyRow] = Field(default_factory=list)
 
@@ -214,7 +231,12 @@ class ReviewSummaryRequest(BaseModel):
     categoryPath: list[str] = Field(default_factory=list)
     totalVisibleReviews: int = 0
     ratingBuckets: list[dict[str, int]] = Field(default_factory=list)
-    newReviews: list[ReviewInput] = Field(default_factory=list)
+    # **상한이 계약에 있다.** 없으면 최악 처리시간이 카프카 폴 간격을 넘겨 컨슈머 태스크가
+    # 죽고, 죽으면 다시 띄우는 코드가 없고 ``/health`` 는 검수만 보므로 200 UP 이라 ECS 가
+    # 교체하지 않는다. 정본은 ``Settings.summary_max_new_reviews`` 이고 그 값이
+    # ``summary_worst_case_handle_seconds()`` 의 배치 항을 정한다 -- 두 수가 한 자리에서
+    # 움직이게 묶어 두는 것이 이 레포가 밟은 함정의 재발 방지다.
+    newReviews: list[ReviewInput] = Field(default_factory=list, max_length=_MAX_NEW_REVIEWS)
     requestedScopes: list[RequestedScope] = Field(default_factory=list)
     schemaVersion: int = SUMMARY_SCHEMA_VERSION
 
@@ -272,11 +294,39 @@ class SummaryAspect(BaseModel):
     quotes: list[QuoteSample] = Field(default_factory=list)
 
 
+class DroppedScope(BaseModel):
+    """요청됐지만 처리하지 않은 스코프. **"요약 없음"과 구분되어야 한다.**
+
+    메시지당 스코프 상한을 넘기면 뒤쪽을 버린다. 그것을 응답에 적지 않으면 백엔드 입장에서
+    "그 세그먼트에 요약이 없다"와 "상한에 걸려 버렸다"가 같은 모양이고, 저장 로직이 전자로
+    읽으면 그 세그먼트가 **영구히 빈 채로 캐시된다.** 이 레포가 다른 모든 자리에서 지키는
+    "통과와 미검사를 섞지 않는다"의 예외를 만들지 않는다.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    scope: SummaryScope
+    segmentKey: str | None = None
+    notProcessedReason: str
+
+
 class ScopeSummary(BaseModel):
     scope: SummaryScope
     segmentKey: str | None = None
     basisReviewCount: int = 0
+    # **요청값 + 이번 회차에 AI 가 못 읽은 건수**의 합이다. 요청값만 되읊으면 추출이
+    # 실패한 리뷰가 "분석한 리뷰" 분모에 남아 못 읽은 부정 리뷰가 "단점 없음"이 된다.
+    #
+    # 비대칭이 하나 있고 그것이 의도다. 상품 스코프는 이번 회차 실패를 AI 가 세어 더하지만
+    # **세그먼트 스코프는 보낸 값을 그대로 쓴다** -- AI 는 펫 스냅샷을 받지 않아 리뷰가 어느
+    # 세그먼트에 속하는지 모르고, 추측해서 더하면 그것이 또 다른 거짓이다. 그래서 세그먼트
+    # 분모는 백엔드가 책임진다(설계 문서의 백엔드 선결 목록에 적었다).
     unextractedReviewCount: int = 0
+    # **실제로 분석된 건수.** 임계와 언급 비율의 분모가 이 수다.
+    #
+    # ``basisReviewCount`` 를 분모로 쓰면 20건 중 3건만 읽은 상태에서 최소 10건 게이트가
+    # 통과하고 "리뷰 3건으로 반복되는 장점을 적는다"가 가능해진다. 실측으로 확인했다.
+    analyzedReviewCount: int = 0
     pros: list[SummaryAspect] = Field(default_factory=list)
     cons: list[SummaryAspect] = Field(default_factory=list)
     consAbsenceReason: ConsAbsenceReason | None = None
@@ -334,6 +384,16 @@ class DroppedCounts(BaseModel):
     truncated: int = 0
     unknownAspectCode: int = 0
     belowThresholdRejected: int = 0
+    # **출력 게이트 탈락을 ``piiRedacted`` 에 섞지 않는다.** 섞으면 그 값이 올랐을 때
+    # "입력에 연락처가 많았다"(정상)인지 "모델이 산문에 연락처를 썼다"(사고)인지 구분할 수
+    # 없고, 하네스가 1순위 안전 지표로 읽는 숫자가 해석 불가가 된다.
+    outputGateBlocked: int = 0
+    # 자유 텍스트 게이트에 걸려 열거 기본값으로 되돌린 라벨 수.
+    labelRejected: int = 0
+    # **마스킹을 되돌린 라벨.** 0 이 정상이고 오르면 사고다.
+    maskRestored: int = 0
+    # ``mentionCount`` 가 분석된 건수를 넘은 집계 줄. 저장 집계 손상(재배달 중복 가산) 신호다.
+    tallyInconsistent: int = 0
     # 임계를 넘었는데 모델이 한 줄을 쓰지 않은 항목 수. 0 이 정상이고, 오르면 서술
     # 접두부의 지시가 지켜지지 않는다는 신호다.
     narrationMissing: int = 0
@@ -349,6 +409,8 @@ class ReviewSummaryMessage(BaseModel):
     narrateVersion: str
     extracted: list[ExtractedReview] = Field(default_factory=list)
     summaries: list[ScopeSummary] = Field(default_factory=list)
+    # 상한에 걸려 처리하지 않은 스코프. 비어 있는 것이 정상이다.
+    droppedScopes: list[DroppedScope] = Field(default_factory=list)
     calls: list[SummaryCallUsage] = Field(default_factory=list)
     dropped: DroppedCounts = Field(default_factory=DroppedCounts)
     failureDetail: str | None = None
@@ -356,4 +418,11 @@ class ReviewSummaryMessage(BaseModel):
     schemaVersion: int = SUMMARY_SCHEMA_VERSION
 
     def event_id(self) -> str:
+        """**백엔드는 이 값으로 멱등 소비해야 한다.**
+
+        러너는 발행 뒤 커밋이라 발행 성공·커밋 실패 사이에 죽으면 같은 메시지가 재배달된다.
+        백엔드가 멱등 처리하지 않으면 같은 리뷰의 항목이 저장 집계에 두 번 더해지고,
+        그러면 ``mentionCount`` 가 분모를 넘는다. AI 쪽은 그 모순을 ``tallyInconsistent``
+        로 세고 비율을 1.0 으로 자르지만, **고치는 것은 백엔드의 멱등성이다.**
+        """
         return f"review-summary-{self.requestId}"

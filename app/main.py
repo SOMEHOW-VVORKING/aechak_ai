@@ -97,6 +97,11 @@ async def health() -> JSONResponse:
     # 요약 컨슈머는 **별 축으로 보고한다.** ``consuming`` 에 AND 로 섞으면 요약 러너가
     # 죽었을 때 검수가 멀쩡한데도 전체가 DOWN 이 되어 ECS 가 태스크를 교체하고,
     # 요약을 끈 배포에서는 그 필드가 거짓이 되어 헬스체크가 영구 503 이 된다.
+    #
+    # **대가를 적어 둔다: 이 필드를 보는 주체가 아직 없다.** ``enable_review_summary`` 가
+    # 참인데 요약 러너가 죽으면 이 응답은 200 UP 이고, 전용 토픽의 메시지가 영구히 쌓이는
+    # 것을 사람이 화면을 보고서야 안다. 경보 주체(CloudWatch 알람 또는 컨슈머 랙 지표)는
+    # 설계 문서의 백엔드 선결 목록에 적었고, 그때까지 이 감시 공백은 실재한다.
     summary_runner: SummaryRunner | None = getattr(app.state, "summary_runner", None)
     summary_consuming = summary_runner.healthy if summary_runner is not None else False
     status = 200 if consuming else 503

@@ -55,11 +55,20 @@ _STATUS_LABELS = {
     NOT_REACHED: "도달하지 않음",
 }
 
-# 단점이 비어 있는 이유를 **화면 문장으로** 옮긴다. 네 갈래가 서로 다른 말이어야 한다.
+# 단점이 비어 있는 이유를 **화면 문장으로** 옮긴다. 다섯 갈래가 서로 다른 말이어야 한다.
+#
+# 뒤 둘이 앞 셋과 특히 달라야 한다. "단점 언급이 없었습니다"는 전수를 읽었다는 주장이고,
+# 뒤 둘은 **읽지 못했거나 쓰지 못했다**는 사실이다. 같은 문장으로 그리면 거짓이 된다.
 CONS_ABSENCE_SENTENCES = {
     ConsAbsenceReason.NO_NEGATIVE_MENTIONS_FOUND.value: "분석한 후기에서 단점 언급이 없었습니다",
     ConsAbsenceReason.BELOW_MENTION_THRESHOLD.value: ("단점 언급이 있었으나 반복이라 부르기엔 적습니다"),
     ConsAbsenceReason.NOT_ENOUGH_REVIEWS.value: "요약을 만들기에 리뷰가 아직 적습니다",
+    ConsAbsenceReason.PARTIALLY_UNEXTRACTED.value: (
+        "분석된 후기에는 단점 언급이 없었지만 **아직 분석되지 않은 후기가 있습니다**"
+    ),
+    ConsAbsenceReason.NARRATION_MISSING.value: (
+        "반복되는 단점을 세었지만 **요약 문장을 만들지 못했습니다** — 건수는 아래에 있습니다"
+    ),
 }
 
 # 떨어진 것들의 사람 말. 계수 이름만 보여 주면 발표장에서 읽히지 않는다.
@@ -67,7 +76,11 @@ DROPPED_LABELS = {
     "evidenceUnverified": "인용이 본문이나 집계표에 없어 버렸다",
     "polarityConflict": "1점 리뷰의 장점이라 셈에서 뺐다",
     "polarityConflictNoted": "5점 리뷰의 단점이라 세기만 하고 남겼다",
-    "piiRedacted": "연락처·지시형이 섞여 그 항목만 버렸다",
+    "piiRedacted": "입력 본문에서 연락처·지시형을 가렸다(정상 동작이다)",
+    "outputGateBlocked": "모델이 쓴 산문·인용에 연락처·지시형이 섞여 그 항목만 버렸다",
+    "labelRejected": "라벨이 게이트에 걸려 열거 기본값으로 되돌렸다",
+    "maskRestored": "라벨이 마스킹된 구간을 되돌려 버렸다. **0 이 정상이다**",
+    "tallyInconsistent": "언급 수가 분석된 건수를 넘었다. 저장 집계 손상 신호다",
     "injectionExcluded": "판정기를 겨냥한 문장이 있어 추출 입력에서 뺐다",
     "duplicateFolded": "같은 문구라 한 건만 남겼다",
     "maskHeavyQuote": "마스킹 기호가 절반 이상인 인용을 버렸다",
@@ -180,6 +193,8 @@ class ScopeRow:
     segment_key: str | None
     basis_review_count: int
     unextracted_review_count: int
+    # **실제로 분석된 건수.** 분모는 이 수이고 ``basis_review_count`` 가 아니다.
+    analyzed_review_count: int
     pros: list[AspectRow]
     cons: list[AspectRow]
     cons_absence_reason: str | None
@@ -396,6 +411,7 @@ def _scope(scope: ScopeSummary) -> ScopeRow:
         segment_key=scope.segmentKey,
         basis_review_count=scope.basisReviewCount,
         unextracted_review_count=scope.unextractedReviewCount,
+        analyzed_review_count=scope.analyzedReviewCount,
         pros=[_aspect(item) for item in scope.pros],
         cons=[_aspect(item) for item in scope.cons],
         cons_absence_reason=reason,

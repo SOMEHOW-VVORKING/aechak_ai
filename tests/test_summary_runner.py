@@ -293,3 +293,182 @@ def test_선별_사유_문자열을_건드리지_않았다() -> None:
     from app.inspection.triage import TRIAGE_SKIP_REASON
 
     assert TRIAGE_SKIP_REASON == "TRIAGE_CLEAR"
+
+
+# --- 건너뛴 레코드를 다음 성공이 함께 커밋하지 않는다 -----------------------------------
+
+
+class _Record:
+    def __init__(self, topic: str, partition: int, offset: int, value: bytes) -> None:
+        self.topic = topic
+        self.partition = partition
+        self.offset = offset
+        self.value = value
+
+
+class _RecordingConsumer:
+    """``_loop`` 를 실제로 돌려 **커밋 인자**를 본다.
+
+    기존 테스트는 ``handle()`` 이 던지는지와 ``producer.sent == []`` 만 봤다. 그래서
+    ``commit()`` 을 인자 없이 부르는 것이 **건너뛴 레코드까지 넘어서** 오프셋을 올리는
+    것을 아무도 보지 못했다 -- aiokafka 문서가 "Defaults to current consumed offsets for
+    all subscribed partitions" 라고 적는다.
+    """
+
+    def __init__(self, records: list[_Record]) -> None:
+        self._records = records
+        self.commits: list[Any] = []
+
+    def __aiter__(self) -> Any:
+        self._iter = iter(self._records)
+        return self
+
+    async def __anext__(self) -> _Record:
+        try:
+            return next(self._iter)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def commit(self, offsets: Any = None) -> None:
+        self.commits.append(offsets)
+
+    async def stop(self) -> None:
+        return None
+
+
+async def test_모르는_이벤트를_건너뛴_뒤_다음_성공이_그_오프셋을_커밋하지_않는다(
+    settings: Settings,
+) -> None:
+    """**"모르는 eventType 을 커밋하지 않는다"가 실제로는 거짓이었다.**
+
+    인자 없는 ``commit()`` 은 소비 위치를 커밋하므로, 다음 레코드가 성공하면 그 커밋이
+    건너뛴 레코드까지 넘어서 오프셋을 올린다. 활성 토픽에서는 그것이 정상 경로다.
+    """
+    from aiokafka import TopicPartition
+
+    topic = settings.kafka_summary_request_topic
+    unknown = _Record(topic, 0, 10, _envelope(_payload(), event_type="SomethingElseMessage").encode())
+    good = _Record(topic, 0, 11, _envelope(_payload()).encode())
+    consumer = _RecordingConsumer([unknown, good])
+
+    runner = _runner(settings, FakeProducer())
+    runner._consumer = consumer  # type: ignore[attr-defined]
+    await runner._loop()  # type: ignore[attr-defined]
+
+    # 같은 파티션에서 앞 레코드를 건너뛰었으므로 **그 뒤 오프셋을 커밋하지 않는다.**
+    assert consumer.commits == [], consumer.commits
+    assert TopicPartition(topic, 0) not in [k for c in consumer.commits if c for k in c]
+
+
+async def test_성공한_레코드는_자기_오프셋만_커밋한다(settings: Settings) -> None:
+    """레코드별 커밋이어야 건너뛴 레코드가 남는다."""
+    from aiokafka import TopicPartition
+
+    topic = settings.kafka_summary_request_topic
+    consumer = _RecordingConsumer([_Record(topic, 3, 7, _envelope(_payload()).encode())])
+
+    runner = _runner(settings, FakeProducer())
+    runner._consumer = consumer  # type: ignore[attr-defined]
+    await runner._loop()  # type: ignore[attr-defined]
+
+    assert consumer.commits == [{TopicPartition(topic, 3): 8}]
+
+
+async def test_건너뛴_파티션의_뒤_레코드도_커밋되지_않는다(settings: Settings) -> None:
+    """다른 파티션은 멈추지 않는다. 손실은 파티션 단위로만 막는다."""
+    from aiokafka import TopicPartition
+
+    topic = settings.kafka_summary_request_topic
+    consumer = _RecordingConsumer(
+        [
+            _Record(topic, 0, 10, _envelope(_payload(), event_type="Nope").encode()),
+            _Record(topic, 0, 11, _envelope(_payload()).encode()),
+            _Record(topic, 1, 4, _envelope(_payload()).encode()),
+        ]
+    )
+
+    runner = _runner(settings, FakeProducer())
+    runner._consumer = consumer  # type: ignore[attr-defined]
+    await runner._loop()  # type: ignore[attr-defined]
+
+    assert consumer.commits == [{TopicPartition(topic, 1): 5}]
+
+
+async def test_폴_간격_식이_실제_배치_수를_쓴다(settings: Settings) -> None:
+    """**식이 추출 배치를 1회로 가정했다.**
+
+    ``service`` 는 리뷰 수에 비례해 배치를 만들고 ``newReviews`` 에 상한이 없었다.
+    실제 최악은 ``한 호출 x (배치 수 + 스코프 수)`` 이고, 리뷰 60건이면 976초로
+    폴 간격 900초를 넘긴다.
+    """
+    import math
+
+    batches = math.ceil(settings.summary_max_new_reviews / settings.summary_extract_batch_max)
+    one_call = 2 * settings.summary_timeout_seconds + 2.0
+    expected = one_call * (batches + settings.summary_scopes_per_message)
+
+    assert settings.summary_worst_case_handle_seconds() == expected
+    assert settings.kafka_summary_max_poll_interval_ms / 1000 >= expected, (
+        "폴 간격이 실제 최악 처리시간보다 좁다. 리뷰 상한이나 배치 상한을 올렸으면 폴 간격도 같이 올려야 한다"
+    )
+
+
+async def test_신규_리뷰_수에_상한이_있다() -> None:
+    """상한이 없으면 최악 처리시간이 폴 간격을 넘겨 컨슈머 태스크가 죽는다.
+
+    죽으면 다시 띄우는 코드가 없고 ``/health`` 는 200 UP 이라 ECS 가 교체하지 않는다.
+    커밋도 안 됐으므로 리밸런스마다 같은 메시지를 다시 받아 추출 호출만 또 태운다.
+    """
+    from pydantic import ValidationError
+
+    from app.schemas.summary import ReviewSummaryRequest
+
+    limit = Settings().summary_max_new_reviews
+    too_many = [
+        {"reviewId": i, "rating": 5, "content": f"리뷰 {i}", "optionName": "기본"} for i in range(limit + 1)
+    ]
+
+    with pytest.raises(ValidationError):
+        ReviewSummaryRequest(requestId="r", productId=1, newReviews=too_many)
+
+
+async def test_커밋_실패가_루프를_조용히_죽이지_않는다(settings: Settings) -> None:
+    """``commit()`` 이 ``handle`` 을 감싼 내부 try **밖**에 있어 바깥으로 빠져나갔다.
+
+    바깥 ``except`` 가 ``_healthy=False`` 후 ``raise`` 해서 ``_loop`` 태스크가 죽고,
+    다시 띄우는 코드가 없다. 커밋 실패는 리밸런스 신호이고 **그 메시지 하나의 실패가
+    컨슈머 전체를 세울 이유가 아니다.**
+    """
+    from aiokafka.errors import CommitFailedError
+
+    topic = settings.kafka_summary_request_topic
+
+    class _FailingCommit(_RecordingConsumer):
+        async def commit(self, offsets: Any = None) -> None:
+            self.commits.append(offsets)
+            raise CommitFailedError("membership changed")
+
+    consumer = _FailingCommit(
+        [
+            _Record(topic, 0, 1, _envelope(_payload()).encode()),
+            _Record(topic, 0, 2, _envelope(_payload()).encode()),
+        ]
+    )
+    runner = _runner(settings, FakeProducer())
+    runner._consumer = consumer  # type: ignore[attr-defined]
+
+    # 루프가 예외로 죽지 않는다. 두 레코드를 다 지나고 정상 종료한다.
+    await runner._loop()  # type: ignore[attr-defined]
+
+    assert len(consumer.commits) == 2
+
+
+async def test_리뷰_상한의_계약_사본이_설정과_같다() -> None:
+    """두 수가 갈라지면 계약이 받아들인 메시지가 폴 간격 예산을 넘긴다.
+
+    계약은 ``app.settings`` 를 import 하지 않는다(스키마가 설정에 의존하면 백엔드와
+    공유하는 모양이 환경에 흔들린다). 그래서 사본을 두고 **그 사본의 표류를 테스트가 막는다.**
+    """
+    from app.schemas.summary import _MAX_NEW_REVIEWS
+
+    assert _MAX_NEW_REVIEWS == Settings().summary_max_new_reviews

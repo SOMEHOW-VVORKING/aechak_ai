@@ -26,7 +26,6 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from app.inspection import rules
 from app.review_summary import envelope as env
 from app.review_summary import evidence
 from app.review_summary import tally as tally_mod
@@ -46,11 +45,12 @@ from app.review_summary.trace import (
     SummaryStageStatus,
     SummaryTraceRecorder,
 )
-from app.schemas.inspection import CallOutcome, ViolationCategory
+from app.schemas.inspection import CallOutcome
 from app.schemas.summary import (
     AspectCode,
     AspectTallyRow,
     DroppedCounts,
+    DroppedScope,
     ExtractedReview,
     ExtractStatus,
     Polarity,
@@ -67,16 +67,26 @@ from app.settings import JUDGE_RETRY_DELAY_SECONDS, Settings
 
 log = logging.getLogger(__name__)
 
-# 요약 산문과 인용에 남으면 안 되는 적중. **금지 성분 적중은 빼야 한다.**
-#
-# 리뷰에 "자일리톨이 들었다고 적혀 있어 걱정된다"가 있고 그것이 반복되는 단점이면 그
-# 요약은 **구매자에게 가장 유용한 문장**이다. 성분 적중으로 떨어뜨리면 그 축이 영구히
-# 사라진다. 막아야 하는 것은 연락처·외부 유도·지시형이고, 그것들만 차단 적중으로 센다.
-_OUTPUT_GATE_IGNORED = (ViolationCategory.BANNED_INGREDIENT,)
 
+def _headline_gate(text: str) -> str | None:
+    """한 줄 요약이 떨어지는 사유. 통과하면 ``None``.
 
-def _gate_hits(text: str) -> list[Any]:
-    return [hit for hit in rules.screen(text).blocking if hit.category not in _OUTPUT_GATE_IGNORED]
+    인용에만 걸려 있던 겹을 여기에도 건다 -- 전에는 차단 적중 하나만 봤고 길이 상한도
+    ``mask_heavy`` 도 없었다. ``headline`` 은 리터럴 검증이 불가능한 자유 텍스트라
+    쓸 수 있는 겹이 이 셋뿐이다.
+
+    **마스킹 복원 검사는 여기서 돌지 않는다.** 한 줄 요약에는 대조할 원본 리뷰가 없다
+    (N3 모델은 리뷰 본문을 보지 않는다). 대신 그 모델의 입력인 집계표가 이미 게이트를
+    지난 라벨과 인용뿐이라 복원할 재료가 거기 없다 -- 그것이 N2 라벨 게이트가 서는
+    두 번째 이유다.
+    """
+    if len(text) > evidence.HEADLINE_MAX_CHARS:
+        return "HEADLINE_TOO_LONG"
+    if env.mask_heavy(text):
+        return "HEADLINE_MASK_HEAVY"
+    if evidence.blocking_hits(text):
+        return "PII_OR_CONTACT"
+    return None
 
 
 class SummaryService:
@@ -141,6 +151,8 @@ class SummaryService:
             counts.polarityConflictNoted += verify_counts.polarity_conflict_noted
             counts.maskHeavyQuote += verify_counts.mask_heavy_quote
             counts.unknownAspectCode += verify_counts.unknown_aspect_code
+            counts.labelRejected += verify_counts.label_rejected
+            counts.maskRestored += verify_counts.mask_restored
 
             seen = {entry.review_id: entry for entry in verified}
             for item in group:
@@ -195,10 +207,28 @@ class SummaryService:
 
             self._record_extract(index, group, result, verify_counts, failed=False)
 
+        # **이번 회차에 읽지 못한 리뷰 수.** 추출 실패·주입 제외·중복 접기·모델 무응답이
+        # 전부 여기 들어간다. 이 수를 분모에서 빼지 않으면 못 읽은 부정 리뷰가 "단점
+        # 언급 없음"이 된다 -- 이 프로젝트의 1번 불변식 위반이다.
+        unextracted_now = sum(1 for row in extracted if row.extracted is ExtractStatus.UNEXTRACTED)
+
         # --- N3 서술 + N4 출력 게이트 -------------------------------------------------
         summaries: list[ScopeSummary] = []
         scopes = request.requestedScopes[: settings.summary_scopes_per_message]
-        if len(request.requestedScopes) > len(scopes):
+        dropped_scopes = [
+            DroppedScope(
+                scope=scope.scope,
+                segmentKey=scope.segmentKey,
+                notProcessedReason=(
+                    f"메시지당 스코프 상한 {settings.summary_scopes_per_message}개를 넘겨 "
+                    "처리하지 않았다. 요약이 없다는 뜻이 아니다"
+                ),
+            )
+            for scope in request.requestedScopes[settings.summary_scopes_per_message :]
+        ]
+        if dropped_scopes:
+            # 로그만 남기면 백엔드가 "요약 없음"과 구분할 수 없어 그 세그먼트를 영구히
+            # 빈 채로 캐시한다. 응답에도 싣는다.
             log.warning(
                 "스코프 상한을 넘겨 뒤쪽을 버린다. requested=%d max=%d requestId=%s",
                 len(request.requestedScopes),
@@ -207,7 +237,7 @@ class SummaryService:
             )
         for scope in scopes:
             summary, usage, did_attempt, did_succeed = await self._narrate_scope(
-                request, scope, new_rows, counts
+                request, scope, new_rows, counts, unextracted_now=unextracted_now
             )
             summaries.append(summary)
             if usage is not None:
@@ -225,6 +255,7 @@ class SummaryService:
             narrateVersion=NARRATE_VERSION,
             extracted=extracted,
             summaries=summaries,
+            droppedScopes=dropped_scopes,
             calls=calls,
             dropped=counts,
             failureDetail=("모델 호출이 전부 실패했다" if state is SummaryState.FAILED else None),
@@ -254,10 +285,19 @@ class SummaryService:
         scope: Any,
         new_rows: list[tuple[int, AspectCode, Polarity, str, str]],
         counts: DroppedCounts,
+        *,
+        unextracted_now: int,
     ) -> tuple[ScopeSummary, SummaryCallUsage | None, bool, bool]:
         settings = self._settings
         merged = tally_mod.from_rows(scope.tally)
-        unextracted = scope.unextractedReviewCount
+
+        # **이번 회차 실패를 더한다.** 요청값만 되읊으면 추출이 실패한 리뷰가 "분석한
+        # 리뷰" 분모에 그대로 남는다. 상품 스코프에만 더하는 이유는 세그먼트 쪽에서 AI 가
+        # 리뷰의 세그먼트 소속을 모르기 때문이다 -- 추측해서 더하면 그것이 또 다른 거짓이고,
+        # 그 분모는 백엔드가 책임진다(계약에 적었다).
+        unextracted = scope.unextractedReviewCount + (
+            unextracted_now if scope.scope is SummaryScope.PRODUCT else 0
+        )
 
         if scope.scope is SummaryScope.PRODUCT:
             # 새 항목은 **상품 스코프에만** 더한다. 세그먼트는 리뷰가 어느 세그먼트에
@@ -282,7 +322,9 @@ class SummaryService:
             basis_review_count=scope.basisReviewCount,
             thresholds=thresholds,
             segment=scope.scope is SummaryScope.SEGMENT,
+            unextracted_review_count=unextracted,
         )
+        counts.tallyInconsistent += classified.inconsistent_rows
         fingerprint = tally_mod.fingerprint(merged)
         scope_label = scope.segmentKey or scope.scope.value
 
@@ -307,10 +349,13 @@ class SummaryService:
                     segmentKey=scope.segmentKey,
                     basisReviewCount=scope.basisReviewCount,
                     unextractedReviewCount=unextracted,
+                    analyzedReviewCount=classified.analyzed_review_count,
                     consAbsenceReason=classified.cons_absence_reason,
                     minorMentions=[row.model_copy(deep=True) for row in merged.as_list()],
+                    # **전수가 아니라 분석된 건수를 적는다.** 못 읽은 리뷰를 분모에 세면
+                    # 이 문장이 거짓이 되고, 화면이 그 문장을 그대로 그린다.
                     notEnoughReason=(
-                        f"분석한 리뷰 {scope.basisReviewCount}건이 최소 {minimum}건에 못 미친다"
+                        f"분석한 리뷰 {classified.analyzed_review_count}건이 최소 {minimum}건에 못 미친다"
                     ),
                     tallyFingerprint=fingerprint,
                 ),
@@ -338,7 +383,9 @@ class SummaryService:
         block = render_tally_block(
             category_path=request.categoryPath,
             scope_label=scope_label,
-            basis_review_count=scope.basisReviewCount,
+            # **분석된 건수를 보낸다.** 전수를 보내면 모델이 분모를 전수로 읽고 "대부분의
+            # 보호자가" 같은 문장을 쓴다. 그 줄이 바로 그것을 막기 위해 있다.
+            analyzed_review_count=classified.analyzed_review_count,
             unextracted_review_count=unextracted,
             rows=[_render_row(item) for item in rows],
         )
@@ -367,7 +414,7 @@ class SummaryService:
                 False,
             )
 
-        pros, cons, reason, dropped = _apply_output_gate(result.tool_input, classified, counts)
+        pros, cons, dropped = _apply_output_gate(result.tool_input, classified, counts)
         unnarrated = _unnarrated(classified, pros, cons)
         counts.narrationMissing += len(unnarrated)
         if unnarrated:
@@ -386,11 +433,16 @@ class SummaryService:
                 segmentKey=scope.segmentKey,
                 basisReviewCount=scope.basisReviewCount,
                 unextractedReviewCount=unextracted,
+                analyzedReviewCount=classified.analyzed_review_count,
                 pros=pros,
                 cons=cons,
-                # 단점이 비면 사유가 **반드시** 붙는다. 모델이 비워 보냈으면 코드가 집계에서
-                # 되살린다 -- 비어 있는 채로 내보내면 화면이 "단점 없음"으로 읽는다.
-                consAbsenceReason=((reason or classified.cons_absence_reason) if not cons else None),
+                # 단점이 비면 사유가 **반드시** 붙고, 그 사유는 **코드의 것이다.**
+                #
+                # 모델이 보낸 값을 먼저 쓰던 것이 "반복된다"의 판정을 모델에게서 빼앗은
+                # 설계에 뚫린 구멍이었다 -- 집계표에 CON 4건이 있는데 모델이
+                # ``NO_NEGATIVE_MENTIONS_FOUND`` 를 보내면 그것이 그대로 출력됐다.
+                # 이제 툴 스키마에 그 필드가 아예 없고 코드만 채운다.
+                consAbsenceReason=_cons_absence_reason(classified, cons),
                 minorMentions=[row.model_copy(deep=True) for row in classified.minor],
                 unnarratedAspects=unnarrated,
                 tallyFingerprint=fingerprint,
@@ -622,12 +674,33 @@ def _failed_scope(
         segmentKey=scope.segmentKey,
         basisReviewCount=scope.basisReviewCount,
         unextractedReviewCount=unextracted,
+        analyzedReviewCount=classified.analyzed_review_count,
         minorMentions=[row.model_copy(deep=True) for row in classified.minor],
         # 반복으로 센 항목을 그대로 싣는다. 산문만 없고 셈은 있다는 사실이 화면에 남아야 한다.
         unnarratedAspects=[item.row.model_copy(deep=True) for item in [*classified.pros, *classified.cons]],
         narrateFailure=detail,
         tallyFingerprint=fingerprint,
     )
+
+
+def _cons_absence_reason(classified: tally_mod.Classified, cons: list[SummaryAspect]) -> Any:
+    """단점이 빈 사유. **전부 코드가 정한다.**
+
+    세 경우가 섞이지 않게 가른다.
+
+    1. 단점이 실렸다 -> 사유가 없다.
+    2. 집계가 반복 단점을 **셌는데** 출력에 하나도 없다 -> ``NARRATION_MISSING``.
+       모델이 한 줄을 안 썼거나 출력 게이트가 전부 떨어뜨린 것이고, 어느 쪽이든
+       "단점 언급이 없었다"가 아니다. 그 값이 여기 올 수 있던 경로를 코드에서 없앤다.
+    3. 그 밖 -> 집계가 계산한 사유(미달·임계 미달·못 읽음·없음).
+    """
+    if cons:
+        return None
+    if classified.cons:
+        from app.schemas.summary import ConsAbsenceReason
+
+        return ConsAbsenceReason.NARRATION_MISSING
+    return classified.cons_absence_reason
 
 
 def _unnarrated(
@@ -656,7 +729,7 @@ def _apply_output_gate(
     tool_input: dict[str, Any] | None,
     classified: tally_mod.Classified,
     counts: DroppedCounts,
-) -> tuple[list[SummaryAspect], list[SummaryAspect], Any, list[DroppedItem]]:
+) -> tuple[list[SummaryAspect], list[SummaryAspect], list[DroppedItem]]:
     """N4. **모델이 거짓을 통과시킬 통로를 닫는다.**
 
     셋을 본다.
@@ -709,13 +782,18 @@ def _apply_output_gate(
             if not isinstance(headline, str) or not headline.strip():
                 counts.evidenceUnverified += 1
                 continue
-            if _gate_hits(headline):
-                counts.piiRedacted += 1
+            headline = headline.strip()
+            gate = _headline_gate(headline)
+            if gate is not None:
+                # **``piiRedacted`` 에 섞지 않는다.** 저쪽은 입력 레닥션 건수이고 이쪽은
+                # 출력 게이트 탈락이다. 한 필드로 세면 값이 올랐을 때 정상과 사고를
+                # 구분할 수 없다.
+                counts.outputGateBlocked += 1
                 dropped.append(
                     DroppedItem(
                         where=f"N4 {key}",
-                        reason="PII_OR_CONTACT",
-                        detail=f"{code.value}: 한 줄 요약에 차단 적중이 있다",
+                        reason=gate,
+                        detail=f"{code.value}: 한 줄 요약이 출력 게이트에 걸렸다",
                     )
                 )
                 continue
@@ -725,8 +803,10 @@ def _apply_output_gate(
             out.append(
                 SummaryAspect(
                     aspectCode=code,
-                    headline=headline.strip(),
+                    headline=headline,
                     mentionCount=repeated.row.mentionCount,
+                    # ``classify`` 가 이미 1.0 으로 자른 값이다. 자르지 않으면 집계 손상
+                    # 한 번으로 "240%의 후기가" 가 화면에 뜬다.
                     mentionShare=round(repeated.share, 4),
                     quotes=quotes,
                 )
@@ -735,17 +815,9 @@ def _apply_output_gate(
 
     pros = collect("pros", Polarity.PRO, PROS_MAX)
     cons = collect("cons", Polarity.CON, CONS_MAX)
-
-    raw_reason = raw.get("consAbsenceReason")
-    reason = None
-    if isinstance(raw_reason, str) and raw_reason:
-        from app.schemas.summary import ConsAbsenceReason
-
-        try:
-            reason = ConsAbsenceReason(raw_reason)
-        except ValueError:
-            reason = None
-    return pros, cons, reason, dropped
+    # ``consAbsenceReason`` 을 **읽지 않는다.** 툴 스키마에 그 필드가 없고, 모델이 보내도
+    # 코드가 센 숫자를 이길 수 없다. 사유는 ``_cons_absence_reason`` 이 정한다.
+    return pros, cons, dropped
 
 
 def _gate_quotes(
@@ -781,8 +853,8 @@ def _gate_quotes(
         if env.mask_heavy(text):
             counts.maskHeavyQuote += 1
             continue
-        if _gate_hits(text):
-            counts.piiRedacted += 1
+        if evidence.blocking_hits(text):
+            counts.outputGateBlocked += 1
             continue
         out.append(QuoteSample(reviewId=review_id, text=text))
     return out

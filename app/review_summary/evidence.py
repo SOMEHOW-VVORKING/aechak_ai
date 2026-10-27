@@ -14,6 +14,29 @@
 언급 건수**다. 모델이 인용 3개를 정확히 달고도 그 위에 과장된 한 줄을 쓸 수 있고 코드는
 막지 못한다. 하네스가 사람 라벨로 재는 축으로 남겼다.
 
+## 자유 텍스트 게이트 — 인용에만 걸려 있던 것을 라벨에도 건다
+
+게이트 넷(길이 상한 / 리터럴 검증 / ``mask_heavy`` / 차단 적중)이 ``quote`` 에만 걸려
+있었다. ``aspectLabel`` 은 ``isinstance(str)`` 만 보고 통과했는데 그것은 **모델이 쓴
+자유 텍스트**이고, ``tally.add(label=...)`` 로 ``labelSamples`` 에 들어가 백엔드가
+**영구 보관**한다. 한 번 들어간 실명·주소는 이후 모든 요약의 집계표와 화면에 계속
+재등장한다. 실제로 재현했다 -- 라벨에 실명과 주소를 넣은 응답이 ``dropped`` 전 필드 0 으로
+통과했고, 하네스가 "1순위 안전 지표"라 부르는 ``piiRedacted`` 가 유출이 일어난 실행에서
+0 을 찍었다.
+
+리터럴 검증은 라벨에 쓸 수 없다 -- 라벨은 "비린 냄새"처럼 정규화된 명사구가 정상이고
+본문에 그 글자가 없다. 그래서 **쓸 수 있는 겹을 전부 쓴다.**
+
+1. 짧은 길이 상한. **유출량의 상한이 이것이다.**
+2. ``mask_heavy`` -- 인용과 같은 기준.
+3. 차단 적중(연락처·외부 유도·지시형). 금지 성분 적중은 보지 않는다 -- 인용·산문과 같은
+   이유다(리뷰가 성분을 걱정한다는 사실이 가장 유용한 단점일 수 있다).
+4. **마스킹 복원 검사.** 원문의 ``*`` 구간 앞뒤 맥락이 라벨에 그대로 있고 ``*`` 는
+   없으면, 모델이 가린 글자를 채운 모양이다.
+
+4번의 한계를 적어 둔다: ``*`` 구간이 본문 맨 앞이나 맨 끝이면 앞뒤 맥락 한쪽이 없어
+판정하지 않는다. **제거가 아니라 완화다.**
+
 ## 극성 교차검사 — 코드가 할 수 있는 유일한 극성 방어
 
 극성 오분류(단점 언급을 장점으로 적음)가 "부정 리뷰 누락"을 **직접** 만든다. 코드가 의미를
@@ -27,12 +50,62 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.inspection import rules
 from app.review_summary.aspects import parse_aspect_code, parse_polarity
 from app.review_summary.envelope import QUOTE_MAX_CHARS, PreparedReview, mask_heavy
+from app.schemas.inspection import ViolationCategory
 from app.schemas.summary import AspectCode, ExtractedAspect, PetContext, PetSource, Polarity
+
+# 라벨 길이 상한. 라벨은 상품 속성을 가리키는 짧은 명사구이고, 이 수가 유출량의 상한이다.
+LABEL_MAX_CHARS = 40
+# 한 줄 요약 길이 상한. 툴 설명의 "60자 이내"와 같은 수다 -- 설명만으로 누르지 않고 코드가 센다.
+HEADLINE_MAX_CHARS = 60
+
+# 마스킹 복원 검사의 맥락 창. 짧게 두면 과탐이 늘고 길게 두면 미탐이 는다.
+_MASK_CONTEXT_CHARS = 2
+_MASK_RUN = re.compile(r"\*+")
+
+# 출력 게이트가 **보지 않는** 적중. 금지 성분 하나다.
+#
+# 리뷰에 "자일리톨이 들었다고 적혀 있어 걱정된다"가 있고 그것이 반복되는 단점이면 그 요약은
+# **구매자에게 가장 유용한 문장**이다. 성분 적중으로 떨어뜨리면 그 축이 영구히 사라진다.
+# 막아야 하는 것은 연락처·외부 유도·지시형이고, 그것들만 차단 적중으로 센다.
+_OUTPUT_GATE_IGNORED = (ViolationCategory.BANNED_INGREDIENT,)
+
+
+def blocking_hits(text: str) -> list[Any]:
+    """출력에 남으면 안 되는 차단 적중. **산문·인용·라벨이 같은 함수를 쓴다.**
+
+    사본을 두면 한쪽만 고쳐져 라벨은 통과하고 인용은 떨어지는 상태가 된다.
+    """
+    return [hit for hit in rules.screen(text).blocking if hit.category not in _OUTPUT_GATE_IGNORED]
+
+
+def restores_mask(text: str, source: str) -> bool:
+    """모델이 마스킹된 구간을 **채워 넣었는가.**
+
+    백엔드 금칙어 마스킹이 ``사장 **아`` 로 가린 것을 모델이 ``사장 병신아`` 로 쓰면
+    앞뒤 맥락은 그대로이고 가린 글자만 채워진 모양이다. 그 모양은 코드가 알아볼 수 있다.
+
+    ``*`` 가 그대로 있으면 복원이 아니다 -- 가린 채로 옮긴 것이고 그것은 정상이다.
+    """
+    if "*" in text or "*" not in source:
+        return False
+    for run in _MASK_RUN.finditer(source):
+        pre = source[max(0, run.start() - _MASK_CONTEXT_CHARS) : run.start()]
+        post = source[run.end() : run.end() + _MASK_CONTEXT_CHARS]
+        # 구간이 본문 끝에 붙어 있으면 맥락 한쪽이 없다. 판정하지 않는다 -- 모듈 머리글의 한계다.
+        if len(pre) < _MASK_CONTEXT_CHARS or len(post) < _MASK_CONTEXT_CHARS:
+            continue
+        at = text.find(pre)
+        if at >= 0 and text.find(post, at + len(pre)) >= 0:
+            return True
+    return False
+
 
 # 극성 충돌을 판정하는 평점. **비대칭이고, 그 비대칭이 의도다.**
 #
@@ -67,6 +140,10 @@ class VerifyCounts:
     mask_heavy_quote: int = 0
     unknown_aspect_code: int = 0
     quote_too_long: int = 0
+    # 자유 텍스트 게이트에 걸려 떨어진 라벨. 길이·차단 적중·마스킹 과다를 합친 수다.
+    label_rejected: int = 0
+    # **마스킹을 되돌린 라벨.** 따로 센다 -- 다른 탈락과 성질이 다르고, 오르면 사고다.
+    mask_restored: int = 0
 
 
 @dataclass(slots=True)
@@ -196,15 +273,44 @@ def _verify_aspect(
         # 이 교차검사가 막으려던 부정 리뷰 누락이다.
         counts.polarity_conflict_noted += 1
 
-    label = item.get("aspectLabel")
+    raw_label = item.get("aspectLabel")
+    label = raw_label.strip() if isinstance(raw_label, str) and raw_label.strip() else None
+    if label is not None:
+        # **인용과 같은 게이트를 라벨에도 건다.** 떨어지면 항목째로 버리지 않고 열거
+        # 라벨로 되돌린다 -- 셈은 코드의 것이고, 읽는 축이 더러워서 세는 축을 버릴 이유가 없다.
+        gate = _label_gate(label, source.model_text)
+        if gate is not None:
+            reasons.append(gate)
+            counts.label_rejected += 1
+            if gate == "LABEL_RESTORES_MASK":
+                counts.mask_restored += 1
+            label = None
+
     return ExtractedAspect(
         aspectCode=code,
-        aspectLabel=(label if isinstance(label, str) and label.strip() else _fallback_label(code)),
+        aspectLabel=label or _fallback_label(code),
         polarity=polarity,
         quote=quote,
         quoteStart=start,
         quoteEnd=start + len(quote),
     )
+
+
+def _label_gate(label: str, source_text: str) -> str | None:
+    """라벨이 떨어지는 사유. 통과하면 ``None``.
+
+    사유를 문자열로 돌려주는 것은 ``drop_reasons`` 에 **무엇 때문인지** 적기 위한 것이다.
+    "검증 실패"로 뭉개면 길이가 넘친 것과 마스킹을 되돌린 것이 같은 문장으로 읽힌다.
+    """
+    if len(label) > LABEL_MAX_CHARS:
+        return "LABEL_TOO_LONG"
+    if mask_heavy(label):
+        return "LABEL_MASK_HEAVY"
+    if blocking_hits(label):
+        return "LABEL_BLOCKED"
+    if restores_mask(label, source_text):
+        return "LABEL_RESTORES_MASK"
+    return None
 
 
 def _fallback_label(code: AspectCode) -> str:

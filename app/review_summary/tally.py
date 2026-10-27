@@ -148,6 +148,10 @@ class Classified:
     minor: tuple[AspectTallyRow, ...]
     cons_absence_reason: ConsAbsenceReason | None
     enough_reviews: bool
+    # **실제로 분석된 건수.** 임계와 비율의 분모이고, 화면 문장의 n 도 이 수다.
+    analyzed_review_count: int
+    # ``mentionCount`` 가 분모를 넘은 줄 수. 저장 집계 손상 신호이고 0 이 정상이다.
+    inconsistent_rows: int = 0
 
 
 def classify(
@@ -156,25 +160,47 @@ def classify(
     basis_review_count: int,
     thresholds: Thresholds,
     segment: bool = False,
+    unextracted_review_count: int = 0,
 ) -> Classified:
     """임계를 적용한다. **이 함수가 "반복되는 장단점"의 유일한 출처다.**
 
-    ``basis_review_count``가 0 이면 비율을 계산할 수 없다. 그때 비율 조건을 통과시키면
+    ## 분모는 ``basisReviewCount`` 가 아니라 **분석된 건수**다
+
+    ``basisReviewCount`` 를 분모로 쓰면 "읽지 못한 리뷰"가 분석된 것으로 세어진다.
+    실측으로 확인했다 -- 20건 중 3건만 읽은 상태에서 최소 10건 게이트가 통과하고
+    ``mentionShare=0.15`` 가 찍혔다(진실은 분석된 3건 중 3건, 즉 100%). 즉 "리뷰 3건으로
+    반복되는 장점을 적는다"가 가능했다. 그래서 분모를 ``basis - unextracted`` 로 둔다.
+
+    분모가 0 이거나 음수면 비율을 계산할 수 없다. 그때 비율 조건을 통과시키면
     (0으로 나누기를 피하려 1.0으로 접는 흔한 실수) 언급 1건이 "100% 반복"이 된다.
     그래서 분모가 없으면 전건이 미달이다.
+
+    ## ``mentionCount`` 가 분모를 넘은 줄은 **버리지 않고 자른다**
+
+    집계는 누적이고 러너는 발행 뒤 커밋이라, 발행 성공·커밋 실패 사이에 죽으면 같은
+    리뷰의 항목이 저장 집계에 두 번 더해질 수 있다(백엔드가 ``eventId`` 로 멱등 처리하면
+    막힌다 -- 계약에 적었다). 그러면 ``mentionCount`` 가 분모를 넘고 비율이 1 을 넘는다.
+
+    **그 줄을 버리지 않는다.** 버리면 실재하는 반복 단점이 사라지고, 그 손해 방향이 이
+    설계가 가장 피하는 실패(부정 리뷰 누락)다. 비율만 1.0 으로 자르고 손상 사실을 센다 --
+    고치는 것은 백엔드의 멱등성이고, 여기서는 거짓 비율을 화면에 보내지 않는 것이 일이다.
     """
     minimum = thresholds.min_segment_reviews if segment else thresholds.min_reviews
-    enough = basis_review_count >= minimum
+    analyzed = max(0, basis_review_count - unextracted_review_count)
+    enough = analyzed >= minimum
 
     pros: list[Repeated] = []
     cons: list[Repeated] = []
     minor: list[AspectTallyRow] = []
     con_mentions = 0
+    inconsistent = 0
 
     for row in tally.as_list():
         if row.polarity is Polarity.CON:
             con_mentions += row.mentionCount
-        share = (row.mentionCount / basis_review_count) if basis_review_count > 0 else 0.0
+        if analyzed > 0 and row.mentionCount > analyzed:
+            inconsistent += 1
+        share = min(1.0, row.mentionCount / analyzed) if analyzed > 0 else 0.0
         repeated = row.mentionCount >= thresholds.min_mentions and share >= thresholds.min_share
         if not repeated:
             minor.append(row)
@@ -185,13 +211,15 @@ def classify(
     if not enough:
         reason = ConsAbsenceReason.NOT_ENOUGH_REVIEWS
     elif not cons:
-        # **"없다"와 "못 찾았다"를 가른다.** 언급이 아예 없었던 것과 있었지만 반복이라
-        # 부르기엔 적었던 것은 다른 사실이고, 화면 문장도 달라야 한다.
-        reason = (
-            ConsAbsenceReason.NO_NEGATIVE_MENTIONS_FOUND
-            if con_mentions == 0
-            else ConsAbsenceReason.BELOW_MENTION_THRESHOLD
-        )
+        # **"없다"와 "못 찾았다"와 "못 읽었다"를 가른다.** 셋이 다른 사실이고 화면 문장도
+        # 달라야 한다. ``NO_NEGATIVE_MENTIONS_FOUND`` 는 "분석한 n건 전부를 읽었고 거기
+        # 단점 언급이 없었다"는 강한 주장이라, 못 읽은 리뷰가 있으면 할 수 없다.
+        if con_mentions > 0:
+            reason = ConsAbsenceReason.BELOW_MENTION_THRESHOLD
+        elif unextracted_review_count > 0:
+            reason = ConsAbsenceReason.PARTIALLY_UNEXTRACTED
+        else:
+            reason = ConsAbsenceReason.NO_NEGATIVE_MENTIONS_FOUND
 
     return Classified(
         pros=tuple(pros),
@@ -199,6 +227,8 @@ def classify(
         minor=tuple(minor),
         cons_absence_reason=reason,
         enough_reviews=enough,
+        analyzed_review_count=analyzed,
+        inconsistent_rows=inconsistent,
     )
 
 

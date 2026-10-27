@@ -7,6 +7,7 @@ Spring Cloud AWS의 파라미터스토어 로딩은 자바 전용이라 파이�
 
 from __future__ import annotations
 
+import math
 from typing import Annotated, Literal
 
 from pydantic import BeforeValidator, Field
@@ -98,6 +99,11 @@ class Settings(BaseSettings):
     summary_timeout_seconds: float = 60.0
     # 메시지당 상한 둘. **폴 간격 예산이 이 두 수를 정한다**(아래 산수 참조).
     summary_extract_batch_max: int = 10
+    # **메시지당 신규 리뷰 상한.** 이 수가 최악 처리시간의 배치 항을 정하고, 그것이 폴
+    # 간격과 묶여 있다. 계약에서 ``ReviewSummaryRequest.newReviews`` 의 ``max_length``
+    # 가 이 값을 쓴다 -- 상한이 없으면 인기 상품의 디바운스 배치 60건이 최악 976초가 되어
+    # 폴 간격 900초를 넘기고, 넘기면 브로커가 멤버를 빼고 컨슈머 태스크가 죽는다.
+    summary_max_new_reviews: int = 40
     summary_scopes_per_message: int = 2
     # 리뷰 본문 절단. 올리면 추출 입력 토큰이 그만큼 오른다.
     # 리뷰 최대 길이는 백엔드 ReviewConstraints.CONTENT_MAX = 1000 이다.
@@ -169,9 +175,16 @@ class Settings(BaseSettings):
 
         **상한만 올리고 폴 간격을 빠뜨리는 것이 이 레포가 실제로 밟은 함정이다.**
         추출 배치 수와 스코프 수를 올리면 이 값이 커지고, 폴 간격이 좁으면 테스트가 떨어진다.
+
+        **배치를 1회로 가정했던 것이 틀렸다.** ``service`` 는 리뷰 수에 비례해 배치를
+        만들고(``env.batches``) ``newReviews`` 에는 상한이 없었다. 실제 최악은
+        ``한 호출 x (배치 수 + 스코프 수)`` 이고 리뷰 60건이면 976초로 폴 간격 900초를
+        넘긴다. 인기 상품의 디바운스 배치가 60건이 되는 것은 평범하다. 그래서 식을
+        실제 배치 수로 바꾸고 리뷰 수에 상한을 걸었다 -- 둘 다 해야 관계가 닫힌다.
         """
         one_call = 2 * self.summary_timeout_seconds + JUDGE_RETRY_DELAY_SECONDS
-        return one_call * (1 + self.summary_scopes_per_message)
+        batches = math.ceil(self.summary_max_new_reviews / max(1, self.summary_extract_batch_max))
+        return one_call * (batches + self.summary_scopes_per_message)
 
     def model_ids(self) -> tuple[str, ...]:
         """설정에 적힌 모델 ID 전부. 부팅에서 가격표와 맞춰 보는 데 쓴다.

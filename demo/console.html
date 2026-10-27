@@ -873,7 +873,11 @@ function summaryScope(scope) {
   const [wrap, panel] = section(title);
 
   const meta = el("div", "pills");
-  meta.appendChild(pill("free", "분모 " + scope.basis_review_count + "건"));
+  // **분모는 분석된 건수다.** 전수를 분모로 그리면 못 읽은 리뷰가 분석된 것으로 읽힌다.
+  meta.appendChild(pill("free", "분석 " + scope.analyzed_review_count + "건"));
+  if (scope.basis_review_count !== scope.analyzed_review_count) {
+    meta.appendChild(pill("free", "전수 " + scope.basis_review_count + "건"));
+  }
   if (scope.unextracted_review_count) {
     meta.appendChild(pill("counted", "분석 안 됨 " + scope.unextracted_review_count + "건"));
   }

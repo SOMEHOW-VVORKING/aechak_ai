@@ -11,6 +11,28 @@ eventType 은 경고 후 ``return`` 하고 바깥 루프가 그대로 커밋한�
 흐르는 공용 토픽이라 건너뛰는 것이 맞았지만, 이 토픽에 오는 것은 전부 우리 것이다.
 모르는 종류가 보이면 그것은 배포 순서가 어긋났다는 뜻이고, 기다리는 것이 사실에 맞다.
 
+## 커밋은 **레코드별 오프셋**이다. 인자 없는 ``commit()`` 으로는 위의 약속이 거짓이다
+
+처음 판은 ``continue`` 로 커밋을 건너뛰고 다음 레코드로 갔다. 그런데 인자 없는
+``consumer.commit()`` 은 **구독한 전 파티션의 현재 소비 위치**를 커밋한다(aiokafka 문서:
+"Defaults to current consumed offsets for all subscribed partitions"). 그래서 다음
+레코드가 성공하면 그 커밋이 **건너뛴 레코드까지 넘어서** 오프셋을 올렸다. 활성 토픽에서는
+그것이 정상 경로이고, 결과적으로 이 모듈 머리글이 "영구히 버린다"고 비판한 바로 그 데이터
+손실이 여기서도 일어났다.
+
+그래서 셋을 바꿨다.
+
+1. 성공한 레코드는 ``commit({TopicPartition(topic, partition): offset + 1})`` 로 **자기
+   오프셋만** 커밋한다.
+2. 어떤 레코드를 건너뛰면 **그 파티션을 막는다.** 뒤 레코드가 성공해도 커밋하지 않는다 --
+   커밋하면 건너뛴 오프셋을 넘어선다. 다른 파티션은 멈추지 않는다.
+3. 커밋 실패(``CommitFailedError``: 리밸런스로 멤버십이 바뀌었다)를 **따로 잡는다.**
+   전에는 ``commit()`` 이 ``handle`` 을 감싼 내부 try 밖이라 바깥 ``except`` 로 빠져
+   ``_healthy=False`` 후 ``raise`` 했고, ``_loop`` 태스크가 죽었다. 다시 띄우는 코드가
+   없고 ``/health`` 는 검수만 보므로 200 UP 이라 ECS 가 태스크를 교체하지 않는다 --
+   요약이 영구히 멈추고 아무도 깨지 않는다. 커밋 실패는 리밸런스 신호이고 그 메시지
+   하나의 실패가 컨슈머 전체를 세울 이유가 아니다.
+
 ## 왜 HTTP 를 열지 않는가
 
 ``app/main.py`` 머리글의 판단을 뒤집지 않는다 -- "공개 ALB 뒤에 있으므로 관리용 경로를
@@ -28,8 +50,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
+from aiokafka.errors import CommitFailedError
 
 from app.review_summary.service import SummaryService
 from app.schemas.envelope import Envelope
@@ -97,25 +121,56 @@ class SummaryRunner:
 
     async def _loop(self) -> None:
         assert self._consumer is not None
+        # 건너뛴 레코드가 있는 파티션. 그 파티션은 **더 커밋하지 않는다** -- 커밋하면
+        # 건너뛴 오프셋을 넘어서 영구히 버린다. 다른 파티션은 계속 흐른다.
+        blocked: set[tuple[str, int]] = set()
         try:
             async for record in self._consumer:
+                partition = (record.topic, record.partition)
                 try:
                     await self.handle(record.value)
                 except Exception:
+                    blocked.add(partition)
                     log.exception(
-                        "요약 처리 실패. topic=%s partition=%s offset=%s",
+                        "요약 처리 실패. 이 파티션의 커밋을 멈춘다. topic=%s partition=%s offset=%s",
                         record.topic,
                         record.partition,
                         record.offset,
                     )
                     continue
-                await self._consumer.commit()
+                if partition in blocked:
+                    log.warning(
+                        "앞 레코드를 건너뛴 파티션이라 커밋하지 않는다. topic=%s partition=%s offset=%s",
+                        record.topic,
+                        record.partition,
+                        record.offset,
+                    )
+                    continue
+                await self._commit_one(record)
         except asyncio.CancelledError:
             raise
         except Exception:
             self._healthy = False
             log.exception("요약 소비 루프가 죽었다")
             raise
+
+    async def _commit_one(self, record: Any) -> None:
+        """그 레코드의 오프셋만 커밋한다. **실패가 루프를 죽이지 않는다.**
+
+        ``CommitFailedError`` 는 리밸런스로 멤버십이 바뀐 신호다. 그때 예외를 밖으로
+        내보내면 소비 태스크가 죽고, 다시 띄우는 코드가 없다. 커밋하지 못한 메시지는
+        재배달되므로 **기다리는 쪽이 사실에 맞다.**
+        """
+        assert self._consumer is not None
+        try:
+            await self._consumer.commit({TopicPartition(record.topic, record.partition): record.offset + 1})
+        except CommitFailedError:
+            log.warning(
+                "커밋이 리밸런스에 밀렸다. 재배달을 기다린다. topic=%s partition=%s offset=%s",
+                record.topic,
+                record.partition,
+                record.offset,
+            )
 
     async def handle(self, raw: bytes | str) -> None:
         payload = raw.decode() if isinstance(raw, bytes) else raw

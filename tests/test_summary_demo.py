@@ -131,12 +131,19 @@ def test_시나리오_목록이_임계를_함께_내려준다(client: TestClient
 # --- 화면 모델이 섞지 않는 것 -----------------------------------------------------------
 
 
-def test_단점_부재_세_갈래가_서로_다른_문장이다() -> None:
-    """뭉개면 "분석한 12건에 단점이 없었다"와 "리뷰가 아직 적다"가 같은 말로 읽힌다."""
+def test_단점_부재_전_갈래가_서로_다른_문장이다() -> None:
+    """뭉개면 "분석한 12건에 단점이 없었다"와 "리뷰가 아직 적다"가 같은 말로 읽힌다.
+
+    **열거를 늘릴 때 화면 문장을 빠뜨리지 않게 열거에서 분모를 가져온다.** 수를 적어 두면
+    새 사유가 ``.get()`` 으로 ``None`` 이 되어 화면이 아무 문장도 그리지 않고, 그러면
+    "단점 없음"으로 읽힌다 -- 이 기능에서 가장 비싼 거짓이다.
+    """
+    from app.schemas.summary import ConsAbsenceReason
+
     sentences = set(summary_view.CONS_ABSENCE_SENTENCES.values())
 
-    assert len(sentences) == 3
-    assert len(summary_view.CONS_ABSENCE_SENTENCES) == 3
+    assert len(sentences) == len(ConsAbsenceReason)
+    assert set(summary_view.CONS_ABSENCE_SENTENCES) == {r.value for r in ConsAbsenceReason}
 
 
 def test_반복인데_문장이_없는_것과_임계_미달을_라벨로_가른다(client: TestClient) -> None:
