@@ -94,24 +94,31 @@ async def health() -> JSONResponse:
     runner: InspectionRunner | None = getattr(app.state, "runner", None)
     consuming = runner.healthy if runner is not None else False
 
-    # 요약 컨슈머는 **별 축으로 보고한다.** ``consuming`` 에 AND 로 섞으면 요약 러너가
-    # 죽었을 때 검수가 멀쩡한데도 전체가 DOWN 이 되어 ECS 가 태스크를 교체하고,
-    # 요약을 끈 배포에서는 그 필드가 거짓이 되어 헬스체크가 영구 503 이 된다.
+    # 요약 컨슈머는 **켜 둔 경우에만** 상태에 들어온다.
     #
-    # **대가를 적어 둔다: 이 필드를 보는 주체가 아직 없다.** ``enable_review_summary`` 가
-    # 참인데 요약 러너가 죽으면 이 응답은 200 UP 이고, 전용 토픽의 메시지가 영구히 쌓이는
-    # 것을 사람이 화면을 보고서야 안다. 경보 주체(CloudWatch 알람 또는 컨슈머 랙 지표)는
-    # 설계 문서의 백엔드 선결 목록에 적었고, 그때까지 이 감시 공백은 실재한다.
+    # 앞 판은 별 축으로만 보고하고 상태에서 뺐다. 끈 배포에서 영구 503 이 되는 것을 피하려는
+    # 것이었는데, 그 대가가 **"켜 둔 기능이 죽어도 200 UP"** 이었다 -- 전용 토픽의 메시지가
+    # 영구히 쌓이는 것을 사람이 화면을 보고서야 안다고 이 주석이 스스로 적어 뒀다.
+    # 토글을 조건에 넣으면 둘을 다 얻는다: 끈 배포는 그 축을 보지 않고, 켠 배포는 죽은
+    # 러너로 DOWN 이 되어 ECS 가 태스크를 교체한다. **켜 둔 기능이 죽은 것은 DOWN 이다.**
+    #
+    # 남은 한계를 정직하게 적어 둔다. 커밋을 멈춘 파티션(``blockedPartitions``)으로는
+    # 상태를 내리지 않는다 -- 요약 러너가 검수와 같은 프로세스라 내리면 교체가 검수까지
+    # 세우고, 결정적 실패면 그 교체가 반복된다. 그 축은 숫자로만 싣고 경보 주체(컨슈머 랙
+    # 알람)는 백엔드 선결 목록에 남아 있다. 숫자가 응답에 없으면 경보를 붙일 재료가 없다.
     summary_runner: SummaryRunner | None = getattr(app.state, "summary_runner", None)
     summary_consuming = summary_runner.healthy if summary_runner is not None else False
-    status = 200 if consuming else 503
+    summary_blocked = summary_runner.blocked_partitions if summary_runner is not None else 0
+    summary_ok = summary_consuming if settings.enable_review_summary else True
+    up = consuming and summary_ok
     return JSONResponse(
-        status_code=status,
+        status_code=200 if up else 503,
         content={
-            "status": "UP" if consuming else "DOWN",
+            "status": "UP" if up else "DOWN",
             "consuming": consuming,
             "reviewSummaryEnabled": settings.enable_review_summary,
             "reviewSummaryConsuming": summary_consuming,
+            "reviewSummaryBlockedPartitions": summary_blocked,
             "promptVersion": settings.prompt_version,
             "schemaVersion": settings.supported_schema_version,
         },

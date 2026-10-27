@@ -39,11 +39,36 @@ eventType 은 경고 후 ``return`` 하고 바깥 루프가 그대로 커밋한�
 열어 두면 이름이 internal 이어도 외부에서 닿는다". 요약은 배치성이라 동기 경로가 필요
 없고, 사전계산 + DB 서빙으로 **조회 비용 0원, 조회 지연 0ms** 를 얻는다.
 
-## 실패 처리 — 유료 재배달 루프를 만들지 않는다
+## 실패 처리 — 유료 재배달 루프를 만들지 않는다. **그리고 실패를 등급으로 가른다**
 
 모델 호출 실패는 ``state = FAILED`` 결과를 발행하고 **오프셋을 커밋한다.** 유료 호출이
-들어간 경로에서 커밋을 빼면 지출이 무한 루프가 된다. 커밋하지 않는 경우는 계약 버전
-불일치와 모르는 eventType 둘뿐이고, 둘 다 코드를 고쳐야 풀리는 상태다.
+들어간 경로에서 커밋을 빼면 지출이 무한 루프가 된다.
+
+그 뒤의 실패를 둘로 가른다. **가르지 않았던 것이 결함이었다.**
+
+- ``SummaryBlocked`` -- **코드나 설정을 고쳐야 풀리는 상태.** 계약 버전 불일치, 모르는
+  eventType, 결과가 발행 상한을 넘는 것. 커밋하지 않고 **그 파티션만 막는다.** 재배달로
+  풀리지 않으므로 다시 받아도 같은 자리에서 멈춘다.
+- ``SummaryPublishFailed`` -- **재배달로 풀리는 상태.** 발행을 ``kafka_publish_attempts``
+  번까지 다시 쏘고도 실패한 경우다. 커밋하지 않고 **소비 루프를 세운다.**
+
+머리글의 앞 판이 "커밋하지 않는 경우는 계약 버전 불일치와 모르는 eventType 둘뿐"이라고
+적었지만 **사실이 아니었다.** ``send_and_wait`` 가 ``handle()`` 안이라 발행 실패가 같은
+분기로 떨어져 그 파티션을 **영구히** 막았다. 토픽은 ``KAFKA_AUTO_CREATE_TOPICS_ENABLE``
+로 자동 생성되고 파티션 수를 지정하지 않아 **1파티션**이므로, 그 한 번의 브로커 단절이
+전 상품의 요약을 영구히 세웠다. 그리고 ``/health`` 가 검수만 보았으므로 아무도 깨지 않았다.
+
+그래서 셋을 함께 고친다. (1) 발행 실패를 위 등급으로 내려 재배달에 맡기고, (2) 발행을
+유료 호출을 다시 태우지 않고 **발행만** 다시 쏘고, (3) ``app/main.py`` 의 ``/health`` 가
+켜 둔 요약 러너의 생존을 상태에 반영한다. 막힌 파티션은 ``blocked_partitions`` 로 세어
+헬스 응답에 함께 싣는다 -- 경보 주체는 아직 백엔드 선결 목록에 있지만, 숫자가 응답에
+없으면 그 경보를 붙일 재료조차 없다.
+
+**막힌 파티션으로 헬스를 내리지는 않는다.** 요약 러너는 검수와 같은 프로세스이고, 내리면
+ECS 가 태스크를 교체해 **검수까지** 선다. 결정적 실패라면 그 교체가 반복되므로 요약 쪽
+버그 하나가 검수를 영구히 멈추게 만든다. 커밋하지 않은 레코드는 잃지 않으므로, 막아 두고
+숫자로 보이는 쪽을 고른다. 발행 실패는 반대다 -- 브로커가 안 되는 상황이면 검수도 이미
+못 돌고 있으므로 태스크 교체가 맞는 처방이다.
 """
 
 from __future__ import annotations
@@ -53,7 +78,7 @@ import logging
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
-from aiokafka.errors import CommitFailedError
+from aiokafka.errors import CommitFailedError, KafkaError
 
 from app.review_summary.service import SummaryService
 from app.schemas.envelope import Envelope
@@ -68,6 +93,24 @@ from app.settings import Settings
 log = logging.getLogger(__name__)
 
 
+class SummaryBlocked(ValueError):
+    """코드나 설정을 고쳐야 풀리는 실패. **그 파티션을 막고 커밋하지 않는다.**
+
+    재배달로 풀리지 않으므로 다시 받아도 같은 자리에서 멈춘다. 기다리는 쪽이 사실에 맞다.
+
+    ``ValueError`` 를 상속한다 -- 앞 판이 계약 실패를 ``ValueError`` 로 던졌고 호출부와
+    테스트가 그 약속을 보고 있다. 등급을 가르면서 그 약속을 깨지 않는다.
+    """
+
+
+class SummaryPublishFailed(RuntimeError):
+    """결과 발행이 재시도까지 쓰고도 실패했다. **재배달로 풀린다.**
+
+    파티션을 막지 않는다 -- 막으면 브로커 단절 한 번이 영구 정지가 되고, 1파티션 토픽에서는
+    그것이 전 상품의 요약 정지다.
+    """
+
+
 class SummaryRunner:
     def __init__(self, *, settings: Settings, service: SummaryService) -> None:
         self._settings = settings
@@ -76,10 +119,20 @@ class SummaryRunner:
         self._producer: AIOKafkaProducer | None = None
         self._task: asyncio.Task[None] | None = None
         self._healthy = False
+        self._blocked: frozenset[tuple[str, int]] = frozenset()
 
     @property
     def healthy(self) -> bool:
         return self._healthy and self._task is not None and not self._task.done()
+
+    @property
+    def blocked_partitions(self) -> int:
+        """커밋을 멈춘 파티션 수. **헬스 응답에 숫자로 싣는다.**
+
+        0이 아니면 그 파티션의 메시지가 쌓이고 있다는 뜻이고, 코드나 설정을 고쳐야 풀린다.
+        경보 주체는 아직 없지만 숫자가 응답에 없으면 경보를 붙일 재료조차 없다.
+        """
+        return len(self._blocked)
 
     async def start(self) -> None:
         self._consumer = AIOKafkaConsumer(
@@ -93,11 +146,18 @@ class SummaryRunner:
             # 테스트가 그 관계를 단언한다. 상한만 올리고 폴 간격을 빠뜨리는 것이 이 레포가
             # 실제로 밟은 함정이다.
             max_poll_interval_ms=self._settings.kafka_summary_max_poll_interval_ms,
+            # **요청 크기 상한을 설정으로 올려 둔다.** 백엔드가 발행하는 쪽이라 우리가 쓸
+            # 수 있는 레버는 이것뿐이고, 기본값에 기대면 ``summary_content_chars`` 를 올린
+            # 날 요청이 흐르지 않는다. 하네스가 그 여유를 숫자로 찍는다.
+            max_partition_fetch_bytes=self._settings.kafka_max_partition_fetch_bytes,
         )
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self._settings.kafka_bootstrap_servers,
             enable_idempotence=True,
             acks="all",
+            # **설정 정본을 넘긴다.** 기본값에 기대면 발행 전 크기 검사가 보는 상한과
+            # 프로듀서가 거부하는 상한이 갈라지고, 그때 검사는 통과하고 발행이 터진다.
+            max_request_size=self._settings.kafka_max_request_size,
         )
         await self._consumer.start()
         await self._producer.start()
@@ -129,8 +189,22 @@ class SummaryRunner:
                 partition = (record.topic, record.partition)
                 try:
                     await self.handle(record.value)
+                except SummaryPublishFailed:
+                    # **재배달로 풀리는 실패다.** 파티션을 막으면 영구 정지이고, 1파티션
+                    # 토픽에서는 전 상품의 요약 정지다. 커밋하지 않고 루프를 세운다 --
+                    # 그래야 ``/health`` 가 내려가고 태스크가 교체되며 레코드가 다시 온다.
+                    self._healthy = False
+                    log.exception(
+                        "요약 결과 발행이 실패했다. 커밋하지 않고 소비를 세운다. "
+                        "topic=%s partition=%s offset=%s",
+                        record.topic,
+                        record.partition,
+                        record.offset,
+                    )
+                    raise
                 except Exception:
                     blocked.add(partition)
+                    self._blocked = frozenset(blocked)
                     log.exception(
                         "요약 처리 실패. 이 파티션의 커밋을 멈춘다. topic=%s partition=%s offset=%s",
                         record.topic,
@@ -172,13 +246,49 @@ class SummaryRunner:
                 record.offset,
             )
 
+    async def _publish(self, payload: bytes, *, key: bytes) -> None:
+        """결과를 발행한다. **유료 호출을 다시 태우지 않고 발행만 다시 쏜다.**
+
+        크기 초과는 재시도로 풀리지 않으므로 **쏘기 전에** 보고 ``SummaryBlocked`` 로 가른다.
+        그 상한을 넘기는 레버가 설정에 셋 있다(``summary_content_chars``,
+        ``summary_scopes_per_message``, ``summary_max_new_reviews``) -- 그 관계는
+        ``harness.run_summary.worst_case_result_bytes()`` 가 숫자로 찍고 테스트가 묶는다.
+        """
+        assert self._producer is not None
+        settings = self._settings
+        if len(payload) > settings.kafka_max_request_size:
+            raise SummaryBlocked(
+                f"요약 결과가 발행 상한을 넘는다. bytes={len(payload)} "
+                f"max_request_size={settings.kafka_max_request_size}. "
+                "summary_content_chars·summary_scopes_per_message·summary_max_new_reviews 를 "
+                "올렸으면 상한도 같이 올려야 한다"
+            )
+
+        attempts = max(1, settings.kafka_publish_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._producer.send_and_wait(settings.kafka_summary_result_topic, payload, key=key)
+                return
+            except KafkaError as error:
+                if attempt >= attempts:
+                    raise SummaryPublishFailed(
+                        f"요약 결과 발행이 {attempts}회 모두 실패했다: {error}"
+                    ) from error
+                log.warning(
+                    "요약 결과 발행 실패. 발행만 다시 쏜다. attempt=%d/%d error=%s",
+                    attempt,
+                    attempts,
+                    error,
+                )
+                await asyncio.sleep(settings.kafka_publish_retry_seconds)
+
     async def handle(self, raw: bytes | str) -> None:
         payload = raw.decode() if isinstance(raw, bytes) else raw
         envelope = Envelope.model_validate_json(payload)
 
         if envelope.eventType != SUMMARY_REQUEST_EVENT_TYPE:
             # 전용 토픽이다. 모르는 종류를 커밋하면 영구히 버린다 -- 기다리는 쪽이 맞다.
-            raise ValueError(
+            raise SummaryBlocked(
                 f"요약 토픽에 모르는 이벤트 종류가 왔다. eventType={envelope.eventType} "
                 f"eventId={envelope.eventId}. 배포 순서가 어긋났을 수 있다"
             )
@@ -186,7 +296,7 @@ class SummaryRunner:
         body = envelope.payload_obj()
         received = int(body.get("schemaVersion", 0))
         if received != self._settings.supported_schema_version:
-            raise ValueError(
+            raise SummaryBlocked(
                 f"지원하지 않는 계약 버전이다. received={received} "
                 f"supported={self._settings.supported_schema_version} eventId={envelope.eventId}"
             )
@@ -207,20 +317,24 @@ class SummaryRunner:
             event_id=message.event_id(),
             event_type=SUMMARY_RESULT_EVENT_TYPE,
             aggregate_type=SUMMARY_AGGREGATE_TYPE,
-            # orderingKey 를 승계한다. 백엔드가 ``orderingKey = productId`` 로 보내므로
-            # 한 상품의 요약 결과가 같은 파티션에서 순서대로 흐른다 -- 그 순서가 백엔드의
-            # "K건마다 재생성" 카운터를 락 없이 유지할 수 있게 하는 선물이다.
+            # orderingKey 를 승계한다. 그래야 한 상품의 결과가 **같은 파티션**으로 간다.
+            #
+            # **그것이 순서를 보장한다고 적지 않는다.** 백엔드 계약이 스스로 부인한다 --
+            # ``IntegrationMessage`` 의 KDoc 이 "같은 키는 같은 파티션으로 감. 발행 순서는
+            # 보장 안 함"이라고 적어 뒀고, 아웃박스가 ``afterCommit`` 비동기 즉시 발행 +
+            # 실패 시 스위퍼 재발행이라 **같은 상품의 두 요청이 뒤집혀 도착할 수 있다.**
+            # 앞 판 주석은 그 순서를 "백엔드가 K건 카운터를 락 없이 유지할 수 있게 하는
+            # 선물"이라고 적었는데, 백엔드가 그 말을 믿고 멱등과 단조 가드를 생략하면
+            # ``mentionCount`` 가 절대값이라 **늦게 온 옛 결과가 최신 집계를 더 작은 수로
+            # 덮는다.** 되돌릴 방법이 없다(원본 추출 결과를 들고 있지 않으면 전 코퍼스
+            # 재추출이다). 그래서 백엔드 선결 목록에 셋을 적었다 -- 리뷰별 행으로 저장하고
+            # 집계는 SQL 로 다시 세기, ``analyzedReviewCount`` 단조 가드, 인박스 멱등.
             ordering_key=envelope.orderingKey,
             payload_obj=message,
             trace_id=envelope.traceId,
         )
-        assert self._producer is not None
         # 발행이 브로커에게 확인된 뒤에만 커밋한다. 호출부가 그 순서를 지킨다.
-        await self._producer.send_and_wait(
-            self._settings.kafka_summary_result_topic,
-            out.to_json().encode(),
-            key=envelope.orderingKey.encode(),
-        )
+        await self._publish(out.to_json().encode(), key=envelope.orderingKey.encode())
         cost = sum(call.costMicroUsd for call in message.calls)
         log.info(
             "요약 발행. traceId=%s requestId=%s state=%s calls=%d costMicroUsd=%d unextracted=%d",

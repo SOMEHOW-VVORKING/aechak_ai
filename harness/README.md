@@ -8,10 +8,19 @@
 ## 리뷰 요약 러너 (SCRUM-310)
 
 ```bash
-uv run python -m harness.run_summary                  # 키 없이 도는 리포트 전부
-uv run python -m harness.run_summary --count-tokens   # 접두부 토큰 실측 (거의 무료)
-uv run python -m harness.run_summary --repeat 3 --yes # 실측
+uv run python -m harness.run_summary                  # 키 없이 도는 리포트 전부 (종료 0)
+uv run python -m harness.run_summary --count-tokens   # 접두부 토큰 실측. **키가 필요하다**
+uv run python -m harness.run_summary --repeat 3 --yes # 실측. **키가 필요하다**
 ```
+
+**키가 필요한 플래그는 키가 없으면 종료 코드 2 다.** 앞 판은 "키가 없으면 리포트를 찍고
+return 0" 이 플래그 분기 **위**에 있어서 세 호출의 출력이 산출물 경로 줄만 빼고 글자 그대로
+같았다 — 사람은 측정을 요청했는데 받은 것은 같은 리포트 한 장이고, 종료 코드가 0 이라
+스크립트도 성공으로 읽었다. 요청한 일을 못 했으면 종료 코드로 말한다.
+
+산출물은 `harness/out/summary-<stamp>/{raw.jsonl,summary.tsv}` 다. **같은 초에 두 번 돌면
+`-2` 접미가 붙는다**(앞 판은 `mkdir(exist_ok=True)` 로 조용히 덮었다). `raw.jsonl` 은
+0줄이라도 쓴다 — 없으면 읽는 사람이 raw 를 잃었는지 애초에 없었는지 구별할 수 없다.
 
 **키가 없어도 값이 나온다.** 그리고 지금 이 범위에서 가장 값비싼 숫자가 거기서 나온다 --
 합성 펫 모집단에 대한 티어·세그먼트 분포다. `NO_PET_INFO` 가 압도적이거나 어느 세그먼트도

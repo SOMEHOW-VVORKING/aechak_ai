@@ -144,6 +144,20 @@ class Settings(BaseSettings):
     # 검수 폴 간격과 **따로** 둔다. 섞으면 요약 쪽 상한을 올릴 때 검수 리밸런스가 흔들린다.
     kafka_summary_max_poll_interval_ms: int = 900_000
 
+    # 발행 본문 상한. aiokafka 기본값과 같은 수를 **설정으로 올려 둔다** -- 기본값에 기대면
+    # 발행 전 크기 검사가 보는 상한과 프로듀서가 거부하는 상한이 갈라진다.
+    #
+    # 계약 상한을 꽉 채운 요약 결과가 이 안에 드는지를 테스트가 단언한다. 결과 쪽을 넘기는
+    # 레버는 둘이고(``summary_scopes_per_message``·``summary_max_new_reviews``) 운영에서
+    # 설정 한 줄을 올리면 발행이 터진다 -- 그 실패는 재배달로 풀리지 않는다.
+    kafka_max_request_size: int = 1_048_576
+    # 수신 본문 상한. 요청을 발행하는 쪽은 백엔드이므로 **요청 크기는 이쪽 상한에 걸린다.**
+    # ``summary_content_chars`` 가 그 레버다(리뷰 본문이 메시지에 그대로 실린다).
+    kafka_max_partition_fetch_bytes: int = 1_048_576
+    # 결과 발행을 몇 번까지 다시 쏘는가. **모델 호출을 다시 태우지 않고 발행만 다시 쏜다.**
+    kafka_publish_attempts: int = 3
+    kafka_publish_retry_seconds: float = 2.0
+
     prompt_version: str = "inspection-v1"
 
     # 계약 버전. 모르는 major를 받으면 떨어뜨리지 않고 거절한다.
@@ -184,7 +198,10 @@ class Settings(BaseSettings):
         """
         one_call = 2 * self.summary_timeout_seconds + JUDGE_RETRY_DELAY_SECONDS
         batches = math.ceil(self.summary_max_new_reviews / max(1, self.summary_extract_batch_max))
-        return one_call * (batches + self.summary_scopes_per_message)
+        # 발행 재시도도 wall clock 이다. 빠뜨리면 발행 재시도를 늘리는 변경이 폴 간격을
+        # 조용히 먹는다 -- 이 함수가 존재하는 이유가 바로 그 종류의 누락이다.
+        publish = max(0, self.kafka_publish_attempts - 1) * self.kafka_publish_retry_seconds
+        return one_call * (batches + self.summary_scopes_per_message) + publish
 
     def model_ids(self) -> tuple[str, ...]:
         """설정에 적힌 모델 ID 전부. 부팅에서 가격표와 맞춰 보는 데 쓴다.

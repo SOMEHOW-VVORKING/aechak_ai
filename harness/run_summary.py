@@ -516,6 +516,259 @@ def _report_thresholds() -> list[tuple[str, str]]:
     return rows
 
 
+def worst_case_result_bytes(settings: Settings) -> int:
+    """계약 상한을 꽉 채운 **결과 엔벨로프**의 바이트 수. 키 없이 계산된다.
+
+    왜 이 숫자가 필요한가. 결과를 발행하는 쪽에 ``max_request_size`` 가 있고, 넘기면
+    ``send_and_wait`` 가 실패한다. 그 실패는 재배달로 풀리지 않는데(크기는 그대로다)
+    앞 판에서는 발행 실패가 계약 실패와 같은 분기로 떨어져 **그 파티션을 영구히 막았고**
+    헬스체크가 그것을 보지 못했다. 토픽이 1파티션이라 그것이 전 상품의 요약 정지다.
+
+    결과 쪽 상한을 넘기는 레버는 **둘**이다. 인용·라벨·한 줄 요약은 코드가 길이를 자르므로
+    ``summary_content_chars`` 는 결과 크기를 키우지 않는다 -- 그 설정은 **요청** 쪽 레버이고
+    그것은 ``worst_case_request_bytes()`` 가 따로 센다. 둘을 한 숫자로 뭉개면 어느 설정이
+    어느 상한을 넘기는지 알 수 없다.
+
+        summary_scopes_per_message   2 -> 5      : 스코프마다 집계 전수가 붙는다
+        summary_max_new_reviews      40 -> 100   : 리뷰별 추출 행이 그만큼 늘어난다
+
+    그래서 **구조적 상한에서** 조립한다. 리뷰 한 건의 항목은 ``(코드, 극성)`` 으로 중복이
+    접히므로 열거 18종 x 2 가 상한이고, 인용 80자(``QUOTE_MAX_CHARS``)·라벨 40자
+    (``LABEL_MAX_CHARS``)·한 줄 요약 60자(``HEADLINE_MAX_CHARS``)·표본 3개
+    (``LABEL_SAMPLES_MAX``/``QUOTE_SAMPLES_MAX``)가 코드의 상한이다. 한글은 UTF-8 에서
+    글자당 3바이트라 그 전제로 채운다 -- **추정이 아니라 조립해서 센 값이다.**
+    """
+    from app.review_summary.evidence import HEADLINE_MAX_CHARS, LABEL_MAX_CHARS
+    from app.review_summary.extract_prompt import EXTRACT_VERSION
+    from app.review_summary.narrate_prompt import NARRATE_VERSION
+    from app.review_summary.tally import LABEL_SAMPLES_MAX, NARRATE_ROWS_MAX, QUOTE_SAMPLES_MAX
+    from app.schemas.envelope import Envelope
+    from app.schemas.summary import (
+        SUMMARY_AGGREGATE_TYPE,
+        SUMMARY_RESULT_EVENT_TYPE,
+        AspectCode,
+        AspectTallyRow,
+        ExtractedAspect,
+        ExtractedReview,
+        PetContext,
+        QuoteSample,
+        ReviewSummaryMessage,
+        ScopeSummary,
+        SummaryAspect,
+        SummaryScope,
+    )
+
+    quote = "가" * env.QUOTE_MAX_CHARS
+    label = "가" * LABEL_MAX_CHARS
+    headline = "가" * HEADLINE_MAX_CHARS
+    pairs = [(code, polarity) for code in AspectCode for polarity in Polarity]
+
+    def samples(review_id: int) -> list[QuoteSample]:
+        return [QuoteSample(reviewId=review_id, text=quote) for _ in range(QUOTE_SAMPLES_MAX)]
+
+    def tally_row(code: AspectCode, polarity: Polarity) -> AspectTallyRow:
+        return AspectTallyRow(
+            aspectCode=code,
+            polarity=polarity,
+            mentionCount=settings.summary_max_new_reviews,
+            labelSamples=[label] * LABEL_SAMPLES_MAX,
+            quoteSamples=samples(1),
+        )
+
+    extracted = [
+        ExtractedReview(
+            extracted=ExtractStatus.EXTRACTED,
+            reviewId=review_id,
+            aspects=[
+                ExtractedAspect(
+                    aspectCode=code,
+                    aspectLabel=label,
+                    polarity=polarity,
+                    quote=quote,
+                    quoteStart=0,
+                    quoteEnd=env.QUOTE_MAX_CHARS,
+                )
+                for code, polarity in pairs
+            ],
+            petContext=PetContext(species="DOG", breedLabel=label, weightKg=15.0, ageYears=3, quote=quote),
+            truncated=True,
+            note="가" * 80,
+        )
+        for review_id in range(1, settings.summary_max_new_reviews + 1)
+    ]
+    summaries = [
+        ScopeSummary(
+            scope=SummaryScope.SEGMENT,
+            segmentKey="DOG_10_25",
+            basisReviewCount=10_000,
+            unextractedReviewCount=10,
+            analyzedReviewCount=settings.summary_max_new_reviews,
+            pros=[
+                SummaryAspect(
+                    aspectCode=code,
+                    headline=headline,
+                    mentionCount=10,
+                    mentionShare=0.5,
+                    quotes=samples(1),
+                )
+                for code, _ in pairs[:3]
+            ],
+            cons=[
+                SummaryAspect(
+                    aspectCode=code,
+                    headline=headline,
+                    mentionCount=10,
+                    mentionShare=0.5,
+                    quotes=samples(1),
+                )
+                for code, _ in pairs[3:6]
+            ],
+            minorMentions=[tally_row(code, polarity) for code, polarity in pairs],
+            unnarratedAspects=[tally_row(code, polarity) for code, polarity in pairs[:NARRATE_ROWS_MAX]],
+            tallyFingerprint="0" * 12,
+        )
+        for _ in range(settings.summary_scopes_per_message)
+    ]
+    message = ReviewSummaryMessage(
+        requestId="r" * 64,
+        productId=10_000_000,
+        extractVersion=EXTRACT_VERSION,
+        narrateVersion=NARRATE_VERSION,
+        extracted=extracted,
+        summaries=summaries,
+        generatedAt=datetime.now(UTC),
+    )
+    out = Envelope.wrap(
+        event_id=message.event_id(),
+        event_type=SUMMARY_RESULT_EVENT_TYPE,
+        aggregate_type=SUMMARY_AGGREGATE_TYPE,
+        ordering_key=str(message.productId),
+        payload_obj=message,
+        trace_id="t" * 36,
+    )
+    return len(out.to_json().encode())
+
+
+def worst_case_request_bytes(settings: Settings) -> int:
+    """계약 상한을 꽉 채운 **요청 엔벨로프**의 바이트 수.
+
+    발행하는 쪽은 백엔드이므로 이 숫자가 걸리는 상한은 우리 프로듀서가 아니라 **컨슈머의
+    ``max_partition_fetch_bytes``** 와 백엔드 프로듀서의 상한이다. 요청 쪽 레버가
+    ``summary_content_chars`` 다 -- 리뷰 본문이 메시지에 그대로 실린다.
+    """
+    from app.review_summary.evidence import LABEL_MAX_CHARS
+    from app.review_summary.tally import LABEL_SAMPLES_MAX, QUOTE_SAMPLES_MAX
+    from app.schemas.envelope import Envelope
+    from app.schemas.summary import (
+        SUMMARY_AGGREGATE_TYPE,
+        SUMMARY_REQUEST_EVENT_TYPE,
+        AspectCode,
+        AspectTallyRow,
+        QuoteSample,
+        RequestedScope,
+        ReviewInput,
+        ReviewSummaryRequest,
+        SummaryScope,
+    )
+
+    quote = "가" * env.QUOTE_MAX_CHARS
+    label = "가" * LABEL_MAX_CHARS
+    pairs = [(code, polarity) for code in AspectCode for polarity in Polarity]
+    request = ReviewSummaryRequest(
+        requestId="r" * 64,
+        productId=10_000_000,
+        categoryPath=["가" * 30] * 3,
+        totalVisibleReviews=10_000,
+        newReviews=[
+            ReviewInput(
+                reviewId=review_id,
+                rating=5,
+                content="가" * settings.summary_content_chars,
+                optionName="가" * 40,
+                hasPhoto=True,
+            )
+            for review_id in range(1, settings.summary_max_new_reviews + 1)
+        ],
+        requestedScopes=[
+            RequestedScope(
+                scope=SummaryScope.SEGMENT,
+                segmentKey="DOG_10_25",
+                basisReviewCount=10_000,
+                unextractedReviewCount=10,
+                tally=[
+                    AspectTallyRow(
+                        aspectCode=code,
+                        polarity=polarity,
+                        mentionCount=1_000,
+                        labelSamples=[label] * LABEL_SAMPLES_MAX,
+                        quoteSamples=[QuoteSample(reviewId=1, text=quote) for _ in range(QUOTE_SAMPLES_MAX)],
+                    )
+                    for code, polarity in pairs
+                ],
+            )
+            for _ in range(settings.summary_scopes_per_message)
+        ],
+    )
+    out = Envelope.wrap(
+        event_id="evt",
+        event_type=SUMMARY_REQUEST_EVENT_TYPE,
+        aggregate_type=SUMMARY_AGGREGATE_TYPE,
+        ordering_key=str(request.productId),
+        payload_obj=request,
+        trace_id="t" * 36,
+    )
+    return len(out.to_json().encode())
+
+
+def _report_publish_budget(settings: Settings) -> list[tuple[str, str]]:
+    """메시지 크기 여유. **설정 한 줄이 요약을 세우는 자리를 숫자로 보여 준다.**
+
+    두 방향을 따로 센다. 결과는 우리가 발행하고(``max_request_size``) 요청은 백엔드가
+    발행해 우리가 가져온다(``max_partition_fetch_bytes``). 한 숫자로 뭉개면 어느 설정이
+    어느 상한을 넘기는지 알 수 없다.
+    """
+    result = worst_case_result_bytes(settings)
+    request = worst_case_request_bytes(settings)
+    send_limit = settings.kafka_max_request_size
+    fetch_limit = settings.kafka_max_partition_fetch_bytes
+    levers = []
+    for name, update, size_of, limit in (
+        ("summary_content_chars=800", {"summary_content_chars": 800}, worst_case_request_bytes, fetch_limit),
+        (
+            "summary_scopes_per_message=5",
+            {"summary_scopes_per_message": 5},
+            worst_case_result_bytes,
+            send_limit,
+        ),
+        (
+            "summary_max_new_reviews=100",
+            {"summary_max_new_reviews": 100},
+            worst_case_result_bytes,
+            send_limit,
+        ),
+    ):
+        size = size_of(settings.model_copy(update=update))
+        levers.append(f"{name}: {size / 1_048_576:.2f}MiB" + (" **초과**" if size > limit else " 이내"))
+    return [
+        (
+            "발행 상한 여유",
+            f"계약 상한을 꽉 채운 결과 {result:,}B ({result / 1_048_576:.2f}MiB) / 상한 "
+            f"{send_limit:,}B — 여유 {(send_limit - result) / send_limit:+.0%}. "
+            "**추정이 아니라 조립해서 센 값이다**",
+        ),
+        (
+            "수신 상한 여유",
+            f"계약 상한을 꽉 채운 요청 {request:,}B ({request / 1_048_576:.2f}MiB) / 상한 "
+            f"{fetch_limit:,}B — 여유 {(fetch_limit - request) / fetch_limit:+.0%}. "
+            "**백엔드가 발행하고 우리가 가져오는 쪽이다**",
+        ),
+        (
+            "상한을 넘기는 레버",
+            " / ".join(levers) + " — 넘기면 메시지가 흐르지 않고, 그 실패는 재배달로 풀리지 않는다",
+        ),
+    ]
+
+
 def _report_estimate(repeat: int) -> list[tuple[str, str]]:
     """비용 추정. **전부 추정이고 실측이 아니다.**"""
     settings = Settings()
@@ -741,13 +994,28 @@ def _summarize_measured(records: list[Record]) -> list[tuple[str, str]]:
     return rows
 
 
-def _write_out(records: list[Record], rows: list[tuple[str, str]]) -> Path:
+def _write_out(records: list[Record], rows: list[tuple[str, str]], *, out_root: Path | None = None) -> Path:
+    """산출물을 쓴다. **덮지 않고, 빈 raw 도 파일로 남긴다.**
+
+    둘을 고쳤다.
+
+    1. 스탬프가 초 단위이고 ``mkdir(exist_ok=True)`` 라 **같은 초에 두 번 돌면 조용히
+       덮었다.** 동시에 두 번 돌려 확인했다 -- 디렉터리가 2개가 아니라 1개만 늘었다.
+       측정 결과를 조용히 잃는 자리라서 겹치면 다른 이름을 쓴다.
+    2. ``if records:`` 가드 때문에 키 없는 경로에서는 ``raw.jsonl`` 이 **영구히 안 써졌다.**
+       읽는 사람은 raw 를 잃었는지 애초에 없었는지 구별할 수 없다. 0줄이라도 파일이 있는
+       쪽이 사실에 가깝다.
+    """
+    root = out_root if out_root is not None else OUT_ROOT
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    out = OUT_ROOT / f"summary-{stamp}"
-    out.mkdir(parents=True, exist_ok=True)
-    if records:
-        (out / "raw.jsonl").write_text("\n".join(r.as_json() for r in records) + "\n")
-    (out / "summary.tsv").write_text("\n".join(f"{k}\t{v}" for k, v in rows) + "\n")
+    out = root / f"summary-{stamp}"
+    serial = 2
+    while out.exists():
+        out = root / f"summary-{stamp}-{serial}"
+        serial += 1
+    out.mkdir(parents=True)
+    (out / "raw.jsonl").write_text("".join(r.as_json() + "\n" for r in records), encoding="utf-8")
+    (out / "summary.tsv").write_text("\n".join(f"{k}\t{v}" for k, v in rows) + "\n", encoding="utf-8")
     return out
 
 
@@ -767,6 +1035,7 @@ async def _main(args: argparse.Namespace) -> int:
     rows.extend(_report_gate())
     rows.extend(_report_polarity_band())
     rows.extend(_report_thresholds())
+    rows.extend(_report_publish_budget(settings))
     rows.extend(_report_estimate(args.repeat))
     _print(rows)
 
@@ -779,6 +1048,20 @@ async def _main(args: argparse.Namespace) -> int:
         )
         out = _write_out([], rows)
         print(f"산출물 {out}")
+        # **요청한 일을 못 했으면 종료 코드로 말한다.**
+        #
+        # 앞 판은 이 자리에서 무조건 0 을 돌려줬고 ``--count-tokens`` 분기와 ``--yes``
+        # 분기가 **아래**에 있었다. 그래서 세 호출의 출력이 산출물 경로 줄만 빼고 글자
+        # 그대로 같았고(diff 로 확인), 사람은 측정을 요청했는데 받은 것은 같은 리포트 한
+        # 장이었다. 종료 코드가 0 이라 스크립트도 성공으로 읽는다.
+        requested = [name for name, on in (("--count-tokens", args.count_tokens), ("--yes", args.yes)) if on]
+        if requested:
+            print(
+                f"[실패] {' '.join(requested)} 는 키가 있어야 돈다. 아무것도 측정하지 않았다 -- "
+                "그 사실을 종료 코드 2 로 알린다. SSM 의 "
+                "/aechak/dev/ai/AECHAK_AI_ANTHROPIC_API_KEY 를 등재해야 한다."
+            )
+            return 2
         return 0
 
     if args.count_tokens:
@@ -823,4 +1106,6 @@ __all__ = [
     "DAILY_NARRATE_CEILING",
     "Record",
     "summary_cache_prefix_targets",
+    "worst_case_request_bytes",
+    "worst_case_result_bytes",
 ]
