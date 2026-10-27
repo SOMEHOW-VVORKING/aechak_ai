@@ -368,6 +368,17 @@ class SummaryService:
             )
 
         pros, cons, reason, dropped = _apply_output_gate(result.tool_input, classified, counts)
+        unnarrated = _unnarrated(classified, pros, cons)
+        counts.narrationMissing += len(unnarrated)
+        if unnarrated:
+            dropped.extend(
+                DroppedItem(
+                    where="N4",
+                    reason="NARRATION_MISSING",
+                    detail=f"{row.aspectCode.value}/{row.polarity.value}: 반복으로 셌는데 한 줄이 없다",
+                )
+                for row in unnarrated
+            )
         self._record_narrate(scope_label, result, dropped, failed=False)
         return (
             ScopeSummary(
@@ -381,6 +392,7 @@ class SummaryService:
                 # 되살린다 -- 비어 있는 채로 내보내면 화면이 "단점 없음"으로 읽는다.
                 consAbsenceReason=((reason or classified.cons_absence_reason) if not cons else None),
                 minorMentions=[row.model_copy(deep=True) for row in classified.minor],
+                unnarratedAspects=unnarrated,
                 tallyFingerprint=fingerprint,
             ),
             usage,
@@ -611,9 +623,33 @@ def _failed_scope(
         basisReviewCount=scope.basisReviewCount,
         unextractedReviewCount=unextracted,
         minorMentions=[row.model_copy(deep=True) for row in classified.minor],
+        # 반복으로 센 항목을 그대로 싣는다. 산문만 없고 셈은 있다는 사실이 화면에 남아야 한다.
+        unnarratedAspects=[item.row.model_copy(deep=True) for item in [*classified.pros, *classified.cons]],
         narrateFailure=detail,
         tallyFingerprint=fingerprint,
     )
+
+
+def _unnarrated(
+    classified: tally_mod.Classified,
+    pros: list[SummaryAspect],
+    cons: list[SummaryAspect],
+) -> list[AspectTallyRow]:
+    """임계를 넘었는데 산문이 붙지 않은 항목. **버리지 않고 건수째로 돌려준다.**
+
+    모델이 ``pros`` 를 비워 보내거나 출력 게이트가 그 항목을 떨어뜨리면, 코드가 이미
+    "반복된다"로 센 항목이 결과에서 통째로 사라진다. 그러면 화면에 아무것도 안 뜨고
+    구매자는 "반복되는 장점이 없다"로 읽는다 -- 센 숫자가 있는데 거짓을 말하는 것이다.
+
+    ``minorMentions`` 에 넣지 않는다. 저쪽은 임계 미달이라는 **다른 사실**이다.
+    """
+    written = {(item.aspectCode, Polarity.PRO) for item in pros}
+    written |= {(item.aspectCode, Polarity.CON) for item in cons}
+    return [
+        item.row.model_copy(deep=True)
+        for item in [*classified.pros, *classified.cons]
+        if (item.row.aspectCode, item.row.polarity) not in written
+    ]
 
 
 def _apply_output_gate(

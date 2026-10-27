@@ -281,6 +281,12 @@ class ScopeSummary(BaseModel):
     cons: list[SummaryAspect] = Field(default_factory=list)
     consAbsenceReason: ConsAbsenceReason | None = None
     minorMentions: list[AspectTallyRow] = Field(default_factory=list)
+    # 임계를 **넘었는데 모델이 한 줄을 쓰지 않은** 항목.
+    #
+    # ``minorMentions`` 와 절대 섞지 않는다. 저쪽은 "언급이 적어 반복이라 부를 수 없다"이고
+    # 이쪽은 "반복이라고 셌는데 문장이 없다"다 -- 뭉개면 반복된 장단점이 조용히 사라지고
+    # 화면은 그것을 "미달"로 적는다. 셈은 코드의 것이므로 모델이 안 써도 건수는 남아야 한다.
+    unnarratedAspects: list[AspectTallyRow] = Field(default_factory=list)
     notEnoughReason: str | None = None
     # 서술 호출이 실패해 산문이 없는 경우. **빈 장단점의 세 번째 사유다.**
     #
@@ -328,6 +334,9 @@ class DroppedCounts(BaseModel):
     truncated: int = 0
     unknownAspectCode: int = 0
     belowThresholdRejected: int = 0
+    # 임계를 넘었는데 모델이 한 줄을 쓰지 않은 항목 수. 0 이 정상이고, 오르면 서술
+    # 접두부의 지시가 지켜지지 않는다는 신호다.
+    narrationMissing: int = 0
 
 
 class ReviewSummaryMessage(BaseModel):

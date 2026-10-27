@@ -39,9 +39,10 @@ id로 렌더한 신뢰 값이라 봉투 바깥에 둬도 안전하다. **리뷰 
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 
-from app.inspection import banned, rules
+from app.inspection import rules
 from app.schemas.inspection import ViolationCategory
 from app.schemas.summary import ExcludeReason, ReviewInput
 
@@ -53,6 +54,29 @@ QUOTE_MAX_CHARS = 80
 # 그대로 요약에 올라오면 화면이 읽히지 않고, 무엇을 가렸는지도 전해지지 않는다.
 MASK_HEAVY_RATIO = 0.5
 _MASK_CHARS = "*"
+
+
+def dedupe_key(text: str) -> str:
+    """중복 접기 키. **NFKC + 공백 정규화뿐이고 반복 축약을 하지 않는다.**
+
+    설계는 ``banned.fold()`` 를 쓰자고 했다. 쓰면 안 된다 -- 실행해 확인했다.
+    그 함수는 금지 성분의 우회 표기를 잡으려고 **같은 글자 반복을 한 번으로 줄인다.**
+    그래서 리뷰 본문에 쓰면 이렇게 된다.
+
+        "2kg 먹였어요"   == "22kg 먹였어요"
+        "1살이에요"      == "11살이에요"
+        "좋아요"         == "좋아아요"
+
+    반려동물 리뷰에서 체중과 나이 숫자는 **내용을 가르는 바로 그 글자**다. 그것을 접으면
+    서로 다른 리뷰가 "중복"으로 분모에서 조용히 빠지고, 그 손실은 어디에도 보고되지 않는
+    형태로 센다(``duplicateFolded`` 가 올라가지만 그것이 거짓 중복인지 알 수 없다).
+    ``rules.normalize()`` 도 3회 이상 반복을 줄여 "2000원"과 "200원"을 같게 만든다.
+
+    중복 접기가 막으려는 것은 **같은 문구를 여러 계정이 붙인 복붙**이고 그것은 성질상
+    글자 그대로다. 그래서 공백 차이와 전각 표기만 흡수하고 나머지는 건드리지 않는다 --
+    거짓 중복이 0 인 쪽을 고른다.
+    """
+    return " ".join(unicodedata.normalize("NFKC", text).split())
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,8 +144,9 @@ def prepare(reviews: list[ReviewInput], *, content_chars: int) -> PreparedBatch:
     2. 판정기를 겨냥한 지시형 문장이 든 리뷰는 **추출 입력에서 뺀다.** 그 리뷰는
        ``UNEXTRACTED`` + ``INJECTION``으로 적히고 "항목 없음"에 섞이지 않는다.
     3. 본문을 절단한다. 절단은 손실이라 플래그로 남긴다.
-    4. ``banned.fold``로 접은 문자열이 완전히 같은 리뷰는 한 건만 남긴다. 같은 문구를
-       여러 계정이 붙인 묶음이 "반복되는 장점"을 혼자 만드는 것을 막는다.
+    4. 공백·전각만 정규화한 문자열이 **완전히 같은** 리뷰는 한 건만 남긴다. 같은 문구를
+       여러 계정이 붙인 묶음이 "반복되는 장점"을 혼자 만드는 것을 막는다. 반복 축약을
+       하지 않는 이유는 ``dedupe_key`` 에 적었다.
     5. 봉투 구분자를 중성화한다. **본문을 프롬프트에 끼우기 전**이다.
 
     **모집단을 ``rules.screen().blocking``으로 걸러내지 않는다.** "카톡"이나 외부 URL
@@ -153,7 +178,7 @@ def prepare(reviews: list[ReviewInput], *, content_chars: int) -> PreparedBatch:
         if truncated:
             body = body[:content_chars]
 
-        folded = banned.fold(body)
+        folded = dedupe_key(body)
         first = seen_folded.get(folded)
         if first is not None:
             batch.excluded.append(
@@ -228,6 +253,7 @@ __all__ = [
     "PreparedBatch",
     "PreparedReview",
     "batches",
+    "dedupe_key",
     "envelope_escaped",
     "mask_heavy",
     "prepare",
