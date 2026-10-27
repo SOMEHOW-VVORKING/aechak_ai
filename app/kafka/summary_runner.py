@@ -78,8 +78,16 @@ import logging
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
-from aiokafka.errors import CommitFailedError, KafkaError
+from aiokafka.errors import (
+    CommitFailedError,
+    KafkaError,
+    MessageSizeTooLargeError,
+    RecordTooLargeError,
+    UnknownTopicOrPartitionError,
+)
+from aiokafka.record.default_records import DefaultRecordBatchBuilder
 
+from app.review_summary.budget import worst_case_result_bytes_for
 from app.review_summary.service import SummaryService
 from app.schemas.envelope import Envelope
 from app.schemas.summary import (
@@ -246,22 +254,38 @@ class SummaryRunner:
                 record.offset,
             )
 
+    # 재배달로 풀리지 않는 발행 실패. **재시도 집합에서 뺀다.**
+    #
+    # 셋 다 ``KafkaError`` 서브클래스라 앞 판의 ``except KafkaError`` 가 전부 재시도했고,
+    # 3회 실패 뒤 ``SummaryPublishFailed`` 로 루프가 죽었다. 그러면 ``/health`` 가 503 이
+    # 되고 ECS 가 태스크를 교체하는데 **같은 프로세스의 검수 컨슈머가 함께 죽는다.** 커밋하지
+    # 않은 레코드가 재배달되어 같은 결정적 실패를 다시 내므로 무한 교체 루프다. 결과 토픽이
+    # 없는 클러스터가 그 모양의 대표 사례이고, 머리글의 전제("브로커가 안 되는 상황이면 검수도
+    # 이미 못 돌고 있다")가 **결과 토픽 한정 실패에서 거짓이다.**
+    _NOT_RETRYABLE = (MessageSizeTooLargeError, RecordTooLargeError, UnknownTopicOrPartitionError)
+
     async def _publish(self, payload: bytes, *, key: bytes) -> None:
         """결과를 발행한다. **유료 호출을 다시 태우지 않고 발행만 다시 쏜다.**
 
         크기 초과는 재시도로 풀리지 않으므로 **쏘기 전에** 보고 ``SummaryBlocked`` 로 가른다.
-        그 상한을 넘기는 레버가 설정에 셋 있다(``summary_content_chars``,
-        ``summary_scopes_per_message``, ``summary_max_new_reviews``) -- 그 관계는
-        ``harness.run_summary.worst_case_result_bytes()`` 가 숫자로 찍고 테스트가 묶는다.
+        그 상한을 넘기는 레버가 설정에 둘이고(``summary_scopes_per_message``,
+        ``summary_max_new_reviews``) 그 관계는 ``app.review_summary.budget`` 이 조립해
+        숫자로 찍고 테스트가 묶는다.
+
+        **사전 검사의 경계를 프로듀서와 같게 맞춘다.** 앞 판은 ``len(payload)`` 로 value
+        바이트만 셌는데 aiokafka 는 ``estimate_size_in_bytes(key, value, headers)`` 로 재고
+        그 값이 레코드 오버헤드(~88B)와 key 길이를 더한다. 그 차이만큼의 창에서는 사전 검사가
+        통과하고 브로커 직전에 ``MessageSizeTooLargeError`` 가 나 **분류가 뒤집혔다.**
         """
         assert self._producer is not None
         settings = self._settings
-        if len(payload) > settings.kafka_max_request_size:
+        estimated = DefaultRecordBatchBuilder.estimate_size_in_bytes(key, payload, [])
+        if estimated > settings.kafka_max_request_size:
             raise SummaryBlocked(
                 f"요약 결과가 발행 상한을 넘는다. bytes={len(payload)} "
-                f"max_request_size={settings.kafka_max_request_size}. "
-                "summary_content_chars·summary_scopes_per_message·summary_max_new_reviews 를 "
-                "올렸으면 상한도 같이 올려야 한다"
+                f"recordBytes={estimated} max_request_size={settings.kafka_max_request_size}. "
+                "결과 크기를 키우는 설정은 summary_scopes_per_message 와 summary_max_new_reviews "
+                "둘이다 -- 그 둘을 내려야 풀린다"
             )
 
         attempts = max(1, settings.kafka_publish_attempts)
@@ -269,6 +293,12 @@ class SummaryRunner:
             try:
                 await self._producer.send_and_wait(settings.kafka_summary_result_topic, payload, key=key)
                 return
+            except self._NOT_RETRYABLE as error:
+                raise SummaryBlocked(
+                    f"재배달로 풀리지 않는 발행 실패다: {type(error).__name__}: {error}. "
+                    "이 파티션만 막는다 -- 재시도하면 같은 실패가 반복되고 루프가 죽으면 "
+                    "같은 프로세스의 검수까지 교체로 멈춘다"
+                ) from error
             except KafkaError as error:
                 if attempt >= attempts:
                     raise SummaryPublishFailed(
@@ -302,6 +332,26 @@ class SummaryRunner:
             )
 
         request = ReviewSummaryRequest.model_validate(body)
+
+        # **크기 초과를 모델을 부르기 전에 판정한다.** 앞 판은 유료 호출을 다 태운 뒤 발행
+        # 직전에 봤고, 그래서 ``SummaryBlocked`` 가 커밋 없이 떨어지면 태스크 교체마다 그
+        # 상품의 추출+서술 비용이 처음부터 다시 나갔다(파티션 blocked 는 프로세스 로컬이다).
+        # 모듈 머리글이 "유료 호출이 들어간 경로에서 커밋을 빼면 지출이 무한 루프가 된다"를
+        # 원칙으로 적어 뒀고 크기 하나가 그 원칙을 어기고 있었다. 이제 요청의 모양만으로
+        # 상한을 조립해 넘을 수 있으면 0원에 가른다.
+        worst = worst_case_result_bytes_for(
+            self._settings,
+            scopes=len(request.requestedScopes),
+            new_reviews=len(request.newReviews),
+        )
+        if worst > self._settings.kafka_max_request_size:
+            raise SummaryBlocked(
+                f"이 요청의 결과는 최악에서 발행 상한을 넘는다. worstCaseBytes={worst} "
+                f"max_request_size={self._settings.kafka_max_request_size} "
+                f"scopes={len(request.requestedScopes)} newReviews={len(request.newReviews)}. "
+                "모델을 부르지 않았다 -- 불렀다면 그 비용이 교체마다 다시 나간다"
+            )
+
         log.info(
             "요약 시작. traceId=%s requestId=%s productId=%s newReviews=%d scopes=%d",
             envelope.traceId,

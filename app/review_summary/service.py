@@ -35,6 +35,7 @@ from app.review_summary.extract_tool import EXTRACT_TOOL
 from app.review_summary.narrate_prompt import (
     NARRATE_PROMPT,
     NARRATE_VERSION,
+    render_evidence_text,
     render_tally_block,
     render_tally_row,
 )
@@ -827,7 +828,15 @@ def _gate_quotes(
     dropped: list[DroppedItem],
     where: str,
 ) -> list[QuoteSample]:
-    verified = {(sample.reviewId, sample.text) for sample in row.quoteSamples}
+    # **모델이 본 꼴로 대조하고 원문으로 돌려준다.**
+    #
+    # 집계표에 실린 인용은 ``render_evidence_text`` 를 지난 꼴이다(줄 양식을 흉내 내는 표식과
+    # 줄바꿈을 지운다). 대조를 원문으로 하면 성실히 베낀 인용이 전건 탈락하고, 반대로 돌려주는
+    # 값을 중성화된 꼴로 두면 화면에 ``[표식]`` 이 나간다. 그래서 키는 렌더된 꼴이고 값은
+    # 원문이다 -- 한쪽만 고치면 깨지는 관계라 테스트가 둘을 함께 묶는다.
+    verified = {
+        (sample.reviewId, render_evidence_text(sample.text)): sample.text for sample in row.quoteSamples
+    }
     out: list[QuoteSample] = []
     items = raw if isinstance(raw, list) else []
     for item in items:
@@ -840,7 +849,8 @@ def _gate_quotes(
         if not isinstance(review_id, int) or not isinstance(text, str) or not text:
             counts.evidenceUnverified += 1
             continue
-        if (review_id, text) not in verified:
+        original = verified.get((review_id, render_evidence_text(text)))
+        if original is None:
             counts.evidenceUnverified += 1
             dropped.append(
                 DroppedItem(
@@ -850,6 +860,7 @@ def _gate_quotes(
                 )
             )
             continue
+        text = original
         if env.mask_heavy(text):
             counts.maskHeavyQuote += 1
             continue

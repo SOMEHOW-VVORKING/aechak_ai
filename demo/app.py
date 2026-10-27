@@ -277,17 +277,38 @@ async def summarize(body: SummaryBody) -> JSONResponse:
     reviews = _parse_reviews(body.reviews)
     if not reviews:
         return _error('리뷰를 한 줄에 한 건씩 "별점|본문" 모양으로 넣어라. 예: 5|잘 먹어요')
+
+    # **분모를 사람 입력에서 그대로 믿지 않는다.** 이 자리가 레포 1순위 불변식을 깼다.
+    #
+    # 앞 판은 ``totalVisibleReviews`` 와 ``basisReviewCount`` 양쪽에 사람이 자유 입력하는
+    # 수(기본 20)를 박고 ``unextractedReviewCount=0`` 을 하드코딩했다. 실제 투입 리뷰는
+    # textarea 줄 수(기본 5)다. 그래서 **콘솔 출고 기본 상태에서** 분석 20건 / 못 읽은
+    # 리뷰 0건이 나왔고, ``summary_min_reviews`` 임계도 그 조작된 분모가 통과시켜 서술
+    # 호출까지 났다. 긍정 리뷰 3건이면 ``NO_NEGATIVE_MENTIONS_FOUND`` -- 17건을 한 글자도
+    # 읽지 않고 "단점 언급을 찾지 못했다"로 내보내는 것이고, 서비스에서 없앤 바로 그 결함이
+    # 입력 계층에서 되살아난 모양이다.
+    #
+    # 분모를 입력으로 남겨 두는 것 자체는 쓸모가 있다 -- "전체 리뷰 1,000건 가운데 신규
+    # 12건만 추출됐다"는 상황을 사람이 재현해 볼 수 있어야 한다. 그래서 받되 **못 읽은
+    # 리뷰 수를 그 차이로 채우고**, 분모가 투입 리뷰보다 작으면 거부한다(음수가 된다).
+    basis = max(body.basisReviewCount, 0)
+    if basis < len(reviews):
+        return _error(
+            f"분모({basis})가 투입 리뷰({len(reviews)}건)보다 작다. "
+            "분모는 '이 상품의 전체 리뷰 수'이고 투입 리뷰는 그 가운데 지금 추출할 신규 건이다"
+        )
     request = ReviewSummaryRequest(
         requestId=f"demo-{body.mode}",
         productId=42,
         categoryPath=body.categoryPath,
-        totalVisibleReviews=body.basisReviewCount,
+        totalVisibleReviews=basis,
         newReviews=reviews,
         requestedScopes=[
             RequestedScope(
                 scope=SummaryScope.PRODUCT,
-                basisReviewCount=body.basisReviewCount,
-                unextractedReviewCount=0,
+                basisReviewCount=basis,
+                # 분모에서 지금 투입한 것을 뺀 나머지는 **한 글자도 읽지 않았다.**
+                unextractedReviewCount=basis - len(reviews),
                 tally=[],
             )
         ],

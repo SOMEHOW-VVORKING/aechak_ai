@@ -403,3 +403,67 @@ def test_모의_모드가_본문_없이는_거부한다(client: TestClient) -> N
     response = client.post("/api/summary", json={"mode": "mock", "reviews": []})
 
     assert response.status_code == 400, response.json()
+
+
+# --- 모의·라이브 모드가 분모를 지어내지 않는다 ---------------------------------------------
+#
+# **이 레포 1순위 불변식("통과와 미검사를 섞지 않는다")을 입력 계층에서 깨던 자리다.**
+# 서비스는 멀쩡했다 -- 정직한 숫자를 주면 ``PARTIALLY_UNEXTRACTED`` 와 "모델이 이 리뷰를
+# 돌려주지 않았다"가 나온다. 거짓말은 데모의 요청 조립 한 자리였다: 사람이 자유 입력하는
+# ``basisReviewCount``(기본 20)를 ``totalVisibleReviews``·``basisReviewCount`` 양쪽에 박고
+# ``unextractedReviewCount=0`` 을 하드코딩했다. 실제 투입 리뷰는 textarea 줄 수(기본 5)다.
+
+
+def test_모의_모드가_투입_리뷰보다_큰_분석_수를_보고하지_않는다(client: TestClient) -> None:
+    """콘솔 **출고 기본 상태**(리뷰 5건 + 분모 20)에서 바로 재현되던 거짓이다.
+
+    ``analyzed == basis`` 라서 화면의 '전수' pill 도, ``unextracted == 0`` 이라 '분석 안 됨'
+    pill 도 뜨지 않았다. 즉 화면이 "분석 20건"만 그렸다.
+    """
+    reviews = ["5|잘 먹어요", "5|배송 빨라요", "4|포장 좋아요", "5|냄새 안 나요", "5|재구매 할게요"]
+    response = client.post("/api/summary", json={"mode": "mock", "reviews": reviews, "basisReviewCount": 20})
+
+    assert response.status_code == 200, response.text
+    scope = response.json()["view"]["scopes"][0]
+    assert scope["analyzed_review_count"] <= len(reviews)
+    assert scope["basis_review_count"] + 0 >= scope["analyzed_review_count"]
+    assert scope["unextracted_review_count"] == scope["basis_review_count"] - len(reviews)
+
+
+def test_모의_모드가_투입_리뷰가_임계_아래면_그렇게_적는다(client: TestClient) -> None:
+    """``summary_min_reviews`` 임계를 조작된 분모가 통과시켰고 서술 호출까지 났다."""
+    response = client.post(
+        "/api/summary", json={"mode": "mock", "reviews": ["5|좋아요", "5|또 살게요", "4|괜찮아요"]}
+    )
+
+    assert response.status_code == 200, response.text
+    view_model = response.json()["view"]
+    scope = view_model["scopes"][0]
+    assert scope["not_enough_reason"] == "분석한 리뷰 3건이 최소 10건에 못 미친다"
+    assert scope["cons_absence_reason"] == "NOT_ENOUGH_REVIEWS"
+    # 서술은 유료 단계다. 임계 아래에서 그 호출이 나면 조작된 분모가 그것을 통과시킨 것이다.
+    narrate = [stage for stage in view_model["stages"] if stage["stage"] == "NARRATE"]
+    assert [stage["status"] for stage in narrate] == ["SKIPPED"]
+    assert all(not stage["paid"] for stage in narrate)
+
+
+def test_모의_모드가_투입_리뷰보다_작은_분모를_거부한다(client: TestClient) -> None:
+    """분모가 투입 리뷰보다 작으면 ``unextracted`` 가 음수가 된다. 조립하지 않고 거부한다."""
+    response = client.post(
+        "/api/summary",
+        json={"mode": "mock", "reviews": ["5|좋아요", "5|또 살게요"], "basisReviewCount": 1},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "분모" in response.json()["error"]
+
+
+def test_집계표가_분석_수를_투입_리뷰로_적는다(client: TestClient) -> None:
+    """모델이 보는 문장이 "분석한 리뷰: 20건 / 아직 분석되지 않은 리뷰: 0건" 이었다."""
+    reviews = [f"5|잘 먹어요 기호성이 좋아요 {i}번" for i in range(1, 13)]
+    response = client.post("/api/summary", json={"mode": "mock", "reviews": reviews, "basisReviewCount": 30})
+
+    assert response.status_code == 200, response.text
+    tally = response.json()["view"]["tally_text"]["PRODUCT"]
+    assert "분석한 리뷰: 12건" in tally
+    assert "아직 분석되지 않은 리뷰: 18건" in tally

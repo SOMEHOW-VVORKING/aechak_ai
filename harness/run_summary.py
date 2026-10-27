@@ -519,134 +519,20 @@ def _report_thresholds() -> list[tuple[str, str]]:
 def worst_case_result_bytes(settings: Settings) -> int:
     """계약 상한을 꽉 채운 **결과 엔벨로프**의 바이트 수. 키 없이 계산된다.
 
-    왜 이 숫자가 필요한가. 결과를 발행하는 쪽에 ``max_request_size`` 가 있고, 넘기면
-    ``send_and_wait`` 가 실패한다. 그 실패는 재배달로 풀리지 않는데(크기는 그대로다)
-    앞 판에서는 발행 실패가 계약 실패와 같은 분기로 떨어져 **그 파티션을 영구히 막았고**
-    헬스체크가 그것을 보지 못했다. 토픽이 1파티션이라 그것이 전 상품의 요약 정지다.
+    **조립은 ``app.review_summary.budget`` 이 한다.** 여기 있던 것을 그쪽으로 옮겼다 --
+    컨슈머가 모델을 부르기 **전에** 같은 상한을 봐야 하는데(앞 판은 유료 호출을 다 태운 뒤
+    발행 직전에 봤다), 사본을 두면 리포트의 숫자와 런타임의 판정 경계가 갈라진다.
 
     결과 쪽 상한을 넘기는 레버는 **둘**이다. 인용·라벨·한 줄 요약은 코드가 길이를 자르므로
     ``summary_content_chars`` 는 결과 크기를 키우지 않는다 -- 그 설정은 **요청** 쪽 레버이고
-    그것은 ``worst_case_request_bytes()`` 가 따로 센다. 둘을 한 숫자로 뭉개면 어느 설정이
-    어느 상한을 넘기는지 알 수 없다.
+    그것은 ``worst_case_request_bytes()`` 가 따로 센다.
 
         summary_scopes_per_message   2 -> 5      : 스코프마다 집계 전수가 붙는다
         summary_max_new_reviews      40 -> 100   : 리뷰별 추출 행이 그만큼 늘어난다
-
-    그래서 **구조적 상한에서** 조립한다. 리뷰 한 건의 항목은 ``(코드, 극성)`` 으로 중복이
-    접히므로 열거 18종 x 2 가 상한이고, 인용 80자(``QUOTE_MAX_CHARS``)·라벨 40자
-    (``LABEL_MAX_CHARS``)·한 줄 요약 60자(``HEADLINE_MAX_CHARS``)·표본 3개
-    (``LABEL_SAMPLES_MAX``/``QUOTE_SAMPLES_MAX``)가 코드의 상한이다. 한글은 UTF-8 에서
-    글자당 3바이트라 그 전제로 채운다 -- **추정이 아니라 조립해서 센 값이다.**
     """
-    from app.review_summary.evidence import HEADLINE_MAX_CHARS, LABEL_MAX_CHARS
-    from app.review_summary.extract_prompt import EXTRACT_VERSION
-    from app.review_summary.narrate_prompt import NARRATE_VERSION
-    from app.review_summary.tally import LABEL_SAMPLES_MAX, NARRATE_ROWS_MAX, QUOTE_SAMPLES_MAX
-    from app.schemas.envelope import Envelope
-    from app.schemas.summary import (
-        SUMMARY_AGGREGATE_TYPE,
-        SUMMARY_RESULT_EVENT_TYPE,
-        AspectCode,
-        AspectTallyRow,
-        ExtractedAspect,
-        ExtractedReview,
-        PetContext,
-        QuoteSample,
-        ReviewSummaryMessage,
-        ScopeSummary,
-        SummaryAspect,
-        SummaryScope,
-    )
+    from app.review_summary.budget import worst_case_result_bytes as assembled
 
-    quote = "가" * env.QUOTE_MAX_CHARS
-    label = "가" * LABEL_MAX_CHARS
-    headline = "가" * HEADLINE_MAX_CHARS
-    pairs = [(code, polarity) for code in AspectCode for polarity in Polarity]
-
-    def samples(review_id: int) -> list[QuoteSample]:
-        return [QuoteSample(reviewId=review_id, text=quote) for _ in range(QUOTE_SAMPLES_MAX)]
-
-    def tally_row(code: AspectCode, polarity: Polarity) -> AspectTallyRow:
-        return AspectTallyRow(
-            aspectCode=code,
-            polarity=polarity,
-            mentionCount=settings.summary_max_new_reviews,
-            labelSamples=[label] * LABEL_SAMPLES_MAX,
-            quoteSamples=samples(1),
-        )
-
-    extracted = [
-        ExtractedReview(
-            extracted=ExtractStatus.EXTRACTED,
-            reviewId=review_id,
-            aspects=[
-                ExtractedAspect(
-                    aspectCode=code,
-                    aspectLabel=label,
-                    polarity=polarity,
-                    quote=quote,
-                    quoteStart=0,
-                    quoteEnd=env.QUOTE_MAX_CHARS,
-                )
-                for code, polarity in pairs
-            ],
-            petContext=PetContext(species="DOG", breedLabel=label, weightKg=15.0, ageYears=3, quote=quote),
-            truncated=True,
-            note="가" * 80,
-        )
-        for review_id in range(1, settings.summary_max_new_reviews + 1)
-    ]
-    summaries = [
-        ScopeSummary(
-            scope=SummaryScope.SEGMENT,
-            segmentKey="DOG_10_25",
-            basisReviewCount=10_000,
-            unextractedReviewCount=10,
-            analyzedReviewCount=settings.summary_max_new_reviews,
-            pros=[
-                SummaryAspect(
-                    aspectCode=code,
-                    headline=headline,
-                    mentionCount=10,
-                    mentionShare=0.5,
-                    quotes=samples(1),
-                )
-                for code, _ in pairs[:3]
-            ],
-            cons=[
-                SummaryAspect(
-                    aspectCode=code,
-                    headline=headline,
-                    mentionCount=10,
-                    mentionShare=0.5,
-                    quotes=samples(1),
-                )
-                for code, _ in pairs[3:6]
-            ],
-            minorMentions=[tally_row(code, polarity) for code, polarity in pairs],
-            unnarratedAspects=[tally_row(code, polarity) for code, polarity in pairs[:NARRATE_ROWS_MAX]],
-            tallyFingerprint="0" * 12,
-        )
-        for _ in range(settings.summary_scopes_per_message)
-    ]
-    message = ReviewSummaryMessage(
-        requestId="r" * 64,
-        productId=10_000_000,
-        extractVersion=EXTRACT_VERSION,
-        narrateVersion=NARRATE_VERSION,
-        extracted=extracted,
-        summaries=summaries,
-        generatedAt=datetime.now(UTC),
-    )
-    out = Envelope.wrap(
-        event_id=message.event_id(),
-        event_type=SUMMARY_RESULT_EVENT_TYPE,
-        aggregate_type=SUMMARY_AGGREGATE_TYPE,
-        ordering_key=str(message.productId),
-        payload_obj=message,
-        trace_id="t" * 36,
-    )
-    return len(out.to_json().encode())
+    return assembled(settings)
 
 
 def worst_case_request_bytes(settings: Settings) -> int:
@@ -660,6 +546,7 @@ def worst_case_request_bytes(settings: Settings) -> int:
     from app.review_summary.tally import LABEL_SAMPLES_MAX, QUOTE_SAMPLES_MAX
     from app.schemas.envelope import Envelope
     from app.schemas.summary import (
+        _MAX_NEW_REVIEWS,
         SUMMARY_AGGREGATE_TYPE,
         SUMMARY_REQUEST_EVENT_TYPE,
         AspectCode,
@@ -674,6 +561,11 @@ def worst_case_request_bytes(settings: Settings) -> int:
     quote = "가" * env.QUOTE_MAX_CHARS
     label = "가" * LABEL_MAX_CHARS
     pairs = [(code, polarity) for code in AspectCode for polarity in Polarity]
+    # **계약 상한으로 자른다.** 설정 레버를 올려 보는 호출에서 이 함수가 숫자 대신
+    # ``ValidationError`` 를 냈다 -- 계약의 ``_MAX_NEW_REVIEWS`` 가 40 으로 하드코딩이고
+    # ``newReviews`` 에 ``max_length`` 로 박혀 있다. 어긋남 자체는 기동에서 거부하므로
+    # (``Settings._new_review_limit_matches_contract``) 여기서는 자르고 리포트가 적는다.
+    new_reviews = min(settings.summary_max_new_reviews, _MAX_NEW_REVIEWS)
     request = ReviewSummaryRequest(
         requestId="r" * 64,
         productId=10_000_000,
@@ -687,7 +579,7 @@ def worst_case_request_bytes(settings: Settings) -> int:
                 optionName="가" * 40,
                 hasPhoto=True,
             )
-            for review_id in range(1, settings.summary_max_new_reviews + 1)
+            for review_id in range(1, new_reviews + 1)
         ],
         requestedScopes=[
             RequestedScope(
@@ -727,6 +619,8 @@ def _report_publish_budget(settings: Settings) -> list[tuple[str, str]]:
     발행해 우리가 가져온다(``max_partition_fetch_bytes``). 한 숫자로 뭉개면 어느 설정이
     어느 상한을 넘기는지 알 수 없다.
     """
+    from app.schemas.summary import _MAX_NEW_REVIEWS
+
     result = worst_case_result_bytes(settings)
     request = worst_case_request_bytes(settings)
     send_limit = settings.kafka_max_request_size
@@ -765,6 +659,17 @@ def _report_publish_budget(settings: Settings) -> list[tuple[str, str]]:
         (
             "상한을 넘기는 레버",
             " / ".join(levers) + " — 넘기면 메시지가 흐르지 않고, 그 실패는 재배달로 풀리지 않는다",
+        ),
+        (
+            "계약 상한과의 어긋남",
+            (
+                f"summary_max_new_reviews={settings.summary_max_new_reviews} 가 계약의 "
+                f"max_length={_MAX_NEW_REVIEWS} 와 **다르다.** 위 요청 쪽 숫자는 계약 상한 "
+                f"{_MAX_NEW_REVIEWS} 로 자른 값이고, 이 조합은 기동에서 거부된다 — "
+                "계약(app/schemas/summary.py)을 백엔드와 함께 올려야 한다"
+            )
+            if settings.summary_max_new_reviews != _MAX_NEW_REVIEWS
+            else f"없다. 설정과 계약이 둘 다 {_MAX_NEW_REVIEWS} 다(기동에서 같음을 단언한다)",
         ),
     ]
 
