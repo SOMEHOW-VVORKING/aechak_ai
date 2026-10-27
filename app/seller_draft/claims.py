@@ -43,6 +43,7 @@ import 하지 않음을 단언하고 Dockerfile 이 ``demo`` 를 COPY 하지 않
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from app.inspection.banned import fold
@@ -83,6 +84,12 @@ UNCOVERED_POLICY_EXAMPLES: tuple[str, ...] = ("국내산(실제 수입품)",)
 # 집합을 먼저 만들어라.
 #
 # 네거티브 리스트의 성질상 이 숫자는 낮게 나온다. 낮은 것이 사실이고, 숨기는 것보다 낫다.
+#
+# **그 숫자가 0/8 이었고, 그래서 사전을 고쳤다. 고친 순간 이 목록은 순환이 되었다.**
+# 아래 ``HOLDOUT_IS_CIRCULAR`` 가 그 사실을 상수로 들고 있고 하네스가 그렇게 찍는다.
+# 목록을 지우지 않는 이유는 **무엇을 보고 고쳤는지가 근거**이기 때문이다. 다음 사람이
+# 비순환 숫자를 원하면 이 목록이 아니라 **실제 셀러 문구**에서 새 집합을 받아야 한다 --
+# 내가 새로 지어낸 문장으로 만든 집합은 규칙을 쓴 사람이 같아서 증거가 약하다.
 HOLDOUT_CLAIM_EXAMPLES: tuple[str, ...] = (
     "염증을 가라앉혀 줍니다",
     "피부병이 사라집니다",
@@ -93,6 +100,13 @@ HOLDOUT_CLAIM_EXAMPLES: tuple[str, ...] = (
     "장 건강을 되찾아 줍니다",
     "알러지를 잡아 줍니다",
 )
+
+# **위 목록을 보고 사전을 고쳤는가.** 참이면 그 목록으로 잰 재현율은 커버리지가 아니다.
+#
+# 리터럴 한 줄씩 더해 메우지는 않았다 -- 축이 다른 규칙 넷을 더했고(질병명·완치 동사·
+# 기간 단정·후기 인용) 그 규칙들이 목록의 문장을 지나간다. 그래도 목록을 **보면서** 썼으므로
+# 순환이다. 숨기는 것보다 적어 두는 쪽이 낫다.
+HOLDOUT_IS_CIRCULAR = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,7 +218,63 @@ _CERTIFICATION: tuple[ClaimTerm, ...] = (
     ClaimTerm("허가", aliases=("정부허가", "식약처허가"), note="확인되지 않은 허가를 주장한다"),
 )
 
-CLAIM_TERMS: tuple[ClaimTerm, ...] = (*_MEDICAL, *_EFFICACY, *_CERTIFICATION)
+# 질병·증상 명사. **축이 다른 층이고, 그것이 이 층을 더한 이유다.**
+#
+# 위 세 묶음은 전부 **동작 어휘**("치료"·"완치"·"보장")라서 그 동작을 쓰지 않고 질병을
+# 가리키는 문장을 하나도 잡지 못했다. 보류 집합 8건 전건 미탐이 그 증거였고, 주입 테스트로
+# 확인했다 -- "염증을 가라앉혀 줍니다" 가 가드를 통과해 description 에 그대로 실려 나갔다.
+#
+# 리터럴 한 줄씩 더해 메우지 않는다. **초안의 사실 슬롯 넷(품목·소재·사용법·보관)에는
+# 질병 자리가 없다** -- 그것이 이 층의 독립 근거다. 질병명이 보이면 그 슬롯은 사실이 아니라
+# 효능 주장을 쓰고 있다는 뜻이므로 비운다. 과탐 쪽으로 기울이는 이 계층의 방향과 맞는다
+# (과탐은 셀러가 직접 쓰게 하고, 과소탐은 셀러 상품이 차단되게 한다).
+#
+# **증상 어휘를 넣지 않는다.** "구토"·"설사"·"묽은 변" 은 보관·급여 안내에 정당하게 나온다
+# ("급여량을 급히 늘리면 묽은 변을 볼 수 있습니다"). 넣으면 그 리프의 사용법 슬롯이 늘 빈다.
+_DISEASE: tuple[ClaimTerm, ...] = (
+    ClaimTerm("관절염", note="질병명을 쓴다"),
+    ClaimTerm("슬개골", aliases=("슬개골탈구",), note="질병명을 쓴다"),
+    ClaimTerm("아토피", note="질병명을 쓴다"),
+    ClaimTerm("피부병", aliases=("피부염",), note="질병명을 쓴다"),
+    ClaimTerm("염증", aliases=("중이염", "결막염", "방광염", "치주염"), note="질병명을 쓴다"),
+    ClaimTerm(
+        "알러지",
+        aliases=("알레르기",),
+        # "저알러지"·"하이포알러지" 는 **원료 구성**을 가리키는 표기이고 치료 주장이 아니다.
+        # 실측으로 걸렸다 -- 평가 케이스의 "소형견 저알러지 처방식사료" 가 0단에서 막혀
+        # 정확도 분모에서 빠졌다. 과탐 방향이라도 분모를 깎으면 측정이 거짓이 된다.
+        deny_prefix=("저", "하이포", "논", "non"),
+        note="질병명을 쓴다",
+    ),
+    ClaimTerm("질병", aliases=("질환",), note="질병을 거론한다"),
+    ClaimTerm("통증", note="증상을 치료 대상으로 거론한다"),
+    ClaimTerm("종양", aliases=("암세포",), note="질병명을 쓴다"),
+    ClaimTerm("당뇨", note="질병명을 쓴다"),
+    ClaimTerm("심장병", aliases=("신장병", "간질환"), note="질병명을 쓴다"),
+    ClaimTerm("요로결석", aliases=("결석",), note="질병명을 쓴다"),
+    ClaimTerm("면역력", note="면역을 올린다고 주장한다"),
+)
+
+# 낫게 만든다는 **결과 동사**. 질병명이 없어도 효능을 단정한다.
+#
+# "장 건강을 되찾아 줍니다" 가 이 층이 필요한 이유다 -- "장 건강" 자체는 막을 수 없다
+# (정책이 "관절 건강에 도움을 줄 수 있는 글루코사민" 을 통과 예시로 든다). 막아야 하는 것은
+# **건강을 되돌려 준다는 약속**이고 그것은 동사 쪽에 있다.
+_CURATIVE: tuple[ClaimTerm, ...] = (
+    ClaimTerm("되찾", aliases=("회복시켜", "회복됩니다"), note="건강을 되돌려 준다고 단정한다"),
+    ClaimTerm("사라집", aliases=("없어집", "싹없어"), note="증상이 없어진다고 단정한다"),
+    ClaimTerm("가라앉혀", aliases=("가라앉힙", "진정시켜줍"), note="증상을 가라앉힌다고 단정한다"),
+    ClaimTerm("완화", deny_suffix=("되지않",), note="증상을 완화한다고 단정한다"),
+    ClaimTerm("재생", deny_suffix=("지",), note="조직이 재생된다고 단정한다"),
+)
+
+CLAIM_TERMS: tuple[ClaimTerm, ...] = (
+    *_MEDICAL,
+    *_EFFICACY,
+    *_CERTIFICATION,
+    *_DISEASE,
+    *_CURATIVE,
+)
 
 # 표현 앞뒤에 이 말이 붙으면 단정이 아니다. ``banned.py`` 와 같은 수법이고, 키워드를
 # 정규식에 날것으로 박지 않고 ``fold`` 를 거쳐 만든다 -- 정규화가 공백을 지우기 때문이다.
@@ -262,11 +332,40 @@ def _matches(folded: str, form: str, prefixes: tuple[str, ...], suffixes: tuple[
     return False
 
 
+def _loose(text: str) -> str:
+    """패턴 층 전용 정규화. **``fold()`` 를 쓸 수 없는 자리다.**
+
+    ``fold()`` 는 금지 성분 우회 표기를 잡으려고 숫자를 글자로 되돌린다
+    (``_HOMOGLYPHS``: "0"->"o", "1"->"l"). 그래서 "10일" 이 "lo일" 이 되고 기간 패턴이
+    숫자를 영구히 못 본다. 숫자가 **의미를 가르는 글자**인 층에서는 그 함수를 쓰면 안 된다
+    -- ``envelope.dedupe_key`` 와 ``service._cache_key`` 가 같은 이유로 거부한 선례가 있다.
+    """
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text or "").lower())
+
+
+# 기간 + 변화. **둘이 함께 있어야 적중이다.**
+#
+# 기간만으로는 못 막는다 -- "7일 이내 교환", "30일 보관 후 폐기" 는 정상 문구다. 변화
+# 어휘만으로도 못 막는다 -- "사이즈 차이가 있습니다" 가 걸린다. "3일이면 달라집니다" 가
+# 위반인 것은 **기간을 약속하기 때문**이고, 그 구조를 그대로 센다.
+_DURATION = re.compile(r"\d+(?:일|주일|주|개월|달)(?:이?면|만에|후|뒤)")
+_CHANGE = re.compile(r"(?:달라지|달라집|효과|변화|좋아지|좋아집|줄어들|줄어듭|개선|차이를느)")
+# 후기를 근거로 든다. **초안은 리뷰를 받지 않는다** -- 툴 스키마에 그 입력이 아예 없으므로
+# 초안이 쓴 "후기가 많습니다" 는 출처가 없는 문장이다.
+_REVIEW_PROOF = re.compile(r"(?:후기|리뷰|사용자)(?:가|들이)?(?:아주|정말|너무)?(?:많|쏟아|폭발)")
+
+_DURATION_TERM = ClaimTerm("기간 단정", note="며칠이면 달라진다고 기간을 약속한다")
+_REVIEW_PROOF_TERM = ClaimTerm("후기 인용", note="초안이 받지도 않은 후기를 근거로 든다")
+
+
 def screen(text: str) -> list[ClaimHit]:
     """효능 단정 표현을 찾는다. **표현 하나당 한 번만 보고한다. 0원.**
 
     같은 표현이 여러 번 나와도 적중을 늘리지 않는다 -- 셀러에게 전할 말이 "치료가 세 번
     나왔다"가 아니라 "그 필드를 비웠다"이기 때문이다.
+
+    두 계층이다. 어휘 층(``CLAIM_TERMS``)은 ``fold()`` 로 띄어쓰기·기호·전각 우회를
+    무력화하고, 패턴 층은 ``_loose()`` 로 숫자를 살려 기간 단정과 후기 인용을 본다.
     """
     folded = fold(text or "")
     if not folded:
@@ -279,6 +378,14 @@ def screen(text: str) -> list[ClaimHit]:
             if _matches(folded, form, prefixes, suffixes):
                 hits.append(ClaimHit(term, form))
                 break
+
+    loose = _loose(text)
+    duration = _DURATION.search(loose)
+    if duration is not None and _CHANGE.search(loose):
+        hits.append(ClaimHit(_DURATION_TERM, duration.group(0)))
+    proof = _REVIEW_PROOF.search(loose)
+    if proof is not None:
+        hits.append(ClaimHit(_REVIEW_PROOF_TERM, proof.group(0)))
     return hits
 
 
@@ -296,6 +403,7 @@ def forbidden_examples_block() -> str:
 __all__ = [
     "CLAIM_TERMS",
     "HOLDOUT_CLAIM_EXAMPLES",
+    "HOLDOUT_IS_CIRCULAR",
     "POLICY_CLAIM_EXAMPLES",
     "UNCOVERED_POLICY_EXAMPLES",
     "ClaimHit",

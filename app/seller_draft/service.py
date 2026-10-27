@@ -54,7 +54,7 @@ from app.schemas.draft import (
     SkipReason,
 )
 from app.schemas.inspection import CallOutcome
-from app.seller_draft import guard, imagemeta
+from app.seller_draft import claims, guard, imagemeta
 from app.seller_draft.catalog import LEAF_BY_ID, ItemGrade, ItemSignal, leaf_path, resolve
 from app.seller_draft.prompt import CATALOG_VERSION as _CATALOG_VERSION
 from app.seller_draft.prompt import (
@@ -166,6 +166,34 @@ class DraftService:
                 notice=(
                     f"상품명이 플랫폼 정책에 걸립니다({reasons}). 그대로 등록하면 검수에서 "
                     "막히므로 초안을 만들지 않았습니다. 상품명을 고친 뒤 다시 시도해 주세요."
+                ),
+            )
+
+        # **0단이 효능을 하나도 보지 않았다.** 그것이 이 블록을 더한 이유다.
+        #
+        # ``rules.screen`` 은 연락처·이메일·외부URL·계좌·봉투탈출·금지성분까지만 본다
+        # (``claims.py`` 머리글이 실행 결과로 그 사실을 적어 뒀다). 그래서 '관절염 치료
+        # 목줄' 은 ``blocking=False`` 로 지나가 모델이 1회 불리고 완성 초안이 나갔다.
+        # 셀러는 그것을 저장하고 **등록 검수가 상품명으로 막는다** -- 설계가 피하겠다고
+        # 선언한 함정("검수에 걸릴 이름으로 초안을 만들어 주는 것은 셀러를 함정에 빠뜨리는
+        # 것")이 생성 **입구**에 그대로 열려 있었다. 하네스도 "0단이 잡는 것 0건"으로
+        # 이미 찍고 있었다.
+        #
+        # 모델 출력에만 걸려 있던 4겹을 입력에도 건다. 0원이고, 걸리면 비용도 0이다.
+        claim_hits = claims.screen(name)
+        if claim_hits:
+            expressions = ", ".join(dict.fromkeys(f"'{hit.canonical}'" for hit in claim_hits))
+            self._record_gate(signal, image_meta, skip=SkipReason.NAME_CLAIM_BLOCKED, detail=expressions)
+            return self._skipped(
+                request,
+                signal,
+                image_meta,
+                mode,
+                SkipReason.NAME_CLAIM_BLOCKED,
+                notice=(
+                    f"상품명에 효능을 단정하는 표현이 있습니다({expressions}). 그대로 등록하면 "
+                    "검수에서 막히므로 초안을 만들지 않았습니다. 질병·치료·기간 약속 표현을 "
+                    "빼고 품목과 소재를 적어 주시면 초안을 채웁니다."
                 ),
             )
 
@@ -865,6 +893,7 @@ def _field_status_for_skip(reason: SkipReason) -> FieldStatus:
     """0원 분기의 사유를 필드 상태로 옮긴다. **네 갈래를 뭉개지 않는다.**"""
     return {
         SkipReason.NAME_RULE_BLOCKED: FieldStatus.EMPTY_NAME_RULE_BLOCKED,
+        SkipReason.NAME_CLAIM_BLOCKED: FieldStatus.EMPTY_NAME_CLAIM_BLOCKED,
         SkipReason.ITEM_UNIDENTIFIED: FieldStatus.EMPTY_ITEM_UNIDENTIFIED,
         SkipReason.DRAFT_DISABLED: FieldStatus.EMPTY_NOT_ATTEMPTED,
         SkipReason.LLM_UNAVAILABLE: FieldStatus.EMPTY_CALL_FAILED,

@@ -885,3 +885,37 @@ async def test_잠근_옵션의_이름_길이에_계약_상한이_있다() -> No
         LockedFields(optionGroups=[{"name": "가" * (OPTION_NAME_MAX + 1), "values": ["v"]}])  # type: ignore[arg-type]
     with pytest.raises(ValidationError):
         LockedFields(optionGroups=[{"name": "g", "values": ["가" * (OPTION_NAME_MAX + 1)]}])  # type: ignore[arg-type]
+
+
+# --- 0단이 효능 단정 상품명을 보지 않았다 ------------------------------------------------
+
+
+async def test_상품명에_효능_단정이_있으면_모델을_부르지_않는다() -> None:
+    """**설계가 피하겠다고 선언한 바로 그 함정이 입력 쪽에 그대로 남아 있었다.**
+
+    0단은 ``rules.screen(name)`` 만 봤고 ``claims.screen`` 은 **모델 출력에만** 걸렸다.
+    그래서 '관절염 치료 목줄' 은 ``rules.blocking=False`` / ``claims`` 적중=True 인데
+    모델이 1회 불리고 ``description=FILLED`` 로 완성 초안이 나갔다. 셀러는 그 초안을
+    저장하고 **검수가 상품명으로 막는다** -- 초안이 셀러를 함정에 빠뜨린 것이다.
+
+    하네스도 그 사실을 "0단과 효능: 정책 효능 위반 예시 8건 중 0단이 잡는 것 0건" 으로
+    이미 찍고 있었는데, 그 구멍이 생성 입구에 열려 있었다.
+    """
+    for name in ("관절염 치료 목줄", "아토피를 완치시켜요 샴푸", "100% 효과 보장 강아지 사료"):
+        llm = FakeLlmClient([])
+        response = await DraftService(llm=llm, settings=_settings()).run(_request(name))
+
+        assert llm.calls == [], f"{name!r}: 0원 분기인데 모델을 불렀다"
+        assert response.modelCalled is False
+        assert response.skipReason is SkipReason.NAME_CLAIM_BLOCKED
+        assert response.fieldStatus["description"] is FieldStatus.EMPTY_NAME_CLAIM_BLOCKED
+        assert "효능" in (response.sellerNotice or ""), response.sellerNotice
+
+
+async def test_효능이_없는_상품명은_그대로_돈다() -> None:
+    """과탐이 정상 상품명을 막지 않는지 함께 고정한다. 리프 라벨 '처방식사료' 가 그 경계다."""
+    llm = FakeLlmClient([ok(_tool_input(leaf=114), model="claude-haiku-4-5")])
+    response = await DraftService(llm=llm, settings=_settings()).run(_request("강아지 처방식사료 2kg"))
+
+    assert response.modelCalled is True
+    assert response.skipReason is None

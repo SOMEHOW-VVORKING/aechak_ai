@@ -93,6 +93,10 @@ class FieldStatus(StrEnum):
       구분이 필요해졌다.
     - ``EMPTY_NAME_RULE_BLOCKED``: **입력 상품명**이 0단 규칙에 걸려 아무것도 시도하지
       않았다. ``EMPTY_GUARD_RULE``(생성물이 걸려 버렸다)과 방향이 반대다.
+    - ``EMPTY_NAME_CLAIM_BLOCKED``: **입력 상품명**에 효능 단정이 있어 아무것도 시도하지
+      않았다. 위와 같은 방향이고 사유만 다르다 -- 0단 규칙은 연락처·봉투탈출·금지성분까지만
+      보고 효능은 **하나도** 보지 않으므로, 둘을 한 값으로 접으면 셀러에게 "상품명의 무엇을
+      고쳐야 하는지"를 말할 수 없다.
     """
 
     FILLED = "FILLED"
@@ -100,6 +104,7 @@ class FieldStatus(StrEnum):
     EMPTY_NOT_ATTEMPTED = "EMPTY_NOT_ATTEMPTED"
     EMPTY_ITEM_UNIDENTIFIED = "EMPTY_ITEM_UNIDENTIFIED"
     EMPTY_NAME_RULE_BLOCKED = "EMPTY_NAME_RULE_BLOCKED"
+    EMPTY_NAME_CLAIM_BLOCKED = "EMPTY_NAME_CLAIM_BLOCKED"
     EMPTY_GUARD_RULE = "EMPTY_GUARD_RULE"
     EMPTY_GUARD_BANNED = "EMPTY_GUARD_BANNED"
     EMPTY_GUARD_CLAIM = "EMPTY_GUARD_CLAIM"
@@ -133,6 +138,10 @@ class SkipReason(StrEnum):
     """모델을 **부르지 않은** 사유. 전부 0원 분기다."""
 
     NAME_RULE_BLOCKED = "NAME_RULE_BLOCKED"
+    # **상품명에 효능 단정이 있는 건.** 0단 규칙(``rules.screen``)은 효능을 하나도 잡지
+    # 않으므로 이 분기가 없으면 '관절염 치료 목줄' 에 완성 초안을 만들어 주고, 셀러가 그것을
+    # 저장하면 등록 검수가 **상품명으로** 막는다 -- 초안이 셀러를 함정에 빠뜨리는 자리다.
+    NAME_CLAIM_BLOCKED = "NAME_CLAIM_BLOCKED"
     ITEM_UNIDENTIFIED = "ITEM_UNIDENTIFIED"
     DRAFT_DISABLED = "DRAFT_DISABLED"
     LLM_UNAVAILABLE = "LLM_UNAVAILABLE"

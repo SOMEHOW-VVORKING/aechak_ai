@@ -242,6 +242,15 @@ DRAFT_SCENARIOS: tuple[DraftScenario, ...] = (
         entries={},
     ),
     DraftScenario(
+        id="draft-name-claim-blocked",
+        title="상품명 효능 단정 — 0원",
+        note="0단 룰은 효능을 **하나도** 잡지 않는다. 그 겹이 없으면 이 이름에 완성 초안을 "
+        "만들어 주고 셀러가 저장하면 등록 검수가 상품명으로 막는다",
+        product_name="관절염 치료 목줄",
+        expected_exit=DraftExit.NAME_CLAIM_BLOCKED.value,
+        entries={},
+    ),
+    DraftScenario(
         id="draft-claim-dropped",
         title="효능 단정 — 그 슬롯만 비운다",
         note="0단 룰이 **하나도 잡지 못하는** 축이다. 전용 효능 사전이 itemSummary 만 떨어뜨리고 "

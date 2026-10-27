@@ -65,6 +65,7 @@ FIELD_STATUS_SENTENCES: dict[str, str] = {
     FieldStatus.EMPTY_NOT_ATTEMPTED.value: "자동완성이 채우지 않는 항목입니다 (가격·재고·이미지)",
     FieldStatus.EMPTY_ITEM_UNIDENTIFIED.value: "어떤 품목인지 확인되지 않아 채우지 않았습니다",
     FieldStatus.EMPTY_NAME_RULE_BLOCKED.value: "상품명이 정책에 걸려 초안을 만들지 않았습니다",
+    FieldStatus.EMPTY_NAME_CLAIM_BLOCKED.value: ("상품명에 효능 단정이 있어 초안을 만들지 않았습니다"),
     FieldStatus.EMPTY_GUARD_RULE.value: "연락처·외부 링크가 섞여 비웠습니다",
     FieldStatus.EMPTY_GUARD_BANNED.value: "반려동물에게 위험한 성분이 적혀 비웠습니다",
     FieldStatus.EMPTY_GUARD_CLAIM.value: "효능을 단정하는 표현이 섞여 비웠습니다",
@@ -101,6 +102,9 @@ class DraftExit(StrEnum):
 
     # 0원으로 끝난 셋. **서로 다른 라벨이어야 한다.**
     NAME_RULE_BLOCKED = "NAME_RULE_BLOCKED"
+    # 상품명의 효능 단정. ``NAME_RULE_BLOCKED`` 와 **라벨이 달라야 한다** -- 셀러가 고쳐야
+    # 하는 것이 연락처가 아니라 효능 표현이고, 0단 규칙은 효능을 하나도 보지 않는다.
+    NAME_CLAIM_BLOCKED = "NAME_CLAIM_BLOCKED"
     ITEM_UNIDENTIFIED = "ITEM_UNIDENTIFIED"
     DRAFT_DISABLED = "DRAFT_DISABLED"
     LLM_DISABLED = "LLM_DISABLED"
@@ -119,6 +123,12 @@ _EXIT_LABELS: dict[str, tuple[str, str]] = {
         "상품명 차단",
         "상품명이 0단 규칙에 걸려 **모델을 0회 불렀다. 0원이다.** 검수에 걸릴 이름으로 초안을 "
         "만들어 주는 것은 셀러를 함정에 빠뜨리는 것이다.",
+    ),
+    DraftExit.NAME_CLAIM_BLOCKED.value: (
+        "상품명 효능 단정",
+        "상품명에 효능 단정이 있어 **모델을 0회 불렀다. 0원이다.** 0단 규칙은 효능을 하나도 "
+        "보지 않으므로 이 겹이 없으면 '관절염 치료 목줄' 에 완성 초안을 만들어 주고, 셀러가 "
+        "그것을 저장하면 등록 검수가 상품명으로 막는다.",
     ),
     DraftExit.ITEM_UNIDENTIFIED.value: (
         "품목 미식별",
@@ -291,6 +301,8 @@ def classify_exit(response: SellerDraftResponse) -> DraftExit:
         return DraftExit.IMAGE_REJECTED
     if response.skipReason is SkipReason.NAME_RULE_BLOCKED:
         return DraftExit.NAME_RULE_BLOCKED
+    if response.skipReason is SkipReason.NAME_CLAIM_BLOCKED:
+        return DraftExit.NAME_CLAIM_BLOCKED
     if response.skipReason is SkipReason.ITEM_UNIDENTIFIED:
         return DraftExit.ITEM_UNIDENTIFIED
     if response.skipReason is SkipReason.DRAFT_DISABLED:
