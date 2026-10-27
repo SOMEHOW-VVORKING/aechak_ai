@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from app.inspection.banned import find_terms
 from app.schemas.inspection import ViolationCategory
@@ -78,17 +79,53 @@ _NEUTRALIZED = "[태그]"
 # 끼운 표기는 적중이 0건이었다. 소비자가 파서가 아니라 모델이라는 점이 그 비대칭을 위험하게
 # 만든다 -- 모델은 폭 0 문자를 사이에 둔 토큰을 닫는 태그로 읽을 수 있고, 그러면 본문이
 # 봉투를 닫는다.
-# ``banned.fold()``가 "자 일 리 톨"을 정규화로 모으는 것과 같은 겹을 봉투 쪽에도 둔다.
 #
-# 대가를 적어 둔다. U+200D(ZWJ)를 지우므로 이모지 결합 문자열이 낱글자로 풀린다. 모델이
-# 보는 문자열과 인용 검증 기준이 같은 함수를 지나므로 검증이 어긋나지는 않고, 화면에
-# 나가는 인용의 이모지 모양만 달라진다. 봉투가 닫히는 쪽이 훨씬 비싼 실패다.
-_INVISIBLE = re.compile(r"[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+# **코드포인트를 손으로 적지 않는다. 그것이 이 자리의 세 번째 결함이었다.** 앞 판은
+# ``[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]`` 를 적어 두었고,
+# 그래서 **적어 둔 것의 바로 옆 글자가 전부 열려 있었다** -- ``U+2060-2064`` 를 넣고
+# ``U+206A-206F`` 를 빠뜨렸고, ``U+202A-202E`` 를 넣고 그 짝인 ``U+2066-2069``(bidi
+# isolate)를 빠뜨렸다. 실측으로 28종이 차단과 중성화를 **둘 다** 통과했고, 한국어 본문에서
+# 가장 쓰기 쉬운 한글 필러(``U+3164``·``U+115F``·``U+1160``·``U+FFA0``)와 이형자
+# 선택자(``U+FE00-FE0F``)가 그 안에 있었다.
+#
+# 그래서 근거를 **유니코드 분류**로 옮긴다. ``Cf``(format) 전부 + 분류가 ``Cf`` 가 아니면서
+# 폭이 0인 글자 집합이고, 후자만 열거한다. 테스트가 유니코드 전 범위를 훑어 이 둘의 합집합이
+# 전건 차단되는 것을 단언하므로 열거를 늘려도 측정이 함께 따라온다.
+#
+# 대가를 적어 둔다. ``U+200D``(ZWJ)와 이형자 선택자를 지우므로 이모지 결합 문자열이
+# 낱글자로 풀린다. 모델이 보는 문자열과 인용 검증 기준이 같은 함수를 지나므로 검증이
+# 어긋나지는 않고, 화면에 나가는 인용의 이모지 모양만 달라진다. 봉투가 닫히는 쪽이 훨씬
+# 비싼 실패다. **한글 자모와 결합 악센트는 지우지 않는다** -- ``Mn`` 전체를 지우면
+# 베트남어·태국어 본문이 망가지므로 분류로 긋지 않고 폭 0 인 것만 열거한다.
+ZERO_WIDTH_MARKS: frozenset[str] = frozenset(
+    "\u034f"  # COMBINING GRAPHEME JOINER
+    "\u115f\u1160"  # 한글 초성·중성 필러
+    "\u17b4\u17b5"  # 크메르 고유 모음 (폭 0)
+    "\u180b\u180c\u180d\u180f"  # 몽골 자유 이형자 선택자
+    "\u3164"  # 한글 필러
+    "\uffa0"  # 반각 한글 필러
+    + "".join(chr(cp) for cp in range(0xFE00, 0xFE10))  # 이형자 선택자 1-16
+    + "".join(chr(cp) for cp in range(0xE0100, 0xE01F0))  # 이형자 선택자 보충
+)
+
+
+@lru_cache(maxsize=8192)
+def _is_invisible(char: str) -> bool:
+    """그 한 글자가 불가시인가. **글자마다 보고 외운다.**
+
+    유니코드 전 범위를 미리 훑어 표를 만들면 import 가 느려지고(``Cf`` 는 ``U+E0001`` 까지
+    흩어져 있다) 범위를 하드코딩하면 파이썬의 유니코드 판이 올라갈 때 조용히 어긋난다.
+    입력에 실제로 나타난 글자만 분류를 묻고 그 답을 외우면 둘 다 피한다.
+    """
+    return unicodedata.category(char) == "Cf" or char in ZERO_WIDTH_MARKS
 
 
 def strip_invisible(text: str) -> str:
-    """폭 0·서식 문자를 지운다. 판정과 중성화가 같은 글자 집합을 보게 만드는 함수다."""
-    return _INVISIBLE.sub("", text)
+    """불가시 문자를 지운다. 판정과 중성화가 같은 글자 집합을 보게 만드는 함수다."""
+    if text.isascii():
+        # ASCII 에는 ``Cf`` 가 없다. 리뷰 본문 대부분이 아니지만 상품명·옵션명에서 흔하다.
+        return text
+    return "".join(char for char in text if not _is_invisible(char))
 
 
 def neutralize_envelope(text: str) -> str:

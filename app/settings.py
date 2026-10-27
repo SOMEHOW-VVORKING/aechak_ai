@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from typing import Annotated, Literal
 
-from pydantic import BeforeValidator, Field
+from pydantic import BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # output_config.effort가 받는 등급. 기본값은 high라서 안 보내면 조용히 올라간다.
@@ -188,6 +188,15 @@ class Settings(BaseSettings):
     # 레버는 둘이고(``summary_scopes_per_message``·``summary_max_new_reviews``) 운영에서
     # 설정 한 줄을 올리면 발행이 터진다 -- 그 실패는 재배달로 풀리지 않는다.
     kafka_max_request_size: int = 1_048_576
+    # 브로커의 ``max.message.bytes``. **이 값을 넘는 발행 상한을 기동에서 거부한다.**
+    #
+    # 앞 판은 ``SummaryBlocked`` 안내문이 사람에게 "상한도 같이 올려야 한다"고 **권했다.**
+    # 권한 대로 5MiB 로 올리면 우리 쪽 사전 검사는 영구히 안 걸리고 브로커가 1MiB 에서
+    # 거부한다. 그 실패는 ``MessageSizeTooLargeError`` 가 아니라 브로커 응답이라 **전건이**
+    # 재시도 경로로 갔고, 요약 쪽 결함 하나가 같은 프로세스의 검수까지 교체로 멈췄다.
+    # 두 수의 관계를 설정에 적어 두고 어긋나면 기동하지 않는다 -- 운영에서 브로커 쪽을
+    # 먼저 올렸으면 이 값을 함께 올려야 한다.
+    kafka_broker_max_message_bytes: int = 1_048_576
     # 수신 본문 상한. 요청을 발행하는 쪽은 백엔드이므로 **요청 크기는 이쪽 상한에 걸린다.**
     # ``summary_content_chars`` 가 그 레버다(리뷰 본문이 메시지에 그대로 실린다).
     kafka_max_partition_fetch_bytes: int = 1_048_576
@@ -244,6 +253,37 @@ class Settings(BaseSettings):
         # 조용히 먹는다 -- 이 함수가 존재하는 이유가 바로 그 종류의 누락이다.
         publish = max(0, self.kafka_publish_attempts - 1) * self.kafka_publish_retry_seconds
         return one_call * (batches + self.summary_scopes_per_message) + publish
+
+    @model_validator(mode="after")
+    def _new_review_limit_matches_contract(self) -> Settings:
+        """계약의 ``newReviews`` 상한과 같아야 한다. **어긋나면 기동하지 않는다.**
+
+        계약은 ``app.settings`` 를 import 하지 않는다(스키마가 설정에 의존하면 백엔드와
+        공유하는 모양이 환경에 흔들린다). 그래서 사본을 두고 테스트가 표류를 막았는데, 그
+        단언이 **기본값에서만** 성립했다 -- 환경 변수로 이 레버를 올리면 CI 는 통과하고
+        운영에서는 요청마다 ``ValidationError`` 가 나 그 파티션이 영구히 막힌다. 토픽이
+        1파티션이면 전 상품 요약 정지이고, 막힌 파티션으로는 설계상 헬스를 내리지 않으므로
+        아무도 깨지 않는다. 사본을 지우는 쪽이 아니라 **어긋남을 기동에서 잡는 쪽**으로 닫는다.
+        """
+        from app.schemas.summary import _MAX_NEW_REVIEWS
+
+        if self.summary_max_new_reviews != _MAX_NEW_REVIEWS:
+            raise ValueError(
+                f"summary_max_new_reviews={self.summary_max_new_reviews} 가 계약 상한 "
+                f"{_MAX_NEW_REVIEWS} 와 다르다. 계약(app/schemas/summary.py)의 max_length 를 "
+                "함께 올려야 하고, 그것은 백엔드와 맞출 변경이다"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _publish_limit_fits_broker(self) -> Settings:
+        if self.kafka_max_request_size > self.kafka_broker_max_message_bytes:
+            raise ValueError(
+                f"kafka_max_request_size={self.kafka_max_request_size} 가 브로커 상한 "
+                f"kafka_broker_max_message_bytes={self.kafka_broker_max_message_bytes} 보다 크다. "
+                "우리 쪽 사전 검사가 통과하고 브로커가 거부하면 그 실패는 재배달로 풀리지 않는다"
+            )
+        return self
 
     def model_ids(self) -> tuple[str, ...]:
         """설정에 적힌 모델 ID 전부. 부팅에서 가격표와 맞춰 보는 데 쓴다.

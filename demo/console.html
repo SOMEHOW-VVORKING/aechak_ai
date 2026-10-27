@@ -272,8 +272,13 @@
 5|배송 빨라요. 아이가 잘 먹습니다.</textarea>
         <label>카테고리</label>
         <input id="summary-category" type="text" value="강아지 > 사료 > 건식사료" />
-        <label>분모 (가시 리뷰 수)</label>
+        <label>분모 (이 상품의 전체 리뷰 수)</label>
         <input id="summary-basis" type="text" value="20" />
+        <p class="note">
+          위 본문에 넣은 리뷰만 <b>읽는다.</b> 분모에서 그만큼을 뺀 나머지는
+          <b>한 글자도 읽지 않은 리뷰</b>로 요청에 실린다 — 화면의 '분석 안 됨' 수가 그것이고,
+          분모를 투입 리뷰보다 작게 적으면 거부한다.
+        </p>
       </div>
     </div>
 
@@ -845,7 +850,7 @@ $("summary-run").onclick = async () => {
           mode: sstate.mode,
           reviews: $("summary-reviews").value.split("\n").map((s) => s.trim()).filter(Boolean),
           categoryPath: $("summary-category").value.split(">").map((s) => s.trim()).filter(Boolean),
-          basisReviewCount: Number($("summary-basis").value) || 20,
+          basisReviewCount: Number($("summary-basis").value) || 0,
         };
   try {
     const response = await fetch("/api/summary", {

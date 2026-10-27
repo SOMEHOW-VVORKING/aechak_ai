@@ -632,3 +632,184 @@ async def test_요약이_켜졌는데_러너가_죽으면_헬스가_내려간다
     body = response.json()
     assert body["reviewSummaryConsuming"] is False
     assert body["status"] == "DOWN"
+
+
+# --- 분류 경계를 프로듀서와 같게 맞춘다 -----------------------------------------------------
+#
+# 사전 검사가 ``len(payload)`` 로 **value 바이트만** 셌다. aiokafka 는
+# ``DefaultRecordBatchBuilder.estimate_size_in_bytes(key, value, headers)`` 로 재고 그 값이
+# 레코드 오버헤드와 key 길이를 더한다. 그래서 그 차이만큼의 창에서는 사전 검사가 통과하고
+# 브로커 직전에 ``MessageSizeTooLargeError`` 가 난다 -- 그것이 ``KafkaError`` 서브클래스라
+# 재시도 집합에 들어가고, 3회 실패 뒤 ``SummaryPublishFailed`` 로 루프가 죽는다.
+# ``/health`` 가 503 이 되어 ECS 가 태스크를 교체하면 **같은 프로세스의 검수 컨슈머가 함께
+# 죽고**, 커밋하지 않은 레코드가 재배달되어 같은 결정적 실패를 다시 낸다 = 무한 교체 루프.
+
+
+def _size_window_settings(settings: Settings, payload_bytes: int) -> Settings:
+    return settings.model_copy(update={"kafka_max_request_size": payload_bytes})
+
+
+async def test_레코드_오버헤드가_사전_검사와_프로듀서를_갈라놓지_않는다(settings: Settings) -> None:
+    """**사전 검사가 통과하면 프로듀서도 통과해야 한다.** 그 사이가 크래시 루프 창이었다."""
+    from aiokafka.record.default_records import DefaultRecordBatchBuilder
+
+    from app.kafka.summary_runner import SummaryBlocked
+
+    key = b"42"
+    payload = b"x" * 4_000
+    broker_size = DefaultRecordBatchBuilder.estimate_size_in_bytes(key, payload, [])
+    assert broker_size > len(payload), "이 테스트의 전제(오버헤드가 있다)가 깨졌다"
+
+    # 상한을 value 바이트와 정확히 같게 두면 앞 판의 사전 검사는 통과했고 프로듀서는 거부했다.
+    runner = _runner(_size_window_settings(settings, len(payload)), FakeProducer())
+    with pytest.raises(SummaryBlocked):
+        await runner._publish(payload, key=key)  # type: ignore[attr-defined]
+
+
+async def test_크기_초과를_발행_실패로_분류하지_않는다(settings: Settings) -> None:
+    """``MessageSizeTooLargeError`` 는 재배달로 풀리지 않는다. 재시도 집합에서 뺀다."""
+    from aiokafka.errors import MessageSizeTooLargeError
+
+    from app.kafka.summary_runner import SummaryBlocked
+
+    class _TooLarge(FakeProducer):
+        async def send_and_wait(self, topic: str, value: bytes, key: bytes | None = None) -> None:
+            self.sent.append((topic, value, key))
+            raise MessageSizeTooLargeError("브로커 상한을 넘는다")
+
+    producer = _TooLarge()
+    # 사전 검사를 통과할 만큼 상한을 넉넉히 두고, 브로커가 거부하는 상황만 만든다.
+    runner = _runner(settings, producer)
+    with pytest.raises(SummaryBlocked):
+        await runner._publish(b"y" * 100, key=b"42")  # type: ignore[attr-defined]
+
+    assert len(producer.sent) == 1, "재시도로 브로커를 세 번 때렸다"
+
+
+async def test_없는_토픽을_발행_실패로_분류하지_않는다(settings: Settings) -> None:
+    """결과 토픽이 없고 auto-create 가 꺼진 클러스터는 **코드·운영을 고쳐야** 풀린다.
+
+    머리글의 전제("브로커가 안 되는 상황이면 검수도 이미 못 돌고 있다")가 결과 토픽 한정
+    실패에서 거짓이다. 그 경우 요약 쪽 결함 하나가 같은 프로세스의 검수를 영구히 멈춘다.
+    """
+    from aiokafka.errors import UnknownTopicOrPartitionError
+
+    from app.kafka.summary_runner import SummaryBlocked
+
+    class _NoTopic(FakeProducer):
+        async def send_and_wait(self, topic: str, value: bytes, key: bytes | None = None) -> None:
+            self.sent.append((topic, value, key))
+            raise UnknownTopicOrPartitionError("결과 토픽이 없다")
+
+    producer = _NoTopic()
+    runner = _runner(settings, producer)
+    with pytest.raises(SummaryBlocked):
+        await runner._publish(b"z" * 100, key=b"42")  # type: ignore[attr-defined]
+
+    assert len(producer.sent) == 1
+
+
+async def test_발행_상한을_브로커_상한_위로_올리면_기동이_거부된다() -> None:
+    """``SummaryBlocked`` 안내문이 사람에게 "상한도 같이 올려라"를 **권했다.**
+
+    5MiB 로 올리면 사전 검사는 영구히 안 걸리고 브로커가 1MiB 에서 거부해 **전건이**
+    크래시 루프 경로로 간다. 그래서 그 조합을 기동 시점에 거부하고 안내문에서도 뺀다.
+    """
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        Settings(kafka_max_request_size=5 * 1_048_576, kafka_broker_max_message_bytes=1_048_576)
+
+
+async def test_크기_초과_안내문이_상한을_올리라고_권하지_않는다(settings: Settings) -> None:
+    from app.kafka.summary_runner import SummaryBlocked
+
+    runner = _runner(_size_window_settings(settings, 10), FakeProducer())
+    with pytest.raises(SummaryBlocked) as caught:
+        await runner._publish(b"x" * 100, key=b"42")  # type: ignore[attr-defined]
+
+    assert "올려야 한다" not in str(caught.value)
+
+
+# --- 유료 호출을 태운 뒤 커밋 없이 떨어지지 않는다 -------------------------------------------
+
+
+async def test_크기_초과가_모델을_부르기_전에_판정된다(settings: Settings) -> None:
+    """**머리글이 금지한 지출 루프다.**
+
+    ``handle()`` 순서가 ``service.run``(추출 배치 + 서술 N회 = 과금) -> ``Envelope.wrap``
+    -> ``_publish`` 이고 크기 검사가 ``_publish`` **안**이었다. 그래서 결과가 발행 상한을
+    넘는 요청은 전체 파이프라인 비용을 다 태운 뒤 ``SummaryBlocked`` 로 **커밋되지 않는다.**
+    파티션 blocked 상태는 프로세스 로컬이라 배포·스케일·리밸런스·헬스 플랩으로 태스크가
+    교체되면 그 레코드가 다시 와서 추출+서술을 처음부터 다시 과금한다.
+    """
+    small = settings.model_copy(update={"kafka_max_request_size": 2_000})
+    topic = small.kafka_summary_request_topic
+    consumer = _RecordingConsumer([_Record(topic, 0, 1, _envelope(_payload()).encode())])
+    runner = _runner(small, FakeProducer())
+    runner._consumer = consumer  # type: ignore[attr-defined]
+    runner._healthy = True  # type: ignore[attr-defined]
+
+    runs: list[int] = []
+    original = runner._service.run
+
+    async def counted(request: Any) -> Any:
+        runs.append(1)
+        return await original(request)
+
+    runner._service.run = counted  # type: ignore[assignment]
+    await runner._loop()  # type: ignore[attr-defined]
+
+    assert runs == [], "크기 초과가 확실한 요청에 유료 호출을 태웠다"
+    assert runner.blocked_partitions == 1
+    assert runner._healthy is True  # type: ignore[attr-defined]
+
+
+async def test_모델을_부르기_전_크기_상한이_최악_결과에서_나온다() -> None:
+    """선판정의 분모가 **요청의 모양**(스코프 수·신규 리뷰 수)에서 조립돼야 한다."""
+    from app.kafka.summary_runner import worst_case_result_bytes_for
+
+    settings = Settings()
+    one = worst_case_result_bytes_for(settings, scopes=1)
+    two = worst_case_result_bytes_for(settings, scopes=2)
+
+    assert one < two, "스코프를 늘렸는데 상한이 늘지 않는다"
+    assert two <= settings.kafka_max_request_size
+
+
+# --- 계약 상한과 설정이 어긋나면 기동에서 거부한다 ------------------------------------------
+
+
+async def test_리뷰_상한을_계약_위로_올리면_기동이_거부된다() -> None:
+    """**이 레버를 올리면 요청마다 ``ValidationError`` 다.**
+
+    계약의 ``_MAX_NEW_REVIEWS`` 가 40 으로 하드코딩이고 ``newReviews`` 에 ``max_length`` 로
+    박혀 있다. 설정만 100 으로 올리면 ``model_validate`` 가 요청마다 터지고, 그 예외는
+    ``_loop`` 의 일반 ``except`` 로 떨어져 **그 파티션을 영구히 막는다.** 토픽이 1파티션이라
+    전 상품 요약 정지이고 ``/health`` 는 설계상 UP 을 유지한다(막힌 파티션으로 상태를
+    내리지 않는다). 같음을 단언하는 테스트가 **기본값에서만** 성립했으므로 CI 는 통과했다.
+    """
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        Settings(summary_max_new_reviews=100)
+
+
+async def test_최악_요청_바이트가_레버를_올려도_터지지_않는다() -> None:
+    """리포트 함수가 숫자 대신 예외를 내던 자리다. 스키마 상한으로 자르고 그 사실을 적는다."""
+    from harness.run_summary import worst_case_request_bytes
+
+    settings = Settings()
+    raised = settings.model_copy(update={"summary_max_new_reviews": 100})
+
+    assert worst_case_request_bytes(raised) == worst_case_request_bytes(settings)
+
+
+async def test_상한_여유_리포트가_계약과의_어긋남을_적는다() -> None:
+    from harness.run_summary import _report_publish_budget
+
+    settings = Settings().model_copy(update={"summary_max_new_reviews": 100})
+    rows = dict(_report_publish_budget(settings))
+
+    assert any("계약 상한" in key or "계약" in value for key, value in rows.items())
+    assert any("40" in value for value in rows.values()), rows
