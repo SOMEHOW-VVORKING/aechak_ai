@@ -228,6 +228,7 @@
     <div class="panel">
       <div class="modes">
         <button id="smode-replay" class="primary" data-smode="replay">재생 (카세트)</button>
+        <button id="smode-mock" data-smode="mock">모의 (내 리뷰)</button>
         <button id="smode-live" data-smode="live">라이브</button>
       </div>
       <p class="note" id="smode-note"></p>
@@ -238,7 +239,7 @@
       <div class="panel" id="summary-scenario-list"></div>
     </div>
 
-    <div id="spanel-live" class="hidden">
+    <div id="spanel-input" class="hidden">
       <h2>리뷰 입력</h2>
       <div class="panel">
         <label>리뷰 (한 줄에 한 건, "별점|본문")</label>
@@ -739,20 +740,26 @@ async function bootSummary() {
   setSummaryMode("replay");
 }
 
+const SUMMARY_MODES = ["replay", "mock", "live"];
+const SUMMARY_MODE_NOTES = {
+  replay: "기록된 호출 응답으로 서비스를 그대로 돌린다. 모델을 부르지 않고 비용이 0이다.",
+  mock:
+    "키워드 표로 답하는 모의 추출·서술기다. 모델이 아니고, 비용과 토큰은 글자 수에서 뽑은 " +
+    "추정값이다. 표에 안 걸린 항목은 \"없다\"가 아니라 \"표에 없다\"는 뜻이다.",
+  live: "실제 모델을 부른다. 돈이 든다. 키가 있을 때만 켜진다.",
+};
+
 function setSummaryMode(mode) {
   sstate.mode = mode;
-  ["replay", "live"].forEach((m) => {
+  SUMMARY_MODES.forEach((m) => {
     $("smode-" + m).classList.toggle("primary", m === mode);
   });
   $("spanel-replay").classList.toggle("hidden", mode !== "replay");
-  $("spanel-live").classList.toggle("hidden", mode !== "live");
-  $("smode-note").textContent =
-    mode === "replay"
-      ? "기록된 호출 응답으로 서비스를 그대로 돌린다. 모델을 부르지 않고 비용이 0이다."
-      : "실제 모델을 부른다. 돈이 든다. 키가 있을 때만 켜진다.";
+  $("spanel-input").classList.toggle("hidden", mode === "replay");
+  $("smode-note").textContent = SUMMARY_MODE_NOTES[mode];
 }
 
-["replay", "live"].forEach((m) => {
+SUMMARY_MODES.forEach((m) => {
   $("smode-" + m).onclick = () => setSummaryMode(m);
 });
 
@@ -762,7 +769,7 @@ $("summary-run").onclick = async () => {
     sstate.mode === "replay"
       ? { mode: "replay", scenario: sstate.scenario }
       : {
-          mode: "live",
+          mode: sstate.mode,
           reviews: $("summary-reviews").value.split("\n").map((s) => s.trim()).filter(Boolean),
           categoryPath: $("summary-category").value.split(">").map((s) => s.trim()).filter(Boolean),
           basisReviewCount: Number($("summary-basis").value) || 20,
