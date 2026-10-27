@@ -49,8 +49,10 @@ def _body(**overrides: Any) -> dict[str, Any]:
 def test_운영_앱의_라우트_집합이_헬스체크_하나로_불변이다() -> None:
     """**초안 라우트를 거기 붙이면 공개 ALB 에 인증 없는 경로가 선다.**
 
-    ``/openapi.json`` 은 ``docs_url=None`` 이어도 FastAPI 가 항상 등록한다 -- 우리가 더한
-    것이 아니므로 분모에서 뺀다. 재는 것은 **우리가 연 경로가 ``/health`` 하나인가**다.
+    ``/openapi.json`` 은 ``docs_url=None`` 이어도 FastAPI 가 등록한다. 운영 앱은 라우트가
+    ``/health`` 하나라 그 스키마에 담길 것이 없어서 분모에서 뺀다 -- **초안 앱은 다르고,
+    거기서는 면제하지 않는다**(``test_초안_앱이_openapi를_열지_않는다``). 면제가 노출을
+    못 잡은 자리였다.
     """
     from app.main import app as operational_app
 
@@ -320,3 +322,29 @@ def test_초안_앱에_헬스체크_경로가_있다() -> None:
     from app.draft_api.app import app as draft_app
 
     assert "/health" in {route.path for route in draft_app.routes}
+
+
+# --- 스키마를 열어 두지 않는다 ------------------------------------------------------------
+
+
+def test_초안_앱이_openapi를_열지_않는다() -> None:
+    """**초안 앱의 ``/openapi.json`` 은 요청 스키마 전문을 그대로 드러낸다.**
+
+    운영 앱은 ``/health`` 하나라 그 노출이 무해했지만, 초안 앱에는
+    ``/internal/seller-draft`` 의 전체 요청 모양(``lockedFields``·이미지 필드·계약 버전)이
+    실려 있다. 공유 비밀이 호출을 막지만 **방어를 인프라 한 겹에 걸지 않는다**는 이 모듈의
+    원칙이 그 한 겹에도 적용된다 -- 열려 있어서 얻는 것이 없다.
+
+    앞 판 테스트는 ``paths - {"/openapi.json"}`` 으로 그 경로를 **면제**해서 이 노출을
+    잡지 못했다.
+    """
+    from app.draft_api.app import DRAFT_PATH
+    from app.draft_api.app import app as draft_app
+
+    paths = {getattr(route, "path", "") for route in draft_app.routes}
+    assert "/openapi.json" not in paths, paths
+    assert paths == {"/health", DRAFT_PATH}, paths
+
+    client = TestClient(draft_app)
+    assert client.get("/openapi.json").status_code == 404
+    assert client.get("/docs").status_code == 404

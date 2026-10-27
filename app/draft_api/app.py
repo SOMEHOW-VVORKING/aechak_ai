@@ -87,7 +87,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await llm.aclose()
 
 
-app = FastAPI(title="aechak-ai seller draft", lifespan=lifespan, docs_url=None, redoc_url=None)
+# ``openapi_url=None`` 까지 끈다. **방어를 인프라 한 겹에 걸지 않는다**는 이 모듈의 원칙이
+# 이 한 겹에도 적용된다 -- ``/openapi.json`` 은 ``docs_url`` 을 꺼도 FastAPI 가 등록하고,
+# 거기에 ``/internal/seller-draft`` 의 전체 요청 모양(lockedFields·이미지 필드·계약 버전)이
+# 실린다. 운영 앱은 ``/health`` 하나라 그 노출이 무해했지만 이 앱은 아니다. 공유 비밀이
+# 호출을 막지만, 열어 두어서 얻는 것이 없다.
+app = FastAPI(
+    title="aechak-ai seller draft",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 
 @app.get("/health")
