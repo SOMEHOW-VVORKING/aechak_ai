@@ -289,3 +289,372 @@ def test_비용표가_단가_정본에서_파생된다(monkeypatch: pytest.Monke
         "단가를 올렸는데 비용표가 따라 움직이지 않았다 -- 표가 상수다"
     )
     assert after["draft_image_896_haiku"] == base["draft_image_896_haiku"] * 2
+
+
+# --- 픽스처 자기검사: 치수만 보면 플레이스홀더를 못 걸러낸다 -------------------------------
+
+
+def _write_fixtures(root: Path, *, distinct: bool) -> None:
+    """896 픽스처를 만든다. ``distinct`` 가 거짓이면 **전건이 같은 한 장**이다."""
+    from demo.draft_cassettes import synthetic_png
+
+    for index, case in enumerate(c for c in CASES if c.image_variant is not None):
+        folder = root / case.id
+        folder.mkdir(parents=True, exist_ok=True)
+        # 치수는 전부 896 으로 맞춘다 -- 자기검사가 보는 유일한 축이 그것이었다.
+        data = synthetic_png(896, 896)
+        if distinct:
+            data = data + b"\x00" * (index + 1)
+        (folder / "896.jpg").write_bytes(data)
+
+
+def test_같은_사진_한_장을_전건에_깔면_자기검사가_멈춘다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**측정 하네스가 스스로 "통과와 미검사를 섞지 않는다"를 깨는 자리였다.**
+
+    자기검사가 **치수만** 봤다. 그래서 같은 합성 PNG 한 장을 29건에 복사해 두면
+    "29/29건 준비됨 / 자기검사 통과" 로 찍히고, 키를 등재한 뒤 (나)·gated 모드를 돌리면
+    **같은 무늬 한 장을 29번 보낸 결과가 "이미지 이득"으로 리포트에 올라간다.**
+
+    가장 나쁜 자리는 WRONG 등급이다. "오사진 안전율"의 분모인데 GOOD 과 완전히 같은
+    이미지를 받으므로 그 안전율이 무의미해진다. ``harness/draft_images/`` 가 gitignore 라
+    안을 감사할 사람도 없다.
+    """
+    monkeypatch.setattr(run_draft, "IMAGE_ROOT", tmp_path)
+    _write_fixtures(tmp_path, distinct=False)
+
+    assert run_draft._self_check() != 0, "같은 사진을 전건에 깔았는데 자기검사가 통과했다"
+
+
+def test_서로_다른_사진이면_자기검사가_통과한다(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """유일성 검사가 **정상 픽스처를 막지 않는지**도 함께 고정한다."""
+    monkeypatch.setattr(run_draft, "IMAGE_ROOT", tmp_path)
+    _write_fixtures(tmp_path, distinct=True)
+
+    assert run_draft._self_check() == 0
+
+
+# --- 오사진 분모: 모델에 닿지 않는 건을 분모로 세지 않는다 --------------------------------
+
+
+def test_오사진_분모가_모델에_닿는_건만_센다() -> None:
+    """**게이트가 스스로 선언한 유일한 출시 숫자가 영구히 판정 불가였다.**
+
+    ``WRONG_PHOTO_MIN_CASES = 6`` 인데 실제 측정 분모는 5다. WRONG 6건 중
+    ``opaque-wrong-photo`` 가 OPAQUE + 카테고리 없음이라 ``service.run()`` 의
+    ``ITEM_UNIDENTIFIED`` 분기에서 **모델을 0회 부른다** -- a·b·gated 세 모드 전부에서
+    ``model_called=False`` 다. 그런데 키 없는 리포트는 "WRONG 6건이 분모다 (최소 6건
+    충족)" 이라고 찍었다. **그 줄이 거짓이었다.**
+    """
+    reachable = run_draft.wrong_photo_reachable_cases()
+
+    assert len(reachable) >= run_draft.WRONG_PHOTO_MIN_CASES, (
+        f"모델에 닿는 오사진이 {len(reachable)}건뿐이다. 그 집합으로는 오사진 안전율이 영구히 판정 불가다"
+    )
+    for case in reachable:
+        signal = catalog.resolve(case.product_name, case.category_given)
+        assert not case.expect_rule_block
+        assert not (signal.grade is ItemGrade.OPAQUE and case.category_given is None)
+
+
+def test_오사진_리포트가_닿지_않는_건을_분모로_세지_않는다() -> None:
+    rows = dict(run_draft._report_images())
+    line = rows["사진 등급 분포"]
+
+    assert "모델에 닿는" in line, line
+    # 선언 최소를 충족한다고 적을 때는 **닿는 건수**를 근거로 적어야 한다.
+    if "충족" in line:
+        assert str(len(run_draft.wrong_photo_reachable_cases())) in line, line
+
+
+def test_이미지_이득_천장이_사진이_모델에_닿는_건수다() -> None:
+    """``OPAQUE 19/72`` 는 약 3배 과대였다. 그 층 19건 중 13건은 모델을 0회 부른다."""
+    rows = dict(run_draft._report_gate_matrix())
+    line = rows["이미지 이득 천장"]
+    reachable = run_draft.image_reachable_cases("b")
+
+    assert f"{len(reachable)}" in line, line
+    assert len(reachable) < len(by_stratum()[NameReveals.OPAQUE]) + 20
+
+
+# --- 옵션 그룹 적중: 모델이 아무것도 안 내면 행이 사라졌다 --------------------------------
+
+
+def _record(**overrides: object) -> run_draft.Record:
+    base: dict[str, object] = {
+        "mode": "a",
+        "repeat": 1,
+        "case_id": "c1",
+        "name_reveals": "EXPLICIT",
+        "category_given": None,
+        "image_variant": None,
+        "leaf_truth": 111,
+        "gate_grade": "PINNED",
+        "gate_leaf": 111,
+        "predicted_leaf": 111,
+        "leaf_correct": True,
+        "scorable": True,
+        "model_called": True,
+        "image_used": False,
+        "image_usability": "NO_IMAGE_SENT",
+        "description_filled": True,
+        "option_groups_filled": False,
+        "option_group_names": [],
+        "option_group_hit": None,
+        "option_group_scorable": True,
+        "field_status": {},
+        "guard_kinds": [],
+        "basis": {},
+        "cost_micro_usd": 100,
+        "latency_ms": 10,
+        "cache_read_tokens": 0,
+    }
+    base.update(overrides)
+    return run_draft.Record(**base)  # type: ignore[arg-type]
+
+
+def test_모델이_옵션을_안_내면_미측정으로_적힌다() -> None:
+    """**절반만 실패하면 리포트가 거짓이 된다.**
+
+    ``option_group_hit`` 이 ``None`` 이면 분모에서 빠지고 행 자체가 사라졌다. 53건 중
+    10건만 옵션을 내고 그 10건이 맞으면 ``10/10(100%)`` 으로 찍히고 **43건이 아무것도
+    못 냈다는 사실은 어디에도 안 적힌다.** 레포 불변식("통과와 미검사를 절대 섞지 않는다")을
+    측정 쪽에서 그대로 어기는 모양이고, 고친 결함(읽지 못한 리뷰를 "단점 없음"으로)과 같다.
+    """
+    records = [_record(case_id=f"hit{i}", option_group_hit=True) for i in range(10)]
+    records += [_record(case_id=f"none{i}", option_group_hit=None) for i in range(43)]
+    rows = dict(run_draft._accuracy_rows("a", records))
+
+    line = rows.get("[a] 옵션 그룹 적중")
+    assert line is not None, "모델이 옵션을 낸 건만 있을 때 행이 사라진다"
+    assert "10/53" in line, line
+    assert "43" in line, f"아무것도 내지 않은 43건이 적히지 않았다: {line}"
+
+
+def test_옵션_정답이_없는_케이스는_분모에_들어가지_않는다() -> None:
+    records = [_record(case_id="x", option_group_scorable=False, option_group_hit=None)]
+    rows = dict(run_draft._accuracy_rows("a", records))
+
+    assert "[a] 옵션 그룹 적중" not in rows
+
+
+# --- 키 없이도 모드가 갈린다 -------------------------------------------------------------
+
+
+def test_모드별_계획이_네_모드를_갈라_찍는다() -> None:
+    """**이 티켓의 핵심 산출물인 비교표가 키 없이는 한 줄도 생산되지 않았다.**
+
+    ``--mode a``/``a-blind``/``b``/``gated`` 네 리포트가 산출물 경로 한 줄만 빼고 **바이트
+    동일**했다(diff 확인). 모델 호출 건수·사진이 모델에 닿는 건수·채점 분모·추정 비용은
+    전부 키 없이 계산되는데 아무 줄도 그것을 모드별로 보여 주지 않았다.
+    """
+    rows = dict(run_draft._report_mode_plan(repeat=1, variant=896))
+    line = rows["모드별 계획"]
+
+    for mode in run_draft.MODES:
+        assert mode in line, line
+    # 네 모드의 숫자가 실제로 갈린다.
+    assert len(run_draft.image_reachable_cases("gated")) != len(run_draft.image_reachable_cases("b"))
+
+
+# --- 산출물 ----------------------------------------------------------------------------
+
+
+def test_산출물에_raw_jsonl이_항상_남고_덮지_않는다(tmp_path: Path) -> None:
+    first = run_draft._write_out([], [("키", "1")], "nokey", out_root=tmp_path)
+    second = run_draft._write_out([], [("키", "2")], "nokey", out_root=tmp_path)
+
+    assert (first / "raw.jsonl").is_file()
+    assert first != second
+
+
+# --- 키가 없을 때 플래그가 조용히 무동작이 되지 않는다 -----------------------------------
+
+
+def _args(**overrides: object) -> object:
+    import argparse
+
+    defaults: dict[str, object] = {
+        "mode": "lexicon-only",
+        "model": "haiku",
+        "variant": 896,
+        "repeat": 1,
+        "count_tokens": False,
+        "count_image_tokens": False,
+        "compare_from": None,
+        "only": None,
+        "yes": False,
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def _run(args: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+    import asyncio
+
+    monkeypatch.setattr(run_draft, "OUT_ROOT", tmp_path)
+    monkeypatch.setenv("AECHAK_AI_ANTHROPIC_API_KEY", "")
+    return asyncio.run(run_draft._main(args))  # type: ignore[arg-type]
+
+
+def test_키가_없어도_기본_리포트는_종료_코드_0이다(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _run(_args(), tmp_path, monkeypatch) == 0
+
+
+@pytest.mark.parametrize("flag", ["count_tokens", "count_image_tokens"])
+def test_키가_필요한_플래그는_키가_없으면_종료_코드가_0이_아니다(
+    flag: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**세 플래그가 조용히 무시됐다.**
+
+    ``_main()`` 의 순서가 (1) 리포트 (2) ``mode == lexicon-only`` 면 return (3) 키 없으면
+    return (4) 그 다음에야 플래그 처리였다. 그래서 기본 모드에서 ``--count-tokens`` 를
+    주면 2번이 먼저 return 하고 플래그는 **아예 읽히지 않으며** 경고도 없고 종료 코드는
+    0 이다. 모듈 독스트링은 그 플래그를 "거의 무료" 로 광고하는데 실제로는 키가 필수다.
+    """
+    assert _run(_args(mode="a", **{flag: True}), tmp_path, monkeypatch) != 0
+
+
+def test_없는_비교_파일을_주면_조용히_끝나지_않는다(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--compare-from /nope/does/not/exist.jsonl`` 이 종료 코드 0 으로 조용히 끝났다."""
+    assert _run(_args(mode="a", compare_from="/nope/does/not/exist.jsonl"), tmp_path, monkeypatch) != 0
+
+
+def test_픽스처와_키가_둘_다_없으면_둘_다_말한다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**두 선결 조건이 동시에 비어 있는데 사용자는 하나만 들었다.**
+
+    키 없음 게이트가 이미지 픽스처 게이트보다 **먼저** 와서, ``--mode b`` 를 돌리면
+    "픽스처가 없다" 가 아니라 "키가 없다" 만 말했다. 픽스처 검사 메시지는 잘 쓰여 있었지만
+    키가 생기기 전까지 절대 보이지 않는다.
+    """
+    monkeypatch.setattr(run_draft, "IMAGE_ROOT", tmp_path / "none")
+    code = _run(_args(mode="b"), tmp_path, monkeypatch)
+    out = capsys.readouterr().out
+
+    assert code != 0
+    assert "픽스처" in out, out
+    assert "AECHAK_AI_ANTHROPIC_API_KEY" in out, out
+
+
+# --- 측정·집계 함수에 회귀 방어를 둔다 ----------------------------------------------------
+#
+# 고친 지표 행(옵션 그룹 적중·오사진 분모)을 타는 테스트가 **0건**이었다. 하네스 테스트
+# 27개 중 ``_measure``·``_summarize``·``_accuracy_rows`` 를 부르는 것이 하나도 없었고,
+# 그래서 "리포트에 찍지 않아 없는 숫자였다"는 결함을 고친 뒤에도 그 행을 지우는 변경이
+# 아무 테스트도 깨지 않았다.
+
+
+class _OracleClient:
+    """정답을 돌려주는 가짜. **품질을 재는 것이 아니라 배관을 고정한다.**
+
+    이 가짜가 만드는 정확도 숫자는 품질에 관해 아무 뜻이 없다(정답을 알고 답한다).
+    재는 것은 요청이 조립되고 가드를 지나고 레코드가 집계되어 **지표 행이 찍히는가**다.
+    """
+
+    def __init__(self, *, groups: str = "right") -> None:
+        self.calls: list[dict[str, object]] = []
+        self._groups = groups
+
+    async def call_tool(self, **kwargs: object) -> object:
+        from app.llm.client import LlmResult
+        from app.schemas.inspection import CallOutcome
+
+        request_id = str(kwargs["request_id"])
+        case_id = request_id.split("-", 2)[-1]
+        case = draft_cases.BY_ID[case_id]
+        self.calls.append({"request_id": request_id})
+        names = sorted(case.acceptable_option_group_names)[:1]
+        if self._groups == "empty":
+            groups: list[dict[str, object]] = []
+        elif self._groups == "wrong":
+            groups = [{"name": "엉뚱한그룹", "values": [{"name": "A"}, {"name": "B"}]}]
+        else:
+            groups = [{"name": n, "values": [{"name": "A"}, {"name": "B"}]} for n in names]
+        return LlmResult(
+            call_id=request_id,
+            outcome=CallOutcome.SUCCESS,
+            model_id="claude-haiku-4-5",
+            tool_input={
+                "leafCategoryId": case.leaf_truth or LEAF_DECLINED,
+                "descriptionParts": {
+                    "itemSummary": "품목 설명입니다.",
+                    "materialOrSpec": "나일론 소재입니다.",
+                    "usage": "산책할 때 씁니다.",
+                    "careAndStorage": "그늘에 말려 보관합니다.",
+                },
+                "optionGroups": groups,
+                "basis": {"categoryId": "NAME", "description": "NAME", "optionGroups": "NAME"},
+                "imageUsability": "NO_IMAGE_SENT",
+                "sellerNotice": "",
+            },
+            input_tokens=2_340,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+            output_tokens=450,
+            cost_micro_usd=4_590,
+            latency_ms=1_200,
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _measure_a(**client_kwargs: object) -> list[run_draft.Record]:
+    client = _OracleClient(**client_kwargs)  # type: ignore[arg-type]
+    return await run_draft._measure(
+        mode="a", model="haiku", variant=896, repeat=1, llm=client, cases=list(CASES)
+    )
+
+
+async def test_측정이_레코드를_케이스마다_하나씩_만든다() -> None:
+    records = await _measure_a()
+
+    assert len(records) == len(CASES)
+    assert {r.case_id for r in records} == {case.id for case in CASES}
+    # 0원 분기는 모델을 부르지 않는다. 그 수가 ``model_called_cases`` 와 같아야 한다.
+    called = [r for r in records if r.model_called]
+    assert len(called) == len(run_draft.model_called_cases("a"))
+
+
+async def test_집계가_옵션_미측정을_숨기지_않는다() -> None:
+    """**모델이 옵션을 하나도 내지 않아도 행이 사라지지 않는다.**"""
+    records = await _measure_a(groups="empty")
+    rows = dict(run_draft._summarize(records, "a"))
+
+    line = rows["[a] 옵션 그룹 적중"]
+    assert "미측정" in line, line
+    assert line.startswith("0/"), line
+
+
+async def test_집계가_틀린_옵션을_맞힌_것으로_세지_않는다() -> None:
+    right = dict(run_draft._summarize(await _measure_a(), "a"))["[a] 옵션 그룹 적중"]
+    wrong = dict(run_draft._summarize(await _measure_a(groups="wrong"), "a"))["[a] 옵션 그룹 적중"]
+
+    assert right != wrong
+    assert wrong.startswith("0/"), wrong
+
+
+async def test_집계가_1순위_지표_행을_전부_찍는다() -> None:
+    """지표 행이 사라지는 변경을 테스트가 막는다. summary.tsv 를 읽는 사람의 전부다."""
+    rows = dict(run_draft._summarize(await _measure_a(), "a"))
+
+    for key in (
+        "[a] 리프 정확도",
+        "[a] 층별",
+        "[a] 옵션 그룹 적중",
+        "[a] 옵션 그룹 적중 층별",
+        "[a] 비용",
+        "[a] 가드 탈락",
+        "[a] 반복 불일치",
+    ):
+        assert key in rows, key
+
+
+async def test_0단_기준선과의_비교가_층별로_나온다() -> None:
+    rows = dict(run_draft._compare(run_draft._lexicon_only_records(), await _measure_a(), label="(x)"))
+
+    assert "한계 이득 (x)" in rows
+    assert "n=" in rows["한계 이득 (x)"]

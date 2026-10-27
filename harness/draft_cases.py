@@ -634,7 +634,54 @@ CASES: tuple[DraftCase, ...] = (
         image_variant=ImageVariant.WRONG,
         wrong_photo_kind=WrongPhotoKind.OTHER_ITEM,
         acceptable_option_group_names=_SIZE | _COLOR,
-        note="사진이 상품명과 다른 건. MISMATCHES_NAME 을 내고 이미지 유래 필드를 비워야 한다",
+        note="**이 건은 오사진 안전율을 측정하지 못한다.** OPAQUE + 카테고리 없음이라 "
+        "ITEM_UNIDENTIFIED 로 0원 종료하고 모델을 0회 부른다. 남겨 두는 이유는 그 사실이 "
+        "분모 계산에서 빠지는 것을 러너가 숫자로 보여 주기 때문이다 -- 아래 셋이 측정용이다",
+    ),
+    # ── OPAQUE 층의 **측정 가능한** 오사진 셋 ───────────────────────────────────
+    #
+    # 왜 더했는가. WRONG_PHOTO_MIN_CASES = 6 인데 모델에 닿는 WRONG 이 b 모드 5건 /
+    # gated 모드 3건이었다. 즉 **게이트가 스스로 선언한 유일한 출시 숫자가 지금 집합으로는
+    # 영구히 "판정 불가"** 였고, 리포트는 WRONG 전수 6건을 분모로 세어 "최소 6건 충족"
+    # 이라고 거짓으로 찍었다.
+    #
+    # 셋 다 OPAQUE + **상위** 카테고리다. 상위 카테고리여야 둘을 동시에 얻는다 -- (1) 품목
+    # 미식별 0원 분기를 피해 모델이 불리고, (2) 리프가 아니므로 채점 분모(``scorable``)에
+    # 남는다. 그리고 어휘 게이트가 리프를 확정하지 못하므로 **gated 모드에서도 사진이
+    # 실려 간다**(``_should_use_image``). 설계가 "이미지가 값을 낼 수 있는 유일한 층"이라고
+    # 지목한 OPAQUE 에서 오사진을 재는 것이 이 셋의 전부다.
+    DraftCase(
+        "opaque-wrong-photo-litter",
+        "클린 샌드 프리미엄 7L",
+        251,
+        NameReveals.OPAQUE,
+        category_given=25,
+        image_variant=ImageVariant.WRONG,
+        wrong_photo_kind=WrongPhotoKind.OTHER_ITEM,
+        acceptable_option_group_names=_SIZE,
+        note="모래인데 전혀 다른 품목 사진. 상위 카테고리만 주어 모델은 불리고 리프는 안 준다",
+    ),
+    DraftCase(
+        "opaque-wrong-photo-bowl",
+        "스테인리스 보울 350ml",
+        331,
+        NameReveals.OPAQUE,
+        category_given=33,
+        image_variant=ImageVariant.WRONG,
+        wrong_photo_kind=WrongPhotoKind.OTHER_SPECIES,
+        acceptable_option_group_names=_SIZE | _COLOR,
+        note="같은 품목 다른 종 사진. **반려동물 커머스에서 더 흔하고 더 위험한 오사진이다**",
+    ),
+    DraftCase(
+        "opaque-wrong-photo-tower",
+        "하이 타워 4단",
+        242,
+        NameReveals.OPAQUE,
+        category_given=24,
+        image_variant=ImageVariant.WRONG,
+        wrong_photo_kind=WrongPhotoKind.NO_PRODUCT,
+        acceptable_option_group_names=_SIZE | _COLOR,
+        note="상품이 안 찍힌 사진(사람·배경만). 세 종류를 한 가지로 뭉개면 어디서 무너지는지 모른다",
     ),
     # ── 정답이 "고르지 않는 것" 인 층 ────────────────────────────────────────────
     #

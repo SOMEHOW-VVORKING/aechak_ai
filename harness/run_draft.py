@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import statistics
 import sys
@@ -191,9 +192,77 @@ class Record:
     latency_ms: int
     cache_read_tokens: int
     note: str = ""
+    # **옵션 그룹에 정답이 있는 케이스인가.** ``option_group_hit`` 과 별 축이어야 한다.
+    #
+    # ``option_group_hit`` 은 셋을 뭉개고 있었다 -- 맞혔다(True) / 틀렸다(False) /
+    # **모델이 옵션을 아무것도 내지 않았다**(None). 집계가 None 을 분모에서 빼므로
+    # 53건 중 10건만 옵션을 내고 그 10건이 맞으면 ``10/10(100%)`` 으로 찍히고 43건이
+    # 아무것도 못 냈다는 사실이 어디에도 안 적혔다. 분모를 이 필드로 따로 들면
+    # 미측정을 숫자로 적을 수 있다.
+    option_group_scorable: bool = False
 
     def as_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
+
+
+# --- 모델·이미지에 **실제로 닿는** 케이스 ------------------------------------------------
+#
+# 이 셋이 없어서 리포트가 거짓을 찍었다. "WRONG 6건이 오사진 안전율의 분모다 (최소 6건
+# 충족)" 과 "이미지 이득 천장 OPAQUE 19/72" 가 둘 다 **모델에 닿지 않는 건을 분모로 셌다.**
+# 실제 측정 분모는 각각 5건과 6건이고, 전자는 선언 최소에 미달해 게이트가 영구히 판정
+# 불가였다. 분모를 세는 함수를 한 자리에 두고 리포트와 테스트가 같은 것을 본다.
+
+
+def _category_for(case: DraftCase, mode: str) -> int | None:
+    """그 모드에서 실제로 넘어가는 카테고리. ``a-blind`` 는 숨긴다."""
+    return None if mode == "a-blind" else case.category_given
+
+
+def model_called_cases(mode: str = "a") -> list[DraftCase]:
+    """모델이 **불리는** 케이스. 0원 분기를 전부 뺀다.
+
+    셋이 0원이다. 상품명 0단 룰 차단, 상품명 효능 단정 차단(``claims``), 품목 미식별.
+    셋째는 모드에 따라 달라진다 -- ``a-blind`` 는 카테고리를 숨기므로 미식별이 늘어난다.
+    """
+    out: list[DraftCase] = []
+    for case in CASES:
+        if case.expect_rule_block or claims.screen(case.product_name):
+            continue
+        given = _category_for(case, mode)
+        if catalog.resolve(case.product_name, given).grade is ItemGrade.OPAQUE and given is None:
+            continue
+        out.append(case)
+    return out
+
+
+def image_reachable_cases(mode: str) -> list[DraftCase]:
+    """사진이 **모델에 실려 가는** 케이스.
+
+    ``GATED`` 는 어휘 게이트가 리프를 확정하지 못했을 때만 이미지를 쓴다
+    (``service._should_use_image``). 그 비대칭을 여기서 같은 조건으로 센다.
+    """
+    if mode not in ("b", "gated"):
+        return []
+    out: list[DraftCase] = []
+    for case in model_called_cases(mode):
+        if case.image_variant is None:
+            continue
+        if mode == "gated":
+            signal = catalog.resolve(case.product_name, _category_for(case, mode))
+            if signal.pinned_leaf_id is not None:
+                continue
+        out.append(case)
+    return out
+
+
+def wrong_photo_reachable_cases(mode: str = "b") -> list[DraftCase]:
+    """오사진 안전율의 **실제 분모.**
+
+    ``WRONG`` 등급 전수가 아니다. OPAQUE + 카테고리 없음인 건은 ``ITEM_UNIDENTIFIED`` 로
+    0원 종료해 모델을 한 번도 부르지 않으므로 그 안전율을 측정할 수 없다. 그 건을 분모로
+    세면 "최소 6건 충족" 이 거짓이 된다.
+    """
+    return [case for case in image_reachable_cases(mode) if case.image_variant is ImageVariant.WRONG]
 
 
 # --- 키 없이 도는 자기검사 --------------------------------------------------------------
@@ -286,6 +355,14 @@ def _self_check() -> int:
 
     # (8) 이미지 픽스처가 있으면 헤더 치수가 선언 등급과 맞는가.
     #     어긋나면 토큰 예산이 틀리고 비용 비교가 무의미해진다.
+    #
+    #     **치수만 보면 안 된다.** 그것이 이 검사의 결함이었다 -- 같은 합성 PNG 한 장을
+    #     29건에 복사해 두면 "29/29건 준비됨 / 자기검사 통과" 로 찍히고, 키를 등재한 뒤
+    #     (나)·gated 모드를 돌리면 **같은 무늬 한 장을 29번 보낸 결과가 "이미지 이득"으로**
+    #     리포트에 올라간다. 가장 나쁜 자리는 WRONG 등급이다 -- "오사진 안전율"의 분모인데
+    #     GOOD 과 완전히 같은 이미지를 받으므로 그 숫자가 무의미해진다. ``draft_images/`` 가
+    #     gitignore 라 안을 감사할 사람도 없다. 그래서 **내용 해시의 유일성**을 함께 본다.
+    digests: dict[str, list[str]] = defaultdict(list)
     for case in CASES:
         if case.image_variant is None:
             continue
@@ -293,7 +370,8 @@ def _self_check() -> int:
             path = _image_path(case, variant)
             if not path.is_file():
                 continue
-            read = imagemeta.read_dimensions(path.read_bytes())
+            data = path.read_bytes()
+            read = imagemeta.read_dimensions(data)
             if read is None:
                 problems.append(f"{case.id}/{variant}: 헤더를 읽을 수 없다")
                 continue
@@ -303,6 +381,15 @@ def _self_check() -> int:
                     f"{case.id}/{variant}: 긴 변이 {max(width, height)}px 다. "
                     "선언 등급과 달라 토큰 예산이 틀린다"
                 )
+            if variant == 896:
+                digests[hashlib.sha256(data).hexdigest()].append(f"{case.id}({case.image_variant.value})")
+    for digest, owners in sorted(digests.items()):
+        if len(owners) > 1:
+            problems.append(
+                f"픽스처 {len(owners)}건이 **같은 파일**이다({digest[:12]}): {', '.join(sorted(owners))}. "
+                "플레이스홀더를 깔아 두면 '이미지 이득'과 '오사진 안전율'이 같은 사진 한 장의 "
+                "숫자가 된다 -- 치수만 맞으면 통과하던 자리다"
+            )
 
     if problems:
         print("[치명] 케이스 기대값이 코드와 어긋난다. 측정 전에 멈춘다.")
@@ -414,6 +501,9 @@ def _lexicon_only_records() -> list[Record]:
                 cost_micro_usd=0,
                 latency_ms=0,
                 cache_read_tokens=0,
+                # 0단 어휘 게이트는 옵션을 제안하지 않는다. 정답이 있는 케이스인 것은
+                # 사실이므로 분모 플래그는 세우고, 미측정으로 적힌다.
+                option_group_scorable=bool(case.acceptable_option_group_names),
             )
         )
     return records
@@ -449,12 +539,18 @@ def _report_gate_matrix() -> list[tuple[str, str]]:
     )
 
     opaque = len(by_stratum()[NameReveals.OPAQUE])
+    reach_b = image_reachable_cases("b")
+    reach_gated = image_reachable_cases("gated")
+    scorable_ids = {case.id for case in scorable()}
     rows.append(
         (
             "이미지 이득 천장",
-            f"OPAQUE 층이 {opaque}/{len(CASES)}건 ({opaque / len(CASES):.0%}). "
-            "**이미지가 값을 낼 수 있는 구간의 상한이고 키 없이 지금 알 수 있다** — "
-            "이 층이 얇으면 이미지의 최대 이득도 그만큼 얇다",
+            f"OPAQUE 층이 {opaque}/{len(CASES)}건 ({opaque / len(CASES):.0%}) 이지만 **사진이 "
+            f"모델에 실제로 닿는 건은 b={len(reach_b)} / gated={len(reach_gated)}** "
+            f"(그 가운데 채점 분모 b={sum(1 for c in reach_b if c.id in scorable_ids)} / "
+            f"gated={sum(1 for c in reach_gated if c.id in scorable_ids)}). "
+            "앞 판은 OPAQUE 층 전수를 천장으로 적었는데 그 층의 상당수가 카테고리 없이 "
+            "0원 종료해 **사진이 모델에 실리지 않는다** — 약 3배 과대였다",
         )
     )
     return rows
@@ -468,10 +564,12 @@ def _report_guards() -> list[tuple[str, str]]:
     rows.append(
         (
             "0단과 효능",
-            f"정책 효능 위반 예시 {len(covered)}건 중 0단(rules.screen)이 잡는 것 "
+            f"정책 효능 위반 예시 {len(covered)}건 중 rules.screen 이 잡는 것 "
             f"{zero_stage_hits}건 / claims 사전이 잡는 것 "
             f"{sum(1 for ex in covered if claims.screen(ex))}건 — "
-            "**0단이 0건인 것이 claims.py 를 새로 만든 이유다.** 다만 claims 쪽 숫자는 "
+            "**rules 가 0건인 것이 claims.py 를 새로 만든 이유다.** 그 사전은 이제 모델 "
+            "출력만 보지 않고 **상품명 0단에도 걸린다**(NAME_CLAIM_BLOCKED) -- 걸려 있지 "
+            "않던 동안 '관절염 치료 목줄' 에 완성 초안이 나갔다. 다만 claims 쪽 숫자는 "
             "**커버리지가 아니다** -- 분모가 사전의 출처와 같고 같은 목록이 프롬프트에도 "
             "들어가므로 순환이며 미탐을 측정하지 못한다. 그 축은 아래 보류 집합이 본다",
         )
@@ -482,8 +580,14 @@ def _report_guards() -> list[tuple[str, str]]:
     rows.append(
         (
             "효능 사전 보류 집합",
-            f"{holdout_hits}/{len(holdout)}건 — **사전을 쓸 때 참조하지 않은 표현이고 이것이 "
-            "유일한 비순환 숫자다.** 네거티브 리스트라 낮게 나오는 것이 사실이다"
+            f"{holdout_hits}/{len(holdout)}건"
+            + (
+                " — **이 숫자는 이제 순환이다.** 이 집합이 0/8 이었고 그것을 보고 사전을 "
+                "고쳤다(질병명·완치 동사·기간 단정·후기 인용 네 층을 더했다). 리터럴을 "
+                "베끼지는 않았지만 목록을 보면서 썼으므로 미탐을 측정하지 못한다"
+                if claims.HOLDOUT_IS_CIRCULAR
+                else " — **사전을 쓸 때 참조하지 않은 표현이고 이것이 유일한 비순환 숫자다.**"
+            )
             + (
                 f" / 놓친 것: {', '.join(missed[:4])}" + (" ..." if len(missed) > 4 else "") if missed else ""
             ),
@@ -491,9 +595,10 @@ def _report_guards() -> list[tuple[str, str]]:
     )
     rows.append(
         (
-            "보류 집합을 보고 사전을 고치지 마라",
-            "고치는 순간 이 숫자도 순환이 되어 측정 도구가 하나 사라진다. "
-            "늘리고 싶으면 **새 보류 집합을 먼저 만들어라**",
+            "비순환 숫자가 지금 없다",
+            "다음 사람이 미탐을 재려면 **실제 셀러 문구**에서 새 보류 집합을 받아야 한다. "
+            "내가 지어낸 문장으로 만든 집합은 규칙을 쓴 사람이 같아서 증거가 약하다 -- "
+            "그 사실을 숫자 대신 적어 둔다",
         )
     )
     rows.append(
@@ -587,14 +692,21 @@ def _report_images() -> list[tuple[str, str]]:
     )
     variants = Counter(case.image_variant.value for case in CASES if case.image_variant is not None)
     wrong = variants.get(ImageVariant.WRONG.value, 0)
+    # **분모는 WRONG 전수가 아니라 모델에 닿는 건이다.** 앞 판이 전수를 세어 "최소 6건
+    # 충족" 이라고 찍었는데 실제 측정 분모는 5건이었다 -- OPAQUE + 카테고리 없음인 건은
+    # ITEM_UNIDENTIFIED 로 0원 종료해 모델을 한 번도 부르지 않는다. 그 줄이 거짓이었고,
+    # 거짓이 아니었어도 게이트는 영구히 판정 불가였다.
+    reach = {mode: len(wrong_photo_reachable_cases(mode)) for mode in ("b", "gated")}
+    enough = min(reach.values()) >= WRONG_PHOTO_MIN_CASES
     rows.append(
         (
             "사진 등급 분포",
             ", ".join(f"{k}={v}" for k, v in sorted(variants.items()))
-            + f" — WRONG {wrong}건이 **오사진 안전율**의 분모다"
+            + f" / WRONG 전수 {wrong}건 가운데 **모델에 닿는 것** b={reach['b']} gated={reach['gated']} "
+            + "— 닿는 건만 오사진 안전율의 분모다"
             + (
                 f" (최소 {WRONG_PHOTO_MIN_CASES}건 충족)"
-                if wrong >= WRONG_PHOTO_MIN_CASES
+                if enough
                 else f" / **최소 {WRONG_PHOTO_MIN_CASES}건에 미달해 그 줄은 판정 불가로 찍힌다**"
             ),
         )
@@ -626,19 +738,96 @@ def _report_images() -> list[tuple[str, str]]:
     return rows
 
 
+def _report_mode_plan(*, repeat: int, variant: int, selected: str | None = None) -> list[tuple[str, str]]:
+    """**키 없이 뽑는 모드 비교표.** 이 티켓의 산출물이 그것인데 한 줄도 없었다.
+
+    ``--mode a``/``a-blind``/``b``/``gated`` 네 리포트가 산출물 경로 한 줄만 빼고 **바이트
+    동일**했다(diff 로 확인). 모드별로 다른 것은 "추정 전체" 한 줄뿐이었고 그마저 모드를
+    주지 않아도 똑같이 찍혔다. 즉 **입력 방식을 고르는 데 쓸 표가 오늘 생산되지 않았다.**
+
+    그런데 모델 품질 말고는 모드 결정 재료가 거의 다 키 없이 계산된다.
+
+    - 모델을 **몇 건에서 부르는가**(0원 분기 셋이 모드마다 다르게 걸린다)
+    - 사진이 **몇 건에서 모델에 닿는가**(gated 는 게이트가 확정하지 못한 건만 보낸다)
+    - 그 가운데 **채점 분모**가 몇 건인가(층별로 나누면 층당 몇 건인지가 결론을 정한다)
+    - **오사진 안전율의 분모**가 선언 최소를 넘는가
+    - 추정 비용과 **사람이 모아야 하는 사진 장수**
+
+    품질 숫자는 여기 없다. 키가 없으면 그것은 영구히 없고, 없는 것을 추정으로 메우지 않는다.
+    """
+    rows: list[tuple[str, str]] = []
+    scorable_ids = {case.id for case in scorable()}
+    parts: list[str] = []
+    for mode in MODES:
+        calls = len(model_called_cases(mode)) if mode != "lexicon-only" else 0
+        images = image_reachable_cases(mode)
+        scored = sum(1 for case in images if case.id in scorable_ids)
+        cost = _mode_cost(mode, len(model_called_cases("a")), repeat)
+        parts.append(
+            f"{mode}: 호출 {calls}건 · 사진 {len(images)}건(채점 {scored}) · {cost / 1_000_000:.3f}USD"
+        )
+    rows.append(
+        (
+            "모드별 계획",
+            " / ".join(parts) + f" (반복 {repeat}, {variant}px). "
+            "**숫자가 키 없이 갈리는 축은 이것이 전부다** — 정확도는 키가 있어야 한다",
+        )
+    )
+
+    layer_parts: list[str] = []
+    for mode in ("b", "gated"):
+        by_layer: Counter[str] = Counter(
+            case.name_reveals.value for case in image_reachable_cases(mode) if case.id in scorable_ids
+        )
+        body = ", ".join(f"{k} {v}" for k, v in sorted(by_layer.items())) or "없음"
+        layer_parts.append(f"{mode}={body}")
+    rows.append(
+        (
+            "사진이 닿는 층별 분모",
+            " / ".join(layer_parts) + " — **층당 건수가 결론을 정한다.** 층당 몇 건으로 "
+            "(가) 대 (나) 를 고를 수 있는지는 사람이 이 줄을 보고 판단한다",
+        )
+    )
+
+    wrong_parts = []
+    for mode in ("b", "gated"):
+        count = len(wrong_photo_reachable_cases(mode))
+        wrong_parts.append(f"{mode}={count}" + ("" if count >= WRONG_PHOTO_MIN_CASES else " **미달**"))
+    rows.append(
+        (
+            "모드별 오사진 분모",
+            " / ".join(wrong_parts) + f" (최소 {WRONG_PHOTO_MIN_CASES}). "
+            "미달이면 그 모드에서 오사진 안전율은 **판정 불가**이고, 정확도와 무관하게 "
+            "이미지를 켜지 않는다",
+        )
+    )
+
+    if selected is not None:
+        need = {case.id for case in CASES if case.image_variant is not None}
+        have = sum(
+            1 for case in CASES if case.image_variant is not None and _image_path(case, variant).is_file()
+        )
+        if selected == "lexicon-only":
+            note = "없음 — 키도 사진도 필요 없다. 0원 기준선이 이 모드의 산출물이다"
+        elif selected in ("a", "a-blind"):
+            note = "키 하나. 사진은 쓰지 않는 모드다"
+        else:
+            note = (
+                f"키 하나 + {variant}px 사진 {len(need)}장({have}장 준비됨). "
+                "WRONG 등급은 **상품명과 다른 상품** 사진이어야 하고, 같은 사진을 복사해 두면 "
+                "자기검사가 막는다"
+            )
+        rows.append((f"선택한 모드 [{selected}] 선결", note))
+    return rows
+
+
 def _report_estimate(repeat: int) -> list[tuple[str, str]]:
     """비용 추정. **전부 추정이고 실측이 아니다.**"""
     text = _DRAFT_ESTIMATE_MICRO_USD["draft_text_haiku"]
     image = _DRAFT_ESTIMATE_MICRO_USD["draft_image_896_haiku"]
-    called = sum(
-        1
-        for case in CASES
-        if not case.expect_rule_block
-        and not (
-            catalog.resolve(case.product_name, case.category_given).grade is ItemGrade.OPAQUE
-            and case.category_given is None
-        )
-    )
+    # **0원 분기 셋을 한 함수가 센다.** 앞 판은 0단 룰 차단과 품목 미식별 둘만 세어서
+    # 상품명 효능 차단(claims)이 더해진 뒤에도 호출 건수가 그대로였다.
+    called = len(model_called_cases("a"))
     rows = [
         (
             "추정 건당",
@@ -675,21 +864,18 @@ def _report_estimate(repeat: int) -> list[tuple[str, str]]:
 
 
 def _mode_cost(mode: str, called: int, repeat: int) -> int:
+    """모드별 추정 비용. **호출 건수와 이미지 건수를 모드별로 다시 센다.**
+
+    ``called`` 인자는 (가) 기준이고 ``a-blind`` 는 카테고리를 숨겨 품목 미식별이 늘어
+    호출 건수가 **줄어든다.** 같은 수를 쓰면 그 모드의 비용이 과대 계상된다.
+    """
     text = _DRAFT_ESTIMATE_MICRO_USD["draft_text_haiku"]
     image = _DRAFT_ESTIMATE_MICRO_USD["draft_image_896_haiku"]
     if mode == "lexicon-only":
         return 0
-    if mode == "b":
-        return (text + image) * called * repeat
-    if mode == "gated":
-        gated = sum(
-            1
-            for case in CASES
-            if catalog.resolve(case.product_name, case.category_given).pinned_leaf_id is None
-            and case.image_variant is not None
-        )
-        return (text * called + image * gated) * repeat
-    return text * called * repeat
+    calls = len(model_called_cases(mode)) if mode == "a-blind" else called
+    images = len(image_reachable_cases(mode))
+    return (text * calls + image * images) * repeat
 
 
 # --- 토큰 실측 -------------------------------------------------------------------------
@@ -914,6 +1100,7 @@ async def _measure(
                         if names and case.acceptable_option_group_names
                         else None
                     ),
+                    option_group_scorable=bool(case.acceptable_option_group_names),
                     field_status={k: v.value for k, v in response.fieldStatus.items()},
                     guard_kinds=[drop.kind.value for drop in response.guardDrops],
                     basis={k: v.value for k, v in response.basis.items()},
@@ -957,6 +1144,7 @@ def _unprocessable_record(
         latency_ms=0,
         cache_read_tokens=0,
         note=f"UNPROCESSABLE: {detail}",
+        option_group_scorable=bool(case.acceptable_option_group_names),
     )
 
 
@@ -1013,25 +1201,41 @@ def _accuracy_rows(mode: str, records: list[Record]) -> list[tuple[str, str]]:
                 "추측해서 맞히는 쪽이 유리하게 측정되지 않게 하는 분모다",
             )
         )
-    option_scored = [r for r in pool if r.option_group_hit is not None]
-    if option_scored:
-        hit = sum(1 for r in option_scored if r.option_group_hit)
+    # **분모는 "정답이 있는 케이스" 다. "모델이 옵션을 낸 케이스" 가 아니다.**
+    #
+    # 앞 판은 ``option_group_hit is not None`` 으로 걸렀다. 그 값은 모델이 옵션을 하나도
+    # 내지 않으면 ``None`` 이라서 **분모에서 빠지고 행 자체가 사라졌다.** 전부 실패하면
+    # "없음"으로 보이는 데 그치지만 **절반만 실패하면 거짓이 된다** -- 53건 중 10건만
+    # 옵션을 내고 그 10건이 맞으면 ``10/10(100%)`` 으로 찍히고 43건이 아무것도 못 냈다는
+    # 사실은 어디에도 안 적힌다. 레포 불변식("통과와 미검사를 절대 섞지 않는다")을 측정
+    # 쪽에서 그대로 어기는 모양이고, 고친 결함(읽지 못한 리뷰를 "단점 없음"으로)과 같다.
+    option_pool = [r for r in pool if r.option_group_scorable]
+    if option_pool:
+        scored = [r for r in option_pool if r.option_group_hit is not None]
+        unattempted = len(option_pool) - len(scored)
+        hit = sum(1 for r in scored if r.option_group_hit)
         rows.append(
             (
                 f"[{mode}] 옵션 그룹 적중",
-                f"{hit}/{len(option_scored)}({hit / len(option_scored):.0%}) — "
-                "**리프 말고 유일하게 정답이 있는 내용 지표다.** 전에는 레코드에만 담고 "
-                "리포트에 찍지 않아 summary.tsv 를 읽는 사람에게는 없는 숫자였다",
+                f"{hit}/{len(option_pool)}({hit / len(option_pool):.0%}) — 분모는 **정답이 있는 "
+                f"케이스 전수**다. 그 가운데 {unattempted}건은 모델이 옵션을 하나도 내지 않아 "
+                "**미측정**이다(맞힌 것도 틀린 것도 아니다). 리프 말고 유일하게 정답이 있는 "
+                "내용 지표다",
             )
         )
         by_layer_option: dict[str, list[Record]] = defaultdict(list)
-        for record in option_scored:
+        for record in option_pool:
             by_layer_option[record.name_reveals].append(record)
         rows.append(
             (
                 f"[{mode}] 옵션 그룹 적중 층별",
                 " / ".join(
                     f"{layer}={sum(1 for r in group if r.option_group_hit)}/{len(group)}"
+                    + (
+                        f"(미측정 {sum(1 for r in group if r.option_group_hit is None)})"
+                        if any(r.option_group_hit is None for r in group)
+                        else ""
+                    )
                     for layer, group in sorted(by_layer_option.items())
                 ),
             )
@@ -1091,7 +1295,7 @@ def _summarize(records: list[Record], mode: str) -> list[tuple[str, str]]:
                 ),
             )
         )
-        wrong_cases = {r.case_id for r in wrong}
+        wrong_cases = {r.case_id for r in wrong if r.model_called}
         if len(wrong_cases) < WRONG_PHOTO_MIN_CASES:
             # **1건짜리 숫자로 출시 게이트를 통과·탈락시키지 않는다.**
             #
@@ -1256,13 +1460,25 @@ def load_records(path: str) -> list[Record]:
     ]
 
 
-def _write_out(records: list[Record], rows: list[tuple[str, str]], tag: str) -> Path:
+def _write_out(
+    records: list[Record], rows: list[tuple[str, str]], tag: str, *, out_root: Path | None = None
+) -> Path:
+    """산출물을 쓴다. **덮지 않고, 빈 raw 도 파일로 남긴다.**
+
+    스탬프가 초 단위이고 ``mkdir(exist_ok=True)`` 라 같은 초에 두 번 돌면 조용히 덮었다.
+    그리고 ``if records:`` 가드 때문에 키 없는 경로에서는 ``raw.jsonl`` 이 안 써져, 읽는
+    사람이 raw 를 잃었는지 애초에 없었는지 구별할 수 없었다.
+    """
+    root = out_root if out_root is not None else OUT_ROOT
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    out = OUT_ROOT / f"draft-{tag}-{stamp}"
-    out.mkdir(parents=True, exist_ok=True)
-    if records:
-        (out / "raw.jsonl").write_text("\n".join(r.as_json() for r in records) + "\n")
-    (out / "summary.tsv").write_text("\n".join(f"{k}\t{v}" for k, v in rows) + "\n")
+    out = root / f"draft-{tag}-{stamp}"
+    serial = 2
+    while out.exists():
+        out = root / f"draft-{tag}-{stamp}-{serial}"
+        serial += 1
+    out.mkdir(parents=True)
+    (out / "raw.jsonl").write_text("".join(r.as_json() + "\n" for r in records), encoding="utf-8")
+    (out / "summary.tsv").write_text("\n".join(f"{k}\t{v}" for k, v in rows) + "\n", encoding="utf-8")
     return out
 
 
@@ -1283,8 +1499,67 @@ async def _main(args: argparse.Namespace) -> int:
     rows.extend(_report_guards())
     rows.extend(_report_envelope())
     rows.extend(_report_images())
+    rows.extend(_report_mode_plan(repeat=args.repeat, variant=args.variant, selected=args.mode))
     rows.extend(_report_estimate(args.repeat))
     _print(rows)
+
+    # **선결 조건을 전부 모아서 한 번에 말한다.** 앞 판은 하나만 말했다.
+    #
+    # 순서가 (1) lexicon-only 면 return (2) 키 없으면 return (3) 그 다음에야 플래그 처리와
+    # 픽스처 검사였다. 그래서 둘이 조용히 거짓이었다.
+    #
+    # - 기본 모드에서 ``--count-tokens`` 를 주면 1번이 먼저 return 해 **플래그가 아예
+    #   읽히지 않고** 경고도 없고 종료 코드 0 이었다. 모듈 독스트링은 그 플래그를 "거의
+    #   무료" 로 광고하는데 실제로는 키가 필수다. ``--compare-from /nope`` 도 같은 자리에서
+    #   조용히 끝났다(존재하지 않는 경로인데 종료 코드 0).
+    # - ``--mode b`` 는 픽스처와 키가 **둘 다** 없는데 사람은 "키가 없다" 만 들었다.
+    #   픽스처 검사 메시지는 잘 쓰여 있었지만 키가 생기기 전까지 절대 보이지 않는다.
+    blockers: list[str] = []
+    cases = [case for case in CASES if not args.only or case.id in args.only]
+
+    if args.compare_from is not None and not await asyncio.to_thread(Path(args.compare_from).is_file):
+        blockers.append(f"--compare-from 경로가 없다: {args.compare_from}")
+
+    if args.mode in ("b", "gated"):
+        missing = [
+            case.id
+            for case in cases
+            if case.image_variant is not None and not _image_path(case, args.variant).is_file()
+        ]
+        if missing:
+            blockers.append(
+                f"{args.variant} 등급 이미지 픽스처가 {len(missing)}건 없다 "
+                "(harness/make_draft_images.sh 가 만든다. 같은 사진을 복사해 두면 자기검사가 막는다)"
+            )
+
+    # **모델을 쓰는 모드를 골랐으면 키가 선결 조건이다.** 기본 모드(``lexicon-only``)는
+    # 아무것도 필요 없고 그 호출만 종료 코드 0 이다 -- 0원 기준선이 그 모드의 산출물이다.
+    if args.mode != "lexicon-only" and not settings.anthropic_api_key:
+        blockers.append(
+            "AECHAK_AI_ANTHROPIC_API_KEY 가 없다(ANTHROPIC_API_KEY 가 아니라 이 이름이다 -- "
+            "Settings 의 env_prefix 가 AECHAK_AI_). 사람이 SSM 에 등재해야 한다"
+        )
+
+    if blockers:
+        print()
+        requested = " ".join(
+            name
+            for name, on in (
+                (f"--mode {args.mode}", True),
+                ("--count-tokens", args.count_tokens),
+                ("--count-image-tokens", args.count_image_tokens),
+                ("--yes", args.yes),
+                (f"--compare-from {args.compare_from}", args.compare_from is not None),
+            )
+            if on
+        )
+        print(f"[실패] 요청한 것을 하지 못했다: {requested}. 선결 조건:")
+        for blocker in blockers:
+            print(f"  - {blocker}")
+        print("위 리포트는 키 없이 뽑은 것이고 비용 숫자는 **추정이다**. 종료 코드 2 로 알린다.")
+        out = _write_out(_lexicon_only_records(), rows, f"blocked-{args.mode}")
+        print(f"산출물 {out}")
+        return 2
 
     if args.mode == "lexicon-only":
         out = _write_out(_lexicon_only_records(), rows, "lexicon-only")
@@ -1295,10 +1570,10 @@ async def _main(args: argparse.Namespace) -> int:
         print()
         print(
             "AECHAK_AI_ANTHROPIC_API_KEY 가 없어 실측을 건너뛴다. "
-            "ANTHROPIC_API_KEY 가 아니라 이 이름이다(Settings 의 env_prefix 가 AECHAK_AI_). "
-            "위 리포트는 키 없이 뽑은 것이고, 비용 숫자는 **추정이다**."
+            "위 리포트는 키 없이 뽑은 것이고, 비용 숫자는 **추정이다**. "
+            "모드 결정 재료 가운데 키 없이 나오는 것은 '모드별 계획' 줄이 전부다."
         )
-        out = _write_out(_lexicon_only_records(), rows, "nokey")
+        out = _write_out(_lexicon_only_records(), rows, f"nokey-{args.mode}")
         print(f"산출물 {out}")
         return 0
 
@@ -1306,22 +1581,6 @@ async def _main(args: argparse.Namespace) -> int:
         return await _count_tokens(settings)
     if args.count_image_tokens:
         return await _count_image_tokens(settings, args.variant)
-
-    cases = [case for case in CASES if not args.only or case.id in args.only]
-    if args.mode in ("b", "gated"):
-        missing = [
-            case.id
-            for case in cases
-            if case.image_variant is not None and not _image_path(case, args.variant).is_file()
-        ]
-        if missing:
-            print()
-            print(
-                f"{args.variant} 등급 이미지 픽스처가 {len(missing)}건 없어 {args.mode} 모드를 "
-                "건너뛴다. harness/make_draft_images.sh 를 먼저 돌려라. "
-                "**조용히 비어 있는 것보다 건너뛰는 쪽이 낫다.**"
-            )
-            return 0
 
     if not args.yes:
         print()
@@ -1387,6 +1646,9 @@ __all__ = [
     "VARIANTS",
     "Record",
     "draft_cache_prefix_targets",
+    "image_reachable_cases",
     "load_records",
+    "model_called_cases",
     "model_earns_its_keep",
+    "wrong_photo_reachable_cases",
 ]
