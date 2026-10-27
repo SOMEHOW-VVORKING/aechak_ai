@@ -120,6 +120,43 @@ class Settings(BaseSettings):
     # 기본 꺼짐. enable_triage 선례 -- 구현하고 측정하고 기본은 끈다.
     enable_review_summary: bool = False
 
+    # --- 셀러 폼 초안(SCRUM-311). 동기 요청이고 **검수 컨슈머 경로가 아니다** ----------
+    #
+    # Haiku 4.5 를 기본으로 둔 이유가 요약과 같다. Sonnet 5 는 ``thinking`` 을 생략하면
+    # adaptive 가 켜져 **사고 토큰이 출력 단가로 과금되는데 초안 글자 수에는 나타나지
+    # 않는다.** 억제 레버는 effort 하나이고, thinking 을 끄려면 손대지 않기로 한
+    # client.py 를 고쳐야 한다. Haiku 는 건당 비용이 고정이고 분산이 0이다.
+    draft_model: str = "claude-haiku-4-5"
+    # Haiku 4.5 는 effort 를 받으면 400 이고 그 400 이 SCHEMA_INVALID 로 숨는다.
+    draft_effort: OptionalEffort = None
+    # 설명 슬롯 4개 + 옵션 2그룹 + 리프 + basis. 좁으면 TRUNCATED 로 떨어져 비용을 쓰고도 못 쓴다.
+    max_tokens_draft: int = 2048
+    # **셀러가 화면에서 기다린다.** 전역 60초는 너무 길다.
+    draft_timeout_seconds: float = 25.0
+    # 설명 전체 길이 상한. 출력 토큰이 비용의 지배 항이라 이 수가 곧 비용 레버다.
+    draft_description_chars: int = 400
+    # 이미지 입력 방식. **기본 꺼짐이고 하네스 숫자가 켠다**(enable_triage 선례 --
+    # 구현하고 측정하고 기본은 끈다). OFF | GATED | ALWAYS.
+    #   OFF    이미지를 받아도 쓰지 않고 imageUsability = NO_IMAGE_SENT
+    #   GATED  어휘 게이트가 품목을 확정하지 못했을 때만 쓴다  <- 조건부 멀티모달
+    #   ALWAYS 항상 쓴다
+    draft_image_mode: str = "OFF"
+    # 해상도 예산의 정본. ~1,024 사방 상한이고 넘으면 거부하면서 필요 치수를 적어 돌려준다.
+    # AI 서버는 리사이즈하지 않는다(의존성 금지) -- 축소는 셀러센터가 한다.
+    draft_image_max_tokens: int = 1400
+    # 초안 재사용 캐시. **프로세스 로컬 LRU 뿐이고 재배포에 사라진다** -- AI 서버가 DB 에
+    # 붙지 않는 불변식 때문이다. 용도는 셀러가 같은 버튼을 연타하는 것을 막는 것까지이고,
+    # 진짜 재사용은 백엔드의 초안 스냅샷 칼럼으로 민다. 0 이면 끈다(하네스가 그렇게 쓴다).
+    draft_cache_entries: int = 64
+    # 내부 호출용 공유 비밀. **비어 있으면 초안 앱이 전건을 거부한다**(fail closed) --
+    # SSM 파라미터가 빠진 배포에서 인증 없는 경로가 열리는 쪽이 더 나쁜 실패다.
+    draft_shared_secret: str = ""
+    # 기본 꺼짐. 켜는 조건(하네스 숫자 몇을 넘으면)은 사람이 정한다.
+    enable_draft: bool = False
+    # 초안 몫의 일 예산. daily_cost_alert_usd 안의 몫이고 경보는 어느 기능이 태웠는지
+    # 말해 주지 않는다 -- 기능별 경보 분리는 아직 없다.
+    draft_daily_budget_usd: float = 1.0
+
     # 예산 경보. 프로세스 로컬이라 강제력이 없다.
     # 실제 상한은 워크스페이스 spend limit이 걸고, 이 값은 경보용이다.
     daily_cost_alert_usd: float = 5.0
@@ -160,6 +197,11 @@ class Settings(BaseSettings):
 
         SDK 재시도는 0으로 꺼 두었으므로 한 ``call_tool``은 타임아웃 한 번이 상한이고,
         관점 호출만 파이프라인이 한 번 더 쏜다.
+
+        **초안(SCRUM-311)은 이 식에 들어오지 않는다.** 카프카 컨슈머 경로가 아니라 별 ASGI
+        앱의 동기 HTTP 요청이고, 같은 이벤트 루프에 두지 않는다. 그 사실을 여기 적어 두는
+        이유는 이 함수가 폴 간격과 묶여 있어서 **모델 호출을 더하면서 폴 간격을 함께 올리는
+        것을 빠뜨리는 함정을 이 레포가 이미 한 번 밟았기** 때문이다.
         """
         judge = _FANOUT_PERSPECTIVES * (2 * self.request_timeout_seconds + JUDGE_RETRY_DELAY_SECONDS)
         tail = self.request_timeout_seconds * 2  # 비평 + 수정 문구
@@ -189,9 +231,9 @@ class Settings(BaseSettings):
     def model_ids(self) -> tuple[str, ...]:
         """설정에 적힌 모델 ID 전부. 부팅에서 가격표와 맞춰 보는 데 쓴다.
 
-        요약 모델을 **반드시** 넣는다. 안 넣으면 ``validate_pricing`` 의 부팅 검증을 받지
-        못하고, 모델 ID 를 오타 내도 ``_FALLBACK_PRICING (15.0, 75.0)`` 으로 조용히 15배
-        비싸게 계상된다.
+        요약 모델과 초안 모델을 **반드시** 넣는다. 안 넣으면 ``validate_pricing`` 의 부팅
+        검증을 받지 못하고, 모델 ID 를 오타 내도 ``_FALLBACK_PRICING (15.0, 75.0)`` 으로
+        조용히 15배 비싸게 계상된다. 초안 앱은 별 프로세스지만 같은 함수로 검증한다.
         """
         return (
             self.screening_model,
@@ -200,6 +242,7 @@ class Settings(BaseSettings):
             self.triage_model,
             self.summary_extract_model,
             self.summary_narrate_model,
+            self.draft_model,
         )
 
 
