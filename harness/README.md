@@ -1,9 +1,116 @@
 # 측정 하네스
 
-러너가 둘이다.
+러너가 셋이다.
 
 - `python -m harness.run` — 선별 계층(아래 전부)
 - `python -m harness.run_summary` — 리뷰 요약(SCRUM-310). **키 없이도 리포트를 찍는다**
+- `python -m harness.run_draft` — 셀러 폼 초안(SCRUM-311). **입력 방식 결정이 여기 달려 있다**
+
+## 셀러 폼 초안 러너 (SCRUM-311)
+
+```bash
+uv run python -m harness.run_draft                         # 키 없이 도는 리포트 전부
+uv run python -m harness.run_draft --count-tokens          # 접두부 토큰 실측 (거의 무료)
+uv run python -m harness.run_draft --count-image-tokens    # 이미지 토큰 추정 치환 (유료 0회)
+uv run python -m harness.run_draft --mode a --repeat 3 --yes
+```
+
+**입력 방식이 아직 미결이다** — (가) 상품명+카테고리만 / (나) 사진 한 장. 이 러너가 그
+결정의 숫자를 낸다. 모드 다섯:
+
+| 모드 | 무엇 | 비용 |
+|---|---|---|
+| `lexicon-only` | 0단 어휘 게이트만. 모델 0회 | **0원. 키도 필요 없다** |
+| `a` | 이름 + 카테고리(주어진 대로) | (가) |
+| `a-blind` | 이름만. 카테고리를 숨긴다 | 카테고리의 한계 이득 대조군 |
+| `b` | `a` + 이미지 1장(base64) | (나) |
+| `gated` | 어휘 게이트가 확정하지 못했을 때만 이미지 | 조건부 멀티모달(제3안) |
+
+### 왜 이 비교가 공정한가
+
+(가)와 (나)는 **별 코드 경로가 아니다.** 같은 프롬프트·툴·모델·접두부를 쓰고 **이미지 블록
+하나의 유무만 다르다.** 이미지는 messages 에 들어가 tools+system 접두부를 깨지 않으므로 두
+변형이 같은 캐시 엔트리를 공유한다 — **변수가 하나다.** 즉 (가)는 별 기능이 아니라 (나)의
+축퇴이고 `imageUsability = NO_IMAGE_SENT` 로 표현된다.
+
+### 키 없이 뽑는 숫자 — 값비싼 것부터
+
+1. **`lexicon-only` 의 층별 리프 정확도.** 0원 기준선이고 (가)안의 핵심 주장이 실제 상품명
+   분포에서 성립하는지다. **현재 케이스 세트: 전체 52%(34/66), EXPLICIT 100%(28/28),
+   AMBIGUOUS 16%(3/19), OPAQUE 16%(3/19).** 읽는 법 — 0원 게이트가 품목어가 드러난 이름은
+   **전건 맞히고** 나머지는 거의 못 맞힌다. 그래서 모델의 일은 정확히 AMBIGUOUS + OPAQUE
+   두 층이고, 모델이 거기서 0단을 넘기지 못하면 그 호출은 비용만 더한다(기계적 중단 규칙).
+2. **`OPAQUE` 층 비중 = 이미지 이득의 천장.** 현재 19/72건(26%). 그 층이 얇으면 이미지의
+   최대 이득도 그만큼 얇다 — **키 없이 이미지 결정의 상한을 먼저 아는 길이다.**
+3. 게이트 등급 x 카테고리 교차표와 **모델 0회 건수**(현재 16/72, 22% — 전부 0원).
+4. **사전 미적중 목록.** 2층 수기 동의어를 추측으로 채우지 말고 이 목록에서 받는다.
+5. 가드 겹별 작동. **정책 효능 위반 예시 8건 중 0단이 잡는 것 0건 / 효능 사전이 8건** —
+   그 0 이 `app/seller_draft/claims.py` 를 새로 만든 이유다.
+6. 봉투 조립 검증과 접두부 글자 수(토큰 수가 아니다).
+7. 비용 추정. `--yes` 없이는 추정만 찍고 멈춘다.
+
+측정 전 자기검사가 **여덟 가지**를 보고 하나라도 어긋나면 종료 코드 1이다. 그 가운데 둘이
+특히 중요하다 — 층 라벨(`name_reveals`)이 실제 `catalog.resolve()` 결과와 같은가(라벨은
+사람 직관이고 게이트는 코드다. 어긋나면 **모든 층별 숫자가 거짓이다**), 그리고 리프 표가
+커밋된 시드 사본과 같은가.
+
+### 비용 전제 — 전부 추정이고 실측이 아니다
+
+Haiku 4.5 기준: 텍스트 4,590uUSD(**6.43원**) / +896 사방 이미지 5,614uUSD(**7.86원, +22%**) /
+품목 미식별 **0원**. 이미지 증분 비율과 일 상한은 **상수로 적지 않고 비용표에서 파생시키고
+테스트가 그 파생을 고정한다.**
+
+**출력 토큰이 이미지보다 큰 레버다.** 출력 300 -> 900 증분이 896 이미지 전체의 약 3배다 —
+"이미지를 넣을 것인가"는 비용 문제로서는 두 번째 레버이고, 첫째는 설명 길이 상한이다.
+
+접두부 캐시는 요약과 같은 이유로 **기본 모델에서 쓰지 못한다**(Haiku 하한 4,096토큰).
+하한 미달이 실패가 아니라 근거이고(`required=False`), Sonnet 으로 뒤집으면 `required=True`
+로 바뀐다. 대상은 **system + 고정 tool 둘 다**다 — tools 가 접두부에 함께 캐시되므로
+system 만 세면 둘 중 어느 것도 재지 않는 셈이다.
+
+### 이미지 픽스처는 커밋하지 않는다
+
+50 케이스 x 5 등급 JPEG 이 레포를 수십 MB 불린다. `harness/draft_images/` 는 gitignore 고
+`harness/make_draft_images.sh` 만 커밋한다. 없으면 `b`·`gated` 모드를 **건너뛰고 이유를
+적고 종료 코드 0** 이다 — 조용히 비어 있는 것이 더 나쁘다. 그래서 **"키만 들어오면 바로
+돈다"는 약속이 이미지 모드에는 해당되지 않는다**: 사진 준비가 선결이고 그 품질이 측정
+결과를 좌우한다.
+
+### 키가 들어오면 돌리는 순서
+
+```bash
+export AECHAK_AI_ANTHROPIC_API_KEY=sk-ant-...
+
+uv run python -m harness.run_draft --count-tokens                       # 1) 접두부 토큰
+uv run python -m harness.run_draft --count-image-tokens                 # 2) 이미지 토큰
+uv run python -m harness.run_draft --mode lexicon-only                  # 3) 0원 기준선
+uv run python -m harness.run_draft --mode a --repeat 3 --yes
+uv run python -m harness.run_draft --mode a-blind --repeat 3 --yes
+uv run python -m harness.run_draft --mode b --repeat 3 --yes
+uv run python -m harness.run_draft --mode gated --repeat 3 --yes
+uv run python -m harness.run_draft --mode a --model sonnet --repeat 3 --yes
+uv run python -m harness.run_draft --mode b --variant 640 --yes
+```
+
+산출물은 `harness/out/draft-<모드>-<모델>-<해상도>-<타임스탬프>/{raw.jsonl,summary.tsv}` 다.
+층별 한계 이득은 앞선 모드의 `raw.jsonl` 을 `--compare-from` 으로 넘겨 계산한다.
+
+### 그 표를 사람이 어떻게 읽는가
+
+- 이미지 한계 이득이 **`OPAQUE` 층에서만** 크고 다른 층에서 0 에 가까우면 → **`gated`**.
+  그때 이미지 비용은 `OPAQUE` 층 비중만큼만 든다.
+- 세 층 전부에서 작으면 → **`OFF`(가).** 증분 1.43원을 아끼는 것이 아니라 **운영 표면과
+  사진 품질 의존성을 아예 들이지 않는 것**이 이득이다.
+- 세 층 전부에서 크면 → **`ALWAYS`(나).** 비용 증분이 +22% 이므로 정확도 이득이 그만큼이면
+  정당하다.
+- **오사진 안전율이 낮으면(`WRONG` 사진에서 `MISMATCHES_NAME` 을 못 내고 초안을 써 버리면)
+  정확도 숫자와 무관하게 이미지를 켜지 않는다.** 그것은 비용 문제가 아니라 거짓 문제다.
+
+**(나) 쪽에 기계적 손익분기를 만들 수 없고, 만든 척하지 않는다.** 틀린 리프 하나의 값
+(셀러가 카테고리를 다시 고르는 수고)이 돈으로 환산되지 않는다. 대신 측정 후 파생되는
+"이미지로 추가로 맞힌 1건당 비용"과 비용 증분율을 나란히 찍고 **사람이 정한다.**
+
+---
 
 ## 리뷰 요약 러너 (SCRUM-310)
 
