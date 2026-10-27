@@ -29,8 +29,10 @@
   header p { margin: 0; color: var(--muted); font-size: 12.5px; }
   main { display: grid; grid-template-columns: 340px 1fr; gap: 0; align-items: start; }
   @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
-  #controls { padding: 18px; border-right: 1px solid var(--line); position: sticky; top: 0; }
-  #results { padding: 18px 22px 60px; min-width: 0; }
+  /* 기능 탭이 둘이라 같은 레이아웃을 두 번 쓴다. id 로 두면 중복 id 가 되고 CSS 가
+     첫 섹션만 칠한다. 레이아웃은 클래스로, 자바스크립트가 집는 것만 id 로 둔다. */
+  .controls { padding: 18px; border-right: 1px solid var(--line); position: sticky; top: 0; }
+  .results { padding: 18px 22px 60px; min-width: 0; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 22px 0 8px; }
   h2:first-child { margin-top: 0; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
@@ -104,19 +106,56 @@
   details summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   .legend { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
   .hidden { display: none; }
+  /* --- 기능 탭 (검수 / 리뷰 요약) ------------------------------------------------ */
+  .tabs { display: flex; gap: 6px; padding: 0 22px; border-bottom: 1px solid var(--line); }
+  .tabs button {
+    border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+    background: none; padding: 9px 12px; color: var(--muted); font-size: 13px; font-weight: 600;
+  }
+  .tabs button:hover { border-color: var(--line); color: var(--text); }
+  .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+  /* --- 요약 화면 전용 --------------------------------------------------------------
+     결과 축(장점/단점)과 **문장이 없는 축**을 색 어휘로 가른다. 통과·미검사 색을
+     그대로 쓰면 "반복이라 셌는데 문장이 없다"가 "단점 없음"과 같은 색이 된다. */
+  .pill.pro { color: var(--clear); border-color: var(--clear); }
+  .pill.con { color: var(--violation); border-color: var(--violation); }
+  .pill.counted { color: var(--skipped); border-color: var(--skipped); border-style: dashed; }
+  .pill.free { color: var(--muted); border-color: var(--line); }
+  .pill.loud { color: var(--warn); border-color: var(--warn); }
+  .aspect { border-left: 2px solid var(--line); padding: 6px 0 6px 10px; margin-top: 8px; }
+  .aspect.pro { border-left-color: var(--clear); }
+  .aspect.con { border-left-color: var(--violation); }
+  .aspect .head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+  .aspect .head b { font-size: 13.5px; }
+  .aspect .count { color: var(--muted); font-size: 12px; }
+  .aspect blockquote {
+    margin: 5px 0 0; padding-left: 9px; border-left: 1px solid var(--line);
+    color: var(--muted); font-size: 12.5px;
+  }
+  .absence { margin: 8px 0 0; padding: 8px 10px; border-radius: 7px;
+    background: var(--panel-2); border: 1px solid var(--skipped); color: var(--text); font-size: 12.5px; }
+  .absence small { display: block; color: var(--muted); margin-top: 3px; }
+  .review { border-top: 1px solid var(--line); padding: 8px 0; font-size: 12.5px; }
+  .review:first-child { border-top: 0; }
+  .review .rid { font-weight: 600; margin-right: 7px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>애착 검수 데모 콘솔 <span class="note">SCRUM-290</span></h1>
-  <p>
+  <h1>애착 AI 데모 콘솔 <span class="note">SCRUM-290 / SCRUM-310</span></h1>
+  <p id="feature-note">
     상품 정보나 리뷰가 N0 규칙부터 N5 확정까지 어디를 지나는지 단계별로 본다.
     기본 모드는 모델을 부르지 않는 재생이다. 어드민 검수 화면은 이쪽 범위가 아니다(SCRUM-283).
   </p>
 </header>
 
-<main>
-  <section id="controls">
+<nav class="tabs">
+  <button id="feature-inspection" class="on" data-feature="inspection">콘텐츠 검수</button>
+  <button id="feature-summary" data-feature="summary">리뷰 요약</button>
+</nav>
+
+<main id="main-inspection">
+  <section class="controls">
     <h2>모드</h2>
     <div class="panel">
       <div class="modes">
@@ -177,9 +216,54 @@
     <p class="note" id="status"></p>
   </section>
 
-  <section id="results">
+  <section class="results">
     <p class="note" id="empty">왼쪽에서 시나리오를 고르고 돌려라.</p>
     <div id="out" class="hidden"></div>
+  </section>
+</main>
+
+<main id="main-summary" class="hidden">
+  <section class="controls">
+    <h2>모드</h2>
+    <div class="panel">
+      <div class="modes">
+        <button id="smode-replay" class="primary" data-smode="replay">재생 (카세트)</button>
+        <button id="smode-live" data-smode="live">라이브</button>
+      </div>
+      <p class="note" id="smode-note"></p>
+    </div>
+
+    <div id="spanel-replay">
+      <h2>시나리오</h2>
+      <div class="panel" id="summary-scenario-list"></div>
+    </div>
+
+    <div id="spanel-live" class="hidden">
+      <h2>리뷰 입력</h2>
+      <div class="panel">
+        <label>리뷰 (한 줄에 한 건, "별점|본문")</label>
+        <textarea id="summary-reviews" style="min-height:170px;">5|우리 15kg 코카가 아주 잘 먹어요. 알이 작아서 먹기 편한가 봐요.
+4|기호성은 좋습니다. 잘 먹어요. 다만 비린 냄새가 좀 납니다.
+5|잘 먹어서 재구매했어요. 냄새는 조금 나는 편입니다.
+2|냄새가 너무 심해서 결국 못 먹였습니다.
+5|배송 빨라요. 아이가 잘 먹습니다.</textarea>
+        <label>카테고리</label>
+        <input id="summary-category" type="text" value="강아지 > 사료 > 건식사료" />
+        <label>분모 (가시 리뷰 수)</label>
+        <input id="summary-basis" type="text" value="20" />
+      </div>
+    </div>
+
+    <h2>임계</h2>
+    <div class="panel"><p class="note" id="summary-thresholds"></p></div>
+
+    <button id="summary-run" class="primary" style="width:100%; padding:9px;">돌린다</button>
+    <p class="note" id="summary-status"></p>
+  </section>
+
+  <section class="results">
+    <p class="note" id="summary-empty">왼쪽에서 시나리오를 고르고 돌려라.</p>
+    <div id="summary-out" class="hidden"></div>
   </section>
 </main>
 
@@ -600,7 +684,399 @@ function renderRaw(verdict) {
   return wrap;
 }
 
+/* ===================== 리뷰 요약 (SCRUM-310) =====================================
+
+   검수 화면과 렌더 함수를 공유하지 않는다. 단계가 다르고(N0/N1/N3), 보여 줘야 하는
+   구분도 다르다 -- 검수는 통과와 미검사를 가르고, 요약은 **"없다"와 "셌는데 문장이
+   없다"** 를 가른다. 같은 함수에 넣으면 한쪽 어휘가 다른 쪽을 가린다.
+   ============================================================================== */
+
+const sstate = { mode: "replay", scenario: null, meta: null };
+
+function setFeature(feature) {
+  ["inspection", "summary"].forEach((f) => {
+    $("feature-" + f).classList.toggle("on", f === feature);
+    $("main-" + f).classList.toggle("hidden", f !== feature);
+  });
+  $("feature-note").textContent =
+    feature === "inspection"
+      ? "상품 정보나 리뷰가 N0 규칙부터 N5 확정까지 어디를 지나는지 단계별로 본다. 기본 모드는 모델을 부르지 않는 재생이다."
+      : "리뷰 묶음이 입력 게이트 -> 추출 -> 집계 -> 서술 -> 출력 게이트를 지나는 동안 무엇이 남고 무엇이 떨어지는지 본다. \"반복된다\"의 판정은 전부 코드가 한다.";
+}
+
+["inspection", "summary"].forEach((f) => {
+  $("feature-" + f).onclick = () => setFeature(f);
+});
+
+async function bootSummary() {
+  const meta = await (await fetch("/api/summary/scenarios")).json();
+  sstate.meta = meta;
+  const list = $("summary-scenario-list");
+  meta.scenarios.forEach((s) => {
+    const button = el("button", "scenario");
+    button.appendChild(el("strong", null, s.title));
+    button.appendChild(el("small", null, s.note));
+    button.onclick = () => {
+      sstate.scenario = s.id;
+      [...list.children].forEach((c) => c.classList.remove("on"));
+      button.classList.add("on");
+    };
+    list.appendChild(button);
+  });
+  if (meta.scenarios.length) list.children[0].click();
+
+  const d = meta.defaults;
+  $("summary-thresholds").textContent =
+    "상품 요약 최소 " + d.minReviews + "건 / 세그먼트 최소 " + d.minSegmentReviews +
+    "건 / 항목 최소 " + d.minAspectMentions + "건 또 " + Math.round(d.minAspectShare * 100) +
+    "% / 본문 " + d.contentChars + "자 절단. 추출 " + d.extractModel + " · 서술 " + d.narrateModel +
+    ". 운영 기본값: " + (d.enabled ? "켜짐" : "꺼짐");
+
+  if (!meta.liveAvailable) {
+    $("smode-live").disabled = true;
+    $("smode-live").title = "AECHAK_AI_ANTHROPIC_API_KEY 가 없다";
+  }
+  setSummaryMode("replay");
+}
+
+function setSummaryMode(mode) {
+  sstate.mode = mode;
+  ["replay", "live"].forEach((m) => {
+    $("smode-" + m).classList.toggle("primary", m === mode);
+  });
+  $("spanel-replay").classList.toggle("hidden", mode !== "replay");
+  $("spanel-live").classList.toggle("hidden", mode !== "live");
+  $("smode-note").textContent =
+    mode === "replay"
+      ? "기록된 호출 응답으로 서비스를 그대로 돌린다. 모델을 부르지 않고 비용이 0이다."
+      : "실제 모델을 부른다. 돈이 든다. 키가 있을 때만 켜진다.";
+}
+
+["replay", "live"].forEach((m) => {
+  $("smode-" + m).onclick = () => setSummaryMode(m);
+});
+
+$("summary-run").onclick = async () => {
+  $("summary-status").textContent = "돌리는 중...";
+  const body =
+    sstate.mode === "replay"
+      ? { mode: "replay", scenario: sstate.scenario }
+      : {
+          mode: "live",
+          reviews: $("summary-reviews").value.split("\n").map((s) => s.trim()).filter(Boolean),
+          categoryPath: $("summary-category").value.split(">").map((s) => s.trim()).filter(Boolean),
+          basisReviewCount: Number($("summary-basis").value) || 20,
+        };
+  try {
+    const response = await fetch("/api/summary", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+      $("summary-status").textContent = "오류: " + (data.error || response.status);
+      return;
+    }
+    $("summary-status").textContent = "";
+    renderSummary(data.view, data.message);
+  } catch (error) {
+    $("summary-status").textContent = "오류: " + error;
+  }
+};
+
+function renderSummary(view, message) {
+  $("summary-empty").classList.add("hidden");
+  const out = $("summary-out");
+  out.classList.remove("hidden");
+  out.textContent = "";
+
+  out.appendChild(summaryHead(view));
+  out.appendChild(summaryStages(view));
+  view.scopes.forEach((scope) => out.appendChild(summaryScope(scope)));
+  if (view.dropped.length) out.appendChild(summaryDropped(view));
+  out.appendChild(summaryReviews(view));
+  if (view.envelope_text) out.appendChild(summaryEnvelope(view));
+  out.appendChild(summaryLedger(view));
+  out.appendChild(summaryRaw(message));
+}
+
+function summaryHead(view) {
+  const [wrap, panel] = section("탈출 지점");
+  const row = el("div", "exit");
+  row.appendChild(el("span", "badge", view.exit_label));
+  row.appendChild(el("span", "verdict", "상태 " + view.state));
+  row.appendChild(pill("free", "추출 " + view.reviews_extracted + "건"));
+  if (view.reviews_unextracted) {
+    // **분석되지 않은 리뷰 수를 반드시 띄운다.** 안 띄우면 분모가 전수로 읽힌다.
+    row.appendChild(pill("counted", "분석되지 않음 " + view.reviews_unextracted + "건"));
+  }
+  panel.appendChild(row);
+  panel.appendChild(el("p", "note", view.exit_note));
+  panel.appendChild(
+    el("p", "note", "버전 " + view.extract_version + " / " + view.narrate_version +
+      " · 모드 " + view.mode + " (" + view.source + ")")
+  );
+  return wrap;
+}
+
+function summaryStages(view) {
+  const [wrap, panel] = section("단계");
+  if (!view.stages.length) {
+    // 추적이 없으면 **거짓 단계를 그리지 않는다.** 요약 결과에는 단계가 없어서
+    // 되살릴 재료가 없고, 억지로 만들면 화면이 추측을 사실처럼 그린다.
+    panel.appendChild(el("p", "note", "추적이 없어 단계를 그릴 수 없다. 결과 메시지에는 단계가 남지 않는다."));
+    return wrap;
+  }
+  view.stages.forEach((stage) => {
+    const row = el("div", "stage " + stage.status.toLowerCase());
+    const name = el("div", "name", stage.label);
+    if (stage.scope) name.appendChild(el("span", null, stage.scope));
+    row.appendChild(name);
+
+    const body = el("div");
+    const pills = el("div", "pills");
+    pills.appendChild(pill(stage.status.toLowerCase(), stage.status_label));
+    pills.appendChild(pill(stage.paid ? "cache-hit" : "free", stage.paid ? "모델 호출" : "0원 단계"));
+    if (stage.outcome && stage.outcome !== "SUCCESS") pills.appendChild(pill("failed", stage.outcome));
+    body.appendChild(pills);
+
+    if (stage.note) body.appendChild(el("div", "why", stage.note));
+    if (stage.detail) body.appendChild(el("div", "warn", stage.detail));
+    const counts = Object.entries(stage.counts).filter(([, v]) => v);
+    if (counts.length) {
+      body.appendChild(el("div", "why", counts.map(([k, v]) => k + "=" + v).join(" · ")));
+    }
+    if (stage.paid) {
+      body.appendChild(
+        el("div", "why",
+          stage.model_id + " · " + stage.latency_ms + "ms · " +
+          money(stage.cost_micro_usd || 0, stage.cost_krw) +
+          " · 입력 " + (stage.input_tokens || 0) + " / 캐시읽기 " +
+          (stage.cache_read_input_tokens || 0) + " / 출력 " + (stage.output_tokens || 0))
+      );
+    }
+    stage.dropped.forEach((d) => {
+      const item = el("div", "finding dropped");
+      item.appendChild(el("b", null, d.reason + " "));
+      item.appendChild(document.createTextNode(d.detail));
+      body.appendChild(item);
+    });
+    row.appendChild(body);
+    panel.appendChild(row);
+  });
+  return wrap;
+}
+
+function summaryScope(scope) {
+  const title = scope.scope === "SEGMENT" ? "세그먼트 요약 — " + scope.segment_key : "상품 요약";
+  const [wrap, panel] = section(title);
+
+  const meta = el("div", "pills");
+  meta.appendChild(pill("free", "분모 " + scope.basis_review_count + "건"));
+  if (scope.unextracted_review_count) {
+    meta.appendChild(pill("counted", "분석 안 됨 " + scope.unextracted_review_count + "건"));
+  }
+  if (scope.tally_fingerprint) {
+    meta.appendChild(pill("free", "집계 지문 " + scope.tally_fingerprint.slice(0, 8)));
+  }
+  panel.appendChild(meta);
+
+  if (scope.not_enough_reason) {
+    const box = el("div", "absence");
+    box.appendChild(el("b", null, "요약을 만들기에 리뷰가 아직 적습니다"));
+    box.appendChild(el("small", null, scope.not_enough_reason + " — 모델을 0회 불렀다."));
+    panel.appendChild(box);
+  }
+  if (scope.narrate_failure) {
+    const box = el("div", "absence");
+    box.appendChild(el("b", null, "센 숫자는 있지만 문장이 없습니다"));
+    box.appendChild(el("small", null, scope.narrate_failure + " — 단점 없음이 아니다."));
+    panel.appendChild(box);
+  }
+
+  panel.appendChild(aspectBlock("장점", "pro", scope.pros));
+  panel.appendChild(aspectBlock("단점", "con", scope.cons));
+
+  if (!scope.cons.length && scope.cons_absence_sentence) {
+    // **"없다"와 "못 찾았다"를 가른 문장을 그대로 띄운다.**
+    const box = el("div", "absence");
+    box.appendChild(el("b", null, scope.cons_absence_sentence));
+    box.appendChild(el("small", null, "사유 코드 " + scope.cons_absence_reason));
+    panel.appendChild(box);
+  }
+
+  if (scope.counted.length) {
+    panel.appendChild(el("h2", null, "문장이 없는 항목"));
+    scope.counted.forEach((row) => {
+      const item = el("div", "aspect " + (row.kind === "UNNARRATED" ? "con" : ""));
+      const head = el("div", "head");
+      head.appendChild(el("b", null, row.aspect_code + " / " + row.polarity));
+      head.appendChild(el("span", "count", row.mention_count + "건"));
+      head.appendChild(pill(row.kind === "UNNARRATED" ? "loud" : "counted", row.kind_label));
+      item.appendChild(head);
+      if (row.labels.length) item.appendChild(el("div", "why", row.labels.join(" | ")));
+      panel.appendChild(item);
+    });
+  }
+  return wrap;
+}
+
+function aspectBlock(label, cls, items) {
+  const wrap = el("div");
+  wrap.appendChild(el("h2", null, label));
+  if (!items.length) {
+    wrap.appendChild(el("p", "note", label + "으로 실린 항목이 없다."));
+    return wrap;
+  }
+  items.forEach((item) => {
+    const row = el("div", "aspect " + cls);
+    const head = el("div", "head");
+    head.appendChild(el("b", null, item.headline));
+    head.appendChild(
+      el("span", "count",
+        item.aspect_code + " · " + item.mention_count + "건 (" +
+        Math.round(item.mention_share * 1000) / 10 + "%)")
+    );
+    row.appendChild(head);
+    item.quotes.forEach((q) => {
+      row.appendChild(el("blockquote", null, "리뷰 " + q.reviewId + ": " + q.text));
+    });
+    if (!item.quotes.length) {
+      row.appendChild(el("div", "warn", "인용이 전부 검증에 실패해 근거가 없다"));
+    }
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+function summaryDropped(view) {
+  const [wrap, panel] = section("떨어진 것");
+  view.dropped.forEach((d) => {
+    const row = el("div", "stage");
+    const name = el("div", "name", d.count + "건");
+    name.appendChild(el("span", null, d.key));
+    row.appendChild(name);
+    const body = el("div");
+    if (d.loud) body.appendChild(pill("loud", "반드시 확인"));
+    body.appendChild(el("div", "why", d.label));
+    row.appendChild(body);
+    panel.appendChild(row);
+  });
+  return wrap;
+}
+
+function summaryReviews(view) {
+  const [wrap, panel] = section("리뷰별 추출 결과");
+  view.reviews.forEach((r) => {
+    const row = el("div", "review");
+    const head = el("div");
+    head.appendChild(el("span", "rid", "리뷰 " + r.review_id));
+    // **"추출됨"과 "분석되지 않음"을 같은 색으로 그리지 않는다.**
+    head.appendChild(pill(r.status === "EXTRACTED" ? "pro" : "counted", r.status_label));
+    if (r.exclude_reason) head.appendChild(pill("loud", r.exclude_reason));
+    if (r.truncated) head.appendChild(pill("counted", "본문 절단"));
+    row.appendChild(head);
+    if (r.note) row.appendChild(el("div", "warn", r.note));
+    r.aspects.forEach((a) => {
+      const item = el("div", "aspect " + (a.polarity === "PRO" ? "pro" : "con"));
+      const ahead = el("div", "head");
+      ahead.appendChild(el("b", null, a.aspectLabel));
+      ahead.appendChild(el("span", "count", a.aspectCode + " / " + a.polarity));
+      item.appendChild(ahead);
+      item.appendChild(el("blockquote", null, a.quote));
+      row.appendChild(item);
+    });
+    if (r.pet_context) {
+      const pet = el("div", "why");
+      pet.appendChild(el("b", null, "본문 추측 펫 "));
+      pet.appendChild(document.createTextNode(
+        [r.pet_context.species, r.pet_context.breedLabel,
+         r.pet_context.weightKg ? r.pet_context.weightKg + "kg" : null,
+         r.pet_context.ageYears ? r.pet_context.ageYears + "살" : null]
+          .filter(Boolean).join(" / ")));
+      row.appendChild(pet);
+      // 단정이 아니라 **인용 그대로** 보여 준다. 세그먼트 분모에는 들어가지 않는다.
+      row.appendChild(el("blockquote", null, "본문: " + r.pet_context.quote));
+    }
+    panel.appendChild(row);
+  });
+  return wrap;
+}
+
+function summaryEnvelope(view) {
+  const wrap = el("div");
+  const details = el("details");
+  details.appendChild(el("summary", null, "모델이 실제로 본 봉투 (중성화·레닥션·절단 후)"));
+  details.appendChild(el("pre", null, view.envelope_text));
+  Object.entries(view.tally_text).forEach(([scope, text]) => {
+    details.appendChild(el("p", "note", "서술 입력 [" + scope + "] — 리뷰 본문이 한 글자도 없다"));
+    details.appendChild(el("pre", null, text));
+  });
+  wrap.appendChild(details);
+  return wrap;
+}
+
+function summaryLedger(view) {
+  const [wrap, panel] = section("원장");
+  const ledger = view.ledger;
+  if (!ledger || !ledger.calls.length) {
+    panel.appendChild(el("p", "note", "모델 호출이 없다. 0원이다."));
+    return wrap;
+  }
+  const table = el("table");
+  const thead = el("thead");
+  const hrow = el("tr");
+  ["단계", "모델", "입력", "캐시읽기", "출력", "비용", "지연", "결과"].forEach((h) =>
+    hrow.appendChild(el("th", null, h))
+  );
+  thead.appendChild(hrow);
+  table.appendChild(thead);
+  const tbody = el("tbody");
+  ledger.calls.forEach((c) => {
+    const row = el("tr");
+    [c.stage, c.modelId, c.inputTokens, c.cacheReadInputTokens, c.outputTokens,
+     money(c.costMicroUsd, c.costKrw), c.latencyMs + "ms", c.outcome]
+      .forEach((v) => row.appendChild(el("td", null, v)));
+    tbody.appendChild(row);
+  });
+  table.appendChild(tbody);
+  const tfoot = el("tfoot");
+  const frow = el("tr");
+  ["합", "", ledger.total_input_tokens, ledger.total_cache_read_tokens,
+   ledger.total_output_tokens, money(ledger.total_cost_micro_usd, ledger.total_cost_krw),
+   ledger.total_latency_ms + "ms", ""]
+    .forEach((v) => frow.appendChild(el("td", null, v)));
+  tfoot.appendChild(frow);
+  table.appendChild(tfoot);
+  const scroll = el("div", "wrap");
+  scroll.appendChild(table);
+  panel.appendChild(scroll);
+  panel.appendChild(
+    el("p", "note",
+      "추출 " + money(ledger.extract_cost_micro_usd, ledger.extract_cost_micro_usd * sstate.meta.defaults.krwPerUsd / 1000000) +
+      " · 서술 " + money(ledger.narrate_cost_micro_usd, ledger.narrate_cost_micro_usd * sstate.meta.defaults.krwPerUsd / 1000000) +
+      ". 추출은 리뷰당 평생 1회이고 서술 비용은 리뷰 수에 무관하다.")
+  );
+  panel.appendChild(
+    el("p", "note",
+      "캐시 적중 " + ledger.cache_reads + "회 — Haiku 4.5 의 최소 캐시 접두부가 4,096토큰이라 " +
+      "요약 프롬프트는 캐시되지 않는다. 0 이 정상이다.")
+  );
+  return wrap;
+}
+
+function summaryRaw(message) {
+  const wrap = el("div");
+  const details = el("details");
+  details.appendChild(el("summary", null, "백엔드로 나가는 요약 메시지 (ReviewSummaryMessage)"));
+  details.appendChild(el("pre", null, JSON.stringify(message, null, 2)));
+  wrap.appendChild(details);
+  return wrap;
+}
+
 boot();
+bootSummary();
 </script>
 </body>
 </html>
