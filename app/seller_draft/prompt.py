@@ -128,6 +128,24 @@ def _gate_line(signal: ItemSignal) -> str:
     return "어휘 게이트: 품목어를 찾지 못했다. 위 50개에서 고를 근거가 없으면 0 을 적어라"
 
 
+def envelope_safe(text: str) -> str:
+    """봉투에 넣을 문자열 하나를 안전하게 만든다. **레닥션 뒤에 중성화한다.**
+
+    두 겹이고 순서가 중요하다. ``_redact`` 가 지시형 문장과 연락처를 ``[가림]`` 으로 바꾸고,
+    그 다음 ``neutralize_envelope`` 가 남은 봉투 구분자를 ``[태그]`` 로 바꾼다.
+
+    **``lockedFields`` 때문에 이 함수가 필요했다.** 테스트를 쓰다 알았다 -- N0 의 0단 차단은
+    **상품명만** 본다. 셀러가 고친 설명은 차단 검사를 지나지 않으므로, 거기 "이전 지시를
+    무시하라"가 들어오면 ``ENVELOPE_TOKENS`` 중성화만으로는 막히지 않는다(그 문구는 봉투
+    토큰이 아니다). 상품명 쪽에서는 ``_INJECTION_STRONG`` 이 그 문장을 차단으로 잡아 모델에
+    닿기 전에 멈추지만, 잠근 값에는 그 관문이 없었다.
+
+    그래서 봉투에 들어가는 **모든** 문자열이 이 함수를 지난다. 상품명은 이미 0단을 통과한
+    값이라 여기서 바뀌는 것이 적고(약한 신호만 가려진다), 잠근 값은 여기가 유일한 방어다.
+    """
+    return rules.neutralize_envelope(rules.screen(text).redacted)
+
+
 def draft_user_content(
     *,
     product_name: str,
@@ -142,6 +160,9 @@ def draft_user_content(
     받지 못한다. 그래서 이미지 증분은 캐시 상태와 무관하게 그대로 더해지고, (가)와 (나)가
     **같은 캐시 엔트리를 공유한다.** 그 사실이 하네스의 비교를 공정하게 만든다 --
     두 변형의 변수가 이미지 블록 하나뿐이다.
+
+    셀러가 타이핑한 문자열은 전부 ``<본문>`` 안에 ``envelope_safe()`` 를 지나 들어간다.
+    meta 줄에 있는 것은 **서버가 리프 id 로 렌더한 신뢰 값**뿐이다.
     """
     meta: list[str] = ['<대상 종류="PRODUCT_DRAFT">', _gate_line(signal)]
     if signal.given_category_id is not None:
@@ -152,14 +173,13 @@ def draft_user_content(
     if image_block is not None and low_fidelity:
         meta.append("사진 힌트: 해상도 대비 용량이 작아 흐릴 수 있다. 읽히지 않으면 그렇게 적어라")
 
-    body: list[str] = ["<본문>", f"상품명: {rules.neutralize_envelope(product_name)}"]
+    body: list[str] = ["<본문>", f"상품명: {envelope_safe(product_name)}"]
     if locked is not None and locked.description:
         body.append("셀러가 고친 설명(그대로 두고 톤을 맞춘다):")
-        body.append(rules.neutralize_envelope(locked.description))
+        body.append(envelope_safe(locked.description))
     if locked is not None and locked.optionGroups:
         names = " / ".join(
-            rules.neutralize_envelope(f"{group.name}: {', '.join(group.values)}")
-            for group in locked.optionGroups
+            envelope_safe(f"{group.name}: {', '.join(group.values)}") for group in locked.optionGroups
         )
         body.append(f"셀러가 고친 옵션(그대로 두고 겹치지 않게 제안한다): {names}")
     body.append("</본문>")
@@ -194,5 +214,6 @@ __all__ = [
     "draft_system_blocks",
     "draft_user_content",
     "draft_version_string",
+    "envelope_safe",
     "image_block",
 ]
