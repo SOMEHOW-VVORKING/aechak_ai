@@ -212,6 +212,10 @@ class RequestedScope(BaseModel):
     basisReviewCount: int = 0
     # 백엔드가 "추출 결과를 아직 받지 못한" 리뷰로 센 수다. **AI 가 이번 회차에 못 읽은
     # 리뷰는 여기 들어 있지 않다** -- 그것은 AI 가 더한다(``ScopeSummary`` 주석 참조).
+    #
+    # 그래서 **이 메시지의 ``newReviews`` 에 든 리뷰는 이 수에서 빼야 한다.** 전에 추출이
+    # 실패한 리뷰를 다시 보내면서 이 수에도 그대로 남겨 두면 같은 리뷰가 두 번 빠져 분모가
+    # 실제보다 작아진다. 손해 방향은 안전하지만(반복 항목이 덜 나온다) 숫자는 거짓이다.
     unextractedReviewCount: int = 0
     tally: list[AspectTallyRow] = Field(default_factory=list)
 

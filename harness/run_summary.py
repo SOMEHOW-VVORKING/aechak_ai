@@ -40,6 +40,7 @@ from typing import Any
 
 import anthropic
 
+from app.llm.client import cost_micro_usd
 from app.review_summary import envelope as env
 from app.review_summary import selection
 from app.review_summary import tally as tally_mod
@@ -66,17 +67,45 @@ from harness.summary_cases import PRODUCTS, VIEWERS, ProductCase, reviewer_popul
 
 OUT_ROOT = Path(__file__).parent / "out"
 
-# 건당 추정 microUSD. **추정이고 실측이 아니다.** ``--count-tokens`` 는 접두부 토큰만
-# 치환하고 이 표를 치환하지 않는다 -- 출력 토큰 전제까지 재려면 실호출이 필요하다.
+# 건당 추정의 **토큰 가정값**. ``--count-tokens`` 가 치환하는 지점이 여기 한 곳이다.
 #
 # 전제: 한국어 1토큰/글자, 추출 접두부 ~1,800 / 서술 접두부 ~1,500, 리뷰 1건 입력 425,
-# 추출 출력 리뷰당 200, 서술 입력(집계표) 2,300, 서술 출력 700. Haiku 4.5 $1/$5.
-_SUMMARY_ESTIMATE_MICRO_USD = {
-    # 배치 10건 한 번.
-    "extract_batch_10": 16_050,
+# 추출 출력 리뷰당 200, 서술 입력(집계표) 2,300, 서술 출력 700.
+_SUMMARY_TOKEN_ASSUMPTIONS = {
+    # 배치 10건 한 번. 접두부 1,800 + 리뷰 10건 x 425 = 6,050 입력 / 10 x 200 출력.
+    "extract_batch_10": {"input_tokens": 6_050, "output_tokens": 2_000},
     # 리뷰 수에 **무관하다.** 입력이 상한 고정 집계표이기 때문이다.
-    "narrate_once": 7_300,
+    "narrate_once": {"input_tokens": 3_800, "output_tokens": 700},
 }
+
+
+def _estimate_micro_usd() -> dict[str, int]:
+    """건당 추정 microUSD. **단가 정본 함수에서 파생한다. 상수로 적지 않는다.**
+
+    처음 판은 손계산한 microUSD 를 적어 뒀고 ``cost_micro_usd()`` 를 한 번도 부르지
+    않았다. 값은 맞았지만 연결이 없어서, ``client._PRICING`` 을 고치는 날(그 주석이
+    "모델 확정 시 공식 단가로 재확인한다"고 예고한다) 이 표의 모든 비용 줄과 일 예산
+    상한이 **조용히 과거 값으로 남고 테스트는 전부 초록**이었다. 지금은 토큰 가정값만
+    상수이고 돈은 전부 여기서 계산된다.
+    """
+    settings = Settings()
+    return {
+        "extract_batch_10": cost_micro_usd(
+            settings.summary_extract_model,
+            cache_read=0,
+            cache_creation=0,
+            **_SUMMARY_TOKEN_ASSUMPTIONS["extract_batch_10"],
+        ),
+        "narrate_once": cost_micro_usd(
+            settings.summary_narrate_model,
+            cache_read=0,
+            cache_creation=0,
+            **_SUMMARY_TOKEN_ASSUMPTIONS["narrate_once"],
+        ),
+    }
+
+
+_SUMMARY_ESTIMATE_MICRO_USD = _estimate_micro_usd()
 
 # 요약 몫의 일 예산. 설정 정본은 ``Settings.summary_daily_budget_usd`` 다.
 _DAILY_BUDGET_USD = Settings().summary_daily_budget_usd

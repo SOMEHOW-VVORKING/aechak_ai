@@ -191,3 +191,21 @@ def test_케이스마다_설명이_붙어_있다(case: object) -> None:
     """라벨만 있고 왜 그 라벨인지가 없으면 다음 사람이 기대값을 고치는 쪽으로 간다."""
     note = getattr(case, "note", "")
     assert len(note) > 10, getattr(case, "id", case)
+
+
+def test_요약_비용표가_단가_정본에서_파생된다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run_draft`` 쪽과 같은 이유다 -- 표 아래쪽만 파생이고 표 자체가 상수였다."""
+    from app.llm import client
+
+    base = run_summary._estimate_micro_usd()
+    assert base == run_summary._SUMMARY_ESTIMATE_MICRO_USD
+
+    settings = Settings()
+    doubled = dict(client._PRICING)
+    for model in {settings.summary_extract_model, settings.summary_narrate_model}:
+        doubled[model] = tuple(price * 2 for price in client._PRICING[model])
+    monkeypatch.setattr(client, "_PRICING", doubled)
+
+    after = run_summary._estimate_micro_usd()
+    assert after["extract_batch_10"] == base["extract_batch_10"] * 2
+    assert after["narrate_once"] == base["narrate_once"] * 2
