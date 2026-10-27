@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 import tomllib
 from pathlib import Path
 
@@ -294,17 +295,51 @@ def test_비용표가_단가_정본에서_파생된다(monkeypatch: pytest.Monke
 # --- 픽스처 자기검사: 치수만 보면 플레이스홀더를 못 걸러낸다 -------------------------------
 
 
-def _write_fixtures(root: Path, *, distinct: bool) -> None:
-    """896 픽스처를 만든다. ``distinct`` 가 거짓이면 **전건이 같은 한 장**이다."""
+def _distinct_png(width: int, height: int, seed: int) -> bytes:
+    """**그림 내용이 실제로 다른** PNG. ``IDAT`` 이 seed 마다 갈린다."""
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    raw = b"".join(
+        b"\x00" + bytes([(row * 7 + seed) % 256, (row * 13) % 256, 90]) * width for row in range(4)
+    )
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw, 1))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _write_fixtures(root: Path, *, distinct: bool, metadata_only: bool = False) -> None:
+    """896 픽스처를 만든다.
+
+    - ``distinct`` 거짓: **전건이 같은 한 장**이다.
+    - ``metadata_only``: 파일 바이트는 전건 다르지만 **그림 내용이 같다.** 플레이스홀더를
+      깔아 두고 자기검사를 통과시키던 우회가 바로 이 모양이다 -- ``synthetic_png`` 가 패딩을
+      ``tEXt`` 청크에 담으므로 같은 치수의 합성 PNG 는 ``IHDR``·``IDAT`` 이 전부 같다.
+    """
     from demo.draft_cassettes import synthetic_png
 
     for index, case in enumerate(c for c in CASES if c.image_variant is not None):
         folder = root / case.id
         folder.mkdir(parents=True, exist_ok=True)
         # 치수는 전부 896 으로 맞춘다 -- 자기검사가 보는 유일한 축이 그것이었다.
-        data = synthetic_png(896, 896)
-        if distinct:
-            data = data + b"\x00" * (index + 1)
+        if metadata_only:
+            data = synthetic_png(896, 896) + b"\x00" * (index + 1)
+        elif distinct:
+            data = _distinct_png(896, 896, index + 1)
+        else:
+            data = synthetic_png(896, 896)
         (folder / "896.jpg").write_bytes(data)
 
 
@@ -333,6 +368,55 @@ def test_서로_다른_사진이면_자기검사가_통과한다(tmp_path: Path,
     _write_fixtures(tmp_path, distinct=True)
 
     assert run_draft._self_check() == 0
+
+
+def test_메타데이터만_다른_사진은_자기검사가_막는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**앞 수정이 파일 전체 해시였고 그것이 한 청크로 우회됐다.**
+
+    ``demo.draft_cassettes.synthetic_png`` 가 패딩을 ``tEXt`` 청크에 담으므로 같은 치수의
+    합성 PNG 는 ``IHDR``·``IDAT`` 이 전부 동일하고 주석만 다르다. 그런 파일 32장을 깔면
+    파일 전체 해시가 32종으로 갈려 "32/32건 준비됨 / 자기검사 통과" 가 찍히고 리포트의
+    "같은 사진을 복사해 두면 자기검사가 막는다" 가 거짓이 된다. 앞 테스트가 **완전히 동일한
+    파일만** 깔았기 때문에 그 사실을 보지 못했다.
+    """
+    monkeypatch.setattr(run_draft, "IMAGE_ROOT", tmp_path)
+    _write_fixtures(tmp_path, distinct=False, metadata_only=True)
+
+    assert run_draft._self_check() != 0, "바이트만 다른 플레이스홀더가 자기검사를 통과했다"
+    assert "같은 그림" in capsys.readouterr().out
+
+
+def test_896이_아닌_등급도_자기검사가_본다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """유일성 검사가 ``variant == 896`` 안에만 있었다. 다른 등급은 아무도 안 봤다."""
+    from demo.draft_cassettes import synthetic_png
+
+    monkeypatch.setattr(run_draft, "IMAGE_ROOT", tmp_path)
+    _write_fixtures(tmp_path, distinct=True)
+    for index, case in enumerate(c for c in CASES if c.image_variant is not None):
+        (tmp_path / case.id / "640.jpg").write_bytes(synthetic_png(640, 640) + b"\x00" * (index + 1))
+
+    assert run_draft._self_check() != 0
+    assert "640" in capsys.readouterr().out
+
+
+def test_확장자와_실제_미디어_타입이_어긋나면_자기검사가_말한다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``read_dimensions`` 가 돌려준 미디어 타입을 ``_media`` 로 받아 **버렸다.**
+
+    치명은 아니다 -- 하네스가 그 타입으로 보내므로 동작은 한다. 그러나 ``.jpg`` 안에 PNG 가
+    들어 있는 것은 **사람이 만든 사진이 아니라는 신호**이고, 자기검사가 그것을 보고 있었는데
+    말하지 않았다.
+    """
+    monkeypatch.setattr(run_draft, "IMAGE_ROOT", tmp_path)
+    _write_fixtures(tmp_path, distinct=True)  # 전부 PNG 인데 경로는 .jpg 다
+
+    run_draft._self_check()
+    assert "image/png" in capsys.readouterr().out
 
 
 # --- 오사진 분모: 모델에 닿지 않는 건을 분모로 세지 않는다 --------------------------------
@@ -516,6 +600,24 @@ def test_키가_필요한_플래그는_키가_없으면_종료_코드가_0이_�
     assert _run(_args(mode="a", **{flag: True}), tmp_path, monkeypatch) != 0
 
 
+@pytest.mark.parametrize("flag", ["count_tokens", "count_image_tokens"])
+def test_기본_모드에서도_키가_필요한_플래그는_종료_코드가_0이_아니다(
+    flag: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**앞 테스트가 ``mode="a"`` 만 고정해 재현 경로를 한 번도 돌지 않았다.**
+
+    키 blocker 가 ``args.mode != "lexicon-only"`` 에 묶여 있고 ``--mode`` 기본값이
+    ``lexicon-only`` 라서, 보고서가 재현 명령으로 적은 ``python -m harness.run_draft
+    --count-tokens`` 가 그대로 **바이트 동일한 리포트 + 종료 코드 0** 이었다. 그 리포트가
+    사람에게 "``--count-tokens`` 가 치환한다"고 권하는데 그 모드에서 아무것도 하지 않는다.
+    """
+    code = _run(_args(**{flag: True}), tmp_path, monkeypatch)
+    out = capsys.readouterr().out
+
+    assert code != 0, out
+    assert "AECHAK_AI_ANTHROPIC_API_KEY" in out, out
+
+
 def test_없는_비교_파일을_주면_조용히_끝나지_않는다(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``--compare-from /nope/does/not/exist.jsonl`` 이 종료 코드 0 으로 조용히 끝났다."""
     assert _run(_args(mode="a", compare_from="/nope/does/not/exist.jsonl"), tmp_path, monkeypatch) != 0
@@ -569,6 +671,13 @@ class _OracleClient:
         names = sorted(case.acceptable_option_group_names)[:1]
         if self._groups == "empty":
             groups: list[dict[str, object]] = []
+        elif self._groups == "half":
+            # 케이스 id 의 해시로 절반만 옵션을 낸다. **절반만 실패할 때가 거짓이 나던 모양이다.**
+            groups = (
+                [{"name": n, "values": [{"name": "A"}, {"name": "B"}]} for n in names]
+                if sum(ord(ch) for ch in case_id) % 2 == 0
+                else []
+            )
         elif self._groups == "wrong":
             groups = [{"name": "엉뚱한그룹", "values": [{"name": "A"}, {"name": "B"}]}]
         else:
@@ -626,7 +735,46 @@ async def test_집계가_옵션_미측정을_숨기지_않는다() -> None:
 
     line = rows["[a] 옵션 그룹 적중"]
     assert "미측정" in line, line
-    assert line.startswith("0/"), line
+    assert line.startswith("미측정 "), line
+
+
+async def test_분모_전체가_미측정이면_백분율을_찍지_않는다() -> None:
+    """**통과와 미검사를 섞지 않는다를 측정 쪽에서 반쯤 되돌린 모양이었다.**
+
+    분모를 "정답이 있는 케이스 전수" 로 바꾼 것은 옳다. 그런데 백분율을 그 분모로 계산해
+    모델을 한 번도 부르지 않는 ``lexicon-only`` 리포트에 ``0/66(0%)`` 이 찍혔다. 분모
+    전체가 미측정인데 '적중 0%' 라는 수치가 앞에 선다 -- TSV 컬럼만 보는 사람에게 그것은
+    '0% 정확도'로 읽힌다. 절반만 미측정이면 ``10/66(15%)`` 가 되어 '하한'처럼 보이는 것도
+    같은 문제다.
+    """
+    rows = dict(run_draft._summarize(await _measure_a(groups="empty"), "a"))
+
+    line = rows["[a] 옵션 그룹 적중"]
+    assert "%" not in line, f"분모 전체가 미측정인데 백분율을 찍었다: {line}"
+    assert "미측정" in line, line
+
+
+async def test_일부만_측정되면_두_숫자를_갈라_찍는다() -> None:
+    """하나의 분수로 합치면 어느 쪽 숫자인지 알 수 없다."""
+    records = await _measure_a(groups="half")
+    rows = dict(run_draft._summarize(records, "a"))
+
+    line = rows["[a] 옵션 그룹 적중"]
+    # 측정된 건수를 분모로 한 백분율이어야 한다 -- 전수를 분모로 하면 '하한'처럼 읽힌다.
+    shape = re.search(r"(\d+)/(\d+) — 측정 (\d+)건 중 (\d+) 적중\((\d+)%\) / \*\*미측정 (\d+)건", line)
+    assert shape is not None, line
+    hit, total, measured, measured_hit, percent, unmeasured = (int(g) for g in shape.groups())
+    assert measured > 0 and unmeasured > 0, line
+    assert measured + unmeasured == total, line
+    assert hit == measured_hit
+    assert percent == round(measured_hit / measured * 100)
+
+
+async def test_0단_리포트의_옵션_행에_백분율이_없다() -> None:
+    """키 없이 뽑는 리포트가 사람이 실제로 읽는 유일한 산출물이다."""
+    rows = dict(run_draft._summarize(run_draft._lexicon_only_records(), "lexicon-only"))
+
+    assert "%" not in rows["[lexicon-only] 옵션 그룹 적중"]
 
 
 async def test_집계가_틀린_옵션을_맞힌_것으로_세지_않는다() -> None:

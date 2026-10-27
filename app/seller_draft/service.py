@@ -179,10 +179,20 @@ class DraftService:
         # 것")이 생성 **입구**에 그대로 열려 있었다. 하네스도 "0단이 잡는 것 0건"으로
         # 이미 찍고 있었다.
         #
-        # 모델 출력에만 걸려 있던 4겹을 입력에도 건다. 0원이고, 걸리면 비용도 0이다.
-        claim_hits = claims.screen(name)
+        # **출력 가드의 사전을 그대로 걸지 않는다.** 이 경로에서 과탐의 비용이 다르다.
+        #
+        # ``claims.py`` 머리글이 과탐 방향을 고른 근거는 "과탐은 필드를 비우게 하고(셀러가
+        # 직접 쓴다) 과소탐은 셀러 상품이 차단되게 한다" 다. 그것은 **출력 가드**의 비용
+        # 구조다. 같은 사전을 이름 0단에 걸면 과탐의 비용이 '필드 하나 비움'에서 **'초안을
+        # 아예 안 줌 + 셀러를 꾸짖는 안내문'** 으로 바뀌는데 사전은 그대로였다 -- 실측으로
+        # 정상 상품명 14건 중 6건이 막혔다('3일 배송 보장 고양이 모래'·'후기 많은 인기
+        # 하네스'·'치료실 전용 매트'·'염증 걱정되는 아이용 순한 패드'·'완치 기원 쾌유
+        # 카드'·'보장된 내구성 하네스'). 그래서 이름은 ``screen_name`` 으로 본다 -- 모호하지
+        # 않은 어휘와 '질병명 AND 결과 동사' 공기만이다. 느슨한 층은 생성 결과의 출력
+        # 가드에 남아 있고 거기서는 슬롯 하나를 비우는 비용이다.
+        claim_hits = claims.screen_name(name)
         if claim_hits:
-            expressions = ", ".join(dict.fromkeys(f"'{hit.canonical}'" for hit in claim_hits))
+            expressions = ", ".join(dict.fromkeys(f"'{hit.display}'" for hit in claim_hits))
             self._record_gate(signal, image_meta, skip=SkipReason.NAME_CLAIM_BLOCKED, detail=expressions)
             return self._skipped(
                 request,
@@ -191,9 +201,10 @@ class DraftService:
                 mode,
                 SkipReason.NAME_CLAIM_BLOCKED,
                 notice=(
-                    f"상품명에 효능을 단정하는 표현이 있습니다({expressions}). 그대로 등록하면 "
-                    "검수에서 막히므로 초안을 만들지 않았습니다. 질병·치료·기간 약속 표현을 "
-                    "빼고 품목과 소재를 적어 주시면 초안을 채웁니다."
+                    f"상품명이 효능이나 질병 치료를 단정하고 있습니다({expressions}). 그대로 "
+                    "등록하면 검수에서 막히므로 초안을 만들지 않았습니다. 상품명에서 그 표현을 "
+                    "빼고 품목과 소재를 적어 주시면 초안을 채웁니다 — 효능은 상품명이 아니라 "
+                    "상세 설명에서 '도움을 줄 수 있다' 정도로 적어야 통과합니다."
                 ),
             )
 

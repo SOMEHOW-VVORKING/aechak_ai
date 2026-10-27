@@ -44,7 +44,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import hashlib
 import json
 import statistics
 import sys
@@ -71,8 +70,10 @@ from app.seller_draft.prompt import DRAFT_PREFIX, draft_system_blocks, draft_ver
 from app.seller_draft.service import DraftService, DraftUnprocessable
 from app.seller_draft.tool import DRAFT_TOOL
 from app.settings import Settings
+from harness import imagecontent
 from harness.draft_cases import (
     CASES,
+    NAME_GATE_ORDINARY_NAMES,
     DraftCase,
     ImageVariant,
     NameReveals,
@@ -356,13 +357,22 @@ def _self_check() -> int:
     # (8) 이미지 픽스처가 있으면 헤더 치수가 선언 등급과 맞는가.
     #     어긋나면 토큰 예산이 틀리고 비용 비교가 무의미해진다.
     #
-    #     **치수만 보면 안 된다.** 그것이 이 검사의 결함이었다 -- 같은 합성 PNG 한 장을
-    #     29건에 복사해 두면 "29/29건 준비됨 / 자기검사 통과" 로 찍히고, 키를 등재한 뒤
-    #     (나)·gated 모드를 돌리면 **같은 무늬 한 장을 29번 보낸 결과가 "이미지 이득"으로**
+    #     **치수만 보면 안 된다.** 그것이 이 검사의 첫 결함이었다 -- 같은 합성 PNG 한 장을
+    #     전건에 복사해 두면 "전부 준비됨 / 자기검사 통과" 로 찍히고, 키를 등재한 뒤
+    #     (나)·gated 모드를 돌리면 **같은 무늬 한 장을 N번 보낸 결과가 "이미지 이득"으로**
     #     리포트에 올라간다. 가장 나쁜 자리는 WRONG 등급이다 -- "오사진 안전율"의 분모인데
     #     GOOD 과 완전히 같은 이미지를 받으므로 그 숫자가 무의미해진다. ``draft_images/`` 가
-    #     gitignore 라 안을 감사할 사람도 없다. 그래서 **내용 해시의 유일성**을 함께 본다.
-    digests: dict[str, list[str]] = defaultdict(list)
+    #     gitignore 라 안을 감사할 사람도 없다.
+    #
+    #     **파일 전체 해시도 모자랐다. 그것이 두 번째 결함이다.** ``synthetic_png`` 가 패딩을
+    #     ``tEXt`` 청크에 담으므로 같은 치수의 합성 PNG 는 ``IHDR``·``IDAT`` 이 전부 동일하고
+    #     주석만 다르다. 그런 파일 32장은 파일 해시가 32종으로 갈려 통과했고, 리포트의 "같은
+    #     사진을 복사해 두면 자기검사가 막는다" 가 거짓이 되었다. 파일 뒤에 ``\x00`` 을 붙이는
+    #     것도 같은 우회다. 그래서 **메타데이터를 뺀 그림 내용**을 해시하고(``imagecontent``)
+    #     ``896`` 만이 아니라 **등급 전체**를 본다 -- 유일성 검사가 ``variant == 896`` 안에만
+    #     있어서 다른 등급은 아무도 보지 않았다.
+    digests: dict[tuple[int, str], list[str]] = defaultdict(list)
+    medias: set[str] = set()
     for case in CASES:
         if case.image_variant is None:
             continue
@@ -375,21 +385,37 @@ def _self_check() -> int:
             if read is None:
                 problems.append(f"{case.id}/{variant}: 헤더를 읽을 수 없다")
                 continue
-            _media, width, height = read
+            media, width, height = read
+            medias.add(media)
             if max(width, height) != variant:
                 problems.append(
                     f"{case.id}/{variant}: 긴 변이 {max(width, height)}px 다. "
                     "선언 등급과 달라 토큰 예산이 틀린다"
                 )
-            if variant == 896:
-                digests[hashlib.sha256(data).hexdigest()].append(f"{case.id}({case.image_variant.value})")
-    for digest, owners in sorted(digests.items()):
+            digest = imagecontent.content_digest(data)
+            if digest is None:
+                problems.append(f"{case.id}/{variant}: 그림 내용을 읽을 수 없다(청크가 깨졌다)")
+                continue
+            digests[(variant, digest)].append(f"{case.id}({case.image_variant.value})")
+    for (variant, digest), owners in sorted(digests.items()):
         if len(owners) > 1:
+            shown = sorted(owners)
+            head = ", ".join(shown[:4]) + (f" 외 {len(shown) - 4}건" if len(shown) > 4 else "")
             problems.append(
-                f"픽스처 {len(owners)}건이 **같은 파일**이다({digest[:12]}): {', '.join(sorted(owners))}. "
+                f"{variant} 등급 픽스처 {len(owners)}건이 **같은 그림**이다({digest[:12]}): {head}. "
                 "플레이스홀더를 깔아 두면 '이미지 이득'과 '오사진 안전율'이 같은 사진 한 장의 "
-                "숫자가 된다 -- 치수만 맞으면 통과하던 자리다"
+                "숫자가 된다 -- 파일 바이트가 아니라 메타데이터를 뺀 그림 내용을 본다"
+                "(주석 청크나 꼬리 바이트로는 갈리지 않는다)"
             )
+    # 확장자와 실제 타입의 어긋남은 **차단이 아니라 신호**다. 하네스가 매직 바이트로 읽은
+    # 타입으로 보내므로 동작은 하는데, ``.jpg`` 안에 PNG 가 들어 있는 것은 사람이 찍은 사진이
+    # 아니라는 뜻이다. 앞 판은 ``read_dimensions`` 가 돌려준 타입을 ``_media`` 로 받아 버렸다.
+    unexpected = sorted(media for media in medias if media != "image/jpeg")
+    if unexpected:
+        print(
+            f"[주의] 픽스처 경로는 .jpg 인데 실제 타입이 {', '.join(unexpected)} 다. "
+            "합성 플레이스홀더의 신호다 -- 측정 전에 실제 사진인지 확인해라."
+        )
 
     if problems:
         print("[치명] 케이스 기대값이 코드와 어긋난다. 측정 전에 멈춘다.")
@@ -593,12 +619,44 @@ def _report_guards() -> list[tuple[str, str]]:
             ),
         )
     )
+    second = claims.SECOND_HOLDOUT_CLAIM_EXAMPLES
+    second_hits = sum(1 for ex in second if claims.screen(ex))
+    second_missed = [ex for ex in second if not claims.screen(ex)]
+    rows.append(
+        (
+            "두 번째 보류 집합",
+            f"{second_hits}/{len(second)}건 — 첫 집합이 순환이 된 뒤 사전을 보지 않고 새로 쓴 "
+            f"것이고 **처음 재니 5/{len(second)} 였다**(전건이 guardDrops=[] 로 description 에 "
+            "실려 나갔다). 미탐의 축이 하나였다 -- 사전이 전부 단일 어휘라 '증상 명사 + 낫게 "
+            "만드는 동사' 구조를 하나도 보지 못했다. 그 구조를 세는 층을 더했고, "
+            "**이 숫자도 보고 고쳤으므로 순환이다**"
+            + (
+                f" / 놓친 것: {', '.join(second_missed[:3])}" + (" ..." if len(second_missed) > 3 else "")
+                if second_missed
+                else ""
+            ),
+        )
+    )
     rows.append(
         (
             "비순환 숫자가 지금 없다",
-            "다음 사람이 미탐을 재려면 **실제 셀러 문구**에서 새 보류 집합을 받아야 한다. "
+            "다음 사람이 미탐을 재려면 **실제 셀러 문구**에서 세 번째 보류 집합을 받아야 한다. "
             "내가 지어낸 문장으로 만든 집합은 규칙을 쓴 사람이 같아서 증거가 약하다 -- "
             "그 사실을 숫자 대신 적어 둔다",
+        )
+    )
+    ordinary = NAME_GATE_ORDINARY_NAMES
+    name_fp = [name for name in ordinary if claims.screen_name(name)]
+    name_loose_fp = [name for name in ordinary if claims.screen(name)]
+    rows.append(
+        (
+            "이름 0단 과탐",
+            f"{len(name_fp)}/{len(ordinary)}건 — 같은 분모를 출력 가드 사전으로 재면 "
+            f"{len(name_loose_fp)}건이 걸린다. **같은 사전을 두 경로에 걸 수 없는 이유가 그 "
+            "차이다** -- 출력 가드에서 과탐은 슬롯 하나를 비우지만(셀러가 직접 쓴다) 이름 0단에서는 "
+            "초안을 아예 주지 않고 셀러를 꾸짖는다. 이름은 모호하지 않은 어휘와 '질병명 AND 결과 "
+            "동사' 공기만 본다. **이 분모도 내가 쓴 것이다** -- 진짜 과탐률은 백엔드 실제 상품명에서 "
+            "받아야 한다",
         )
     )
     rows.append(
@@ -1214,15 +1272,27 @@ def _accuracy_rows(mode: str, records: list[Record]) -> list[tuple[str, str]]:
         scored = [r for r in option_pool if r.option_group_hit is not None]
         unattempted = len(option_pool) - len(scored)
         hit = sum(1 for r in scored if r.option_group_hit)
-        rows.append(
-            (
-                f"[{mode}] 옵션 그룹 적중",
-                f"{hit}/{len(option_pool)}({hit / len(option_pool):.0%}) — 분모는 **정답이 있는 "
-                f"케이스 전수**다. 그 가운데 {unattempted}건은 모델이 옵션을 하나도 내지 않아 "
-                "**미측정**이다(맞힌 것도 틀린 것도 아니다). 리프 말고 유일하게 정답이 있는 "
-                "내용 지표다",
+        # **백분율을 전수 분모로 계산하지 않는다.** 그것이 통과와 미검사를 섞는 자리였다.
+        #
+        # 모델을 한 번도 부르지 않는 ``lexicon-only`` 리포트에 ``0/66(0%)`` 이 찍혔다 --
+        # 분모 전체가 미측정인데 '적중 0%' 라는 수치가 앞에 선다. TSV 컬럼만 보는 사람에게
+        # 그것은 '0% 정확도'로 읽힌다. 절반만 미측정이면 ``10/66(15%)`` 가 되어 '하한'처럼
+        # 보이는 것도 같은 문제다. 측정 건수가 0 이면 백분율을 아예 찍지 않고, 있으면
+        # **측정된 건수를 분모로** 적고 미측정 건수를 따로 적는다.
+        if not scored:
+            value = (
+                f"미측정 {unattempted}/{len(option_pool)} — 분모는 **정답이 있는 케이스 전수**이고 "
+                "그 전건에서 모델이 옵션을 하나도 내지 않았다. **백분율을 찍지 않는다** "
+                "(맞힌 것도 틀린 것도 아니라 적중률이 존재하지 않는다)"
             )
-        )
+        else:
+            value = (
+                f"{hit}/{len(option_pool)} — 측정 {len(scored)}건 중 {hit} 적중"
+                f"({hit / len(scored):.0%}) / **미측정 {unattempted}건**. 분모는 정답이 있는 "
+                "케이스 전수이고 백분율의 분모는 측정된 건수다 — 하나의 분수로 합치면 어느 쪽 "
+                "숫자인지 알 수 없다. 리프 말고 유일하게 정답이 있는 내용 지표다"
+            )
+        rows.append((f"[{mode}] 옵션 그룹 적중", value))
         by_layer_option: dict[str, list[Record]] = defaultdict(list)
         for record in option_pool:
             by_layer_option[record.name_reveals].append(record)
@@ -1532,9 +1602,17 @@ async def _main(args: argparse.Namespace) -> int:
                 "(harness/make_draft_images.sh 가 만든다. 같은 사진을 복사해 두면 자기검사가 막는다)"
             )
 
-    # **모델을 쓰는 모드를 골랐으면 키가 선결 조건이다.** 기본 모드(``lexicon-only``)는
-    # 아무것도 필요 없고 그 호출만 종료 코드 0 이다 -- 0원 기준선이 그 모드의 산출물이다.
-    if args.mode != "lexicon-only" and not settings.anthropic_api_key:
+    # **키가 필요한 것을 요청했으면 모드와 무관하게 선결 조건이다.**
+    #
+    # 앞 판은 이 blocker 를 ``args.mode != "lexicon-only"`` 에 묶었고 ``--mode`` 기본값이
+    # ``lexicon-only`` 다. 그래서 **기본 모드에서 플래그가 다시 조용히 무동작이었다** --
+    # ``--count-tokens`` 와 ``--count-image-tokens`` 가 바이트 동일한 리포트를 찍고 종료
+    # 코드 0 으로 끝났는데, 그 리포트가 사람에게 "접두부 길이는 글자 수이고 토큰 수가 아니다.
+    # --count-tokens 가 치환한다" 고 권한다. 고쳤다고 적어 둔 것이 사실이 아니었던 자리다.
+    #
+    # ``--yes`` 도 같은 집합이다 -- 승인만 주고 키가 없으면 할 수 있는 일이 없다.
+    needs_key = args.mode != "lexicon-only" or args.count_tokens or args.count_image_tokens or args.yes
+    if needs_key and not settings.anthropic_api_key:
         blockers.append(
             "AECHAK_AI_ANTHROPIC_API_KEY 가 없다(ANTHROPIC_API_KEY 가 아니라 이 이름이다 -- "
             "Settings 의 env_prefix 가 AECHAK_AI_). 사람이 SSM 에 등재해야 한다"
