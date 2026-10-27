@@ -34,6 +34,7 @@ from app.inspection.trace import TraceRecorder
 from app.llm.client import LlmClient
 from app.review_summary.service import SummaryService
 from app.review_summary.trace import SummaryTraceRecorder
+from app.schemas.draft import SellerDraftRequest
 from app.schemas.inspection import (
     ContentVerdict,
     ProductInspectionRequest,
@@ -41,9 +42,12 @@ from app.schemas.inspection import (
     TargetType,
 )
 from app.schemas.summary import RequestedScope, ReviewInput, ReviewSummaryRequest, SummaryScope
+from app.seller_draft.service import DraftService, DraftUnprocessable
+from app.seller_draft.trace import DraftTraceRecorder
 from app.settings import Settings
-from demo import summary_view, view
+from demo import draft_view, summary_view, view
 from demo.cassettes import BY_ID, SCENARIOS, Scenario
+from demo.draft_cassettes import DRAFT_BY_ID, DRAFT_SCENARIOS, DraftScenario, draft_image
 from demo.mock import MockLlmClient
 from demo.replay import CassetteMiss, ReplayLlmClient, SequencedReplayClient
 from demo.summary_cassettes import SUMMARY_BY_ID, SUMMARY_SCENARIOS
@@ -430,3 +434,239 @@ def _error(message: str) -> JSONResponse:
 def scenario_of(scenario_id: str) -> Scenario | None:
     """테스트와 스크립트가 시나리오를 집어 올 때 쓴다."""
     return BY_ID.get(scenario_id)
+
+
+# --- 셀러 폼 초안(SCRUM-311) ---------------------------------------------------------
+#
+# **두 입력 방식을 나란히 돌린다.** 사람이 아직 (가)와 (나) 중 무엇을 켤지 고르지 못했고,
+# 고르려면 비용·지연·초안을 같은 입력에서 나란히 봐야 한다. 두 방식이 별 코드 경로가
+# 아니라 이미지 블록 하나의 유무만 다르다는 것이 이 비교를 공정하게 만든다.
+
+
+class DraftBody(BaseModel):
+    """초안 콘솔이 보내는 입력. ``mode`` 의 기본값이 재생인 것이 안전장치다."""
+
+    mode: Literal["replay", "live"] = "replay"
+    scenario: str | None = None
+    productName: str = "강아지 목줄 M 네이비"
+    categoryId: int | None = None
+    # 라이브에서 두 방식을 모두 돌릴지. 재생은 시나리오가 가진 카세트가 정한다.
+    withImage: bool = False
+
+
+@app.get("/api/draft/scenarios")
+async def draft_scenarios() -> JSONResponse:
+    settings = Settings()
+    return JSONResponse(
+        {
+            "scenarios": [
+                {
+                    "id": scenario.id,
+                    "title": scenario.title,
+                    "note": scenario.note,
+                    "productName": scenario.product_name,
+                    "categoryId": scenario.category_id,
+                    "expectedExit": scenario.expected_exit,
+                    "expectedImageExit": scenario.expected_image_exit,
+                    "hasImageVariant": scenario.image_entries is not None,
+                    "imagePx": scenario.image_px,
+                }
+                for scenario in DRAFT_SCENARIOS
+            ],
+            "liveAvailable": bool(settings.anthropic_api_key),
+            "defaults": {
+                "draftModel": settings.draft_model,
+                "imageMode": settings.draft_image_mode,
+                "imageMaxTokens": settings.draft_image_max_tokens,
+                "descriptionChars": settings.draft_description_chars,
+                "maxTokens": settings.max_tokens_draft,
+                "timeoutSeconds": settings.draft_timeout_seconds,
+                "enabled": settings.enable_draft,
+                # 환율을 다시 적지 않는다. demo/view 의 것을 그대로 내려보낸다.
+                "krwPerUsd": view.KRW_PER_USD,
+            },
+        }
+    )
+
+
+@app.post("/api/draft")
+async def draft(body: DraftBody) -> JSONResponse:
+    if body.mode == "replay":
+        scenario = DRAFT_BY_ID.get(body.scenario or "")
+        if scenario is None:
+            return _error(f"모르는 초안 시나리오다. scenario={body.scenario}")
+        return await _run_draft_compare(scenario)
+
+    settings = Settings()
+    if not settings.anthropic_api_key:
+        return _error("AECHAK_AI_ANTHROPIC_API_KEY 가 없어 라이브 모드를 쓸 수 없다. 재생으로 돌려라")
+    if not body.productName.strip():
+        return _error("상품명을 넣어라. 초안을 만들 입력이 없다")
+
+    llm = LlmClient(api_key=settings.anthropic_api_key, timeout_seconds=settings.draft_timeout_seconds)
+    try:
+        text = await _run_draft_one(
+            llm=llm,
+            settings=settings.model_copy(update={"enable_draft": True, "draft_image_mode": "OFF"}),
+            product_name=body.productName,
+            category_id=body.categoryId,
+            label="(가) 이름 + 카테고리",
+            mode="live",
+            with_image=False,
+        )
+        image = None
+        if body.withImage:
+            image = await _run_draft_one(
+                llm=llm,
+                settings=settings.model_copy(update={"enable_draft": True, "draft_image_mode": "ALWAYS"}),
+                product_name=body.productName,
+                category_id=body.categoryId,
+                label="(나) + 사진 1장",
+                mode="live",
+                with_image=True,
+            )
+    finally:
+        await llm.aclose()
+
+    if isinstance(text, JSONResponse):
+        return text
+    if isinstance(image, JSONResponse):
+        return image
+    built = draft_view.build_compare(
+        product_name=body.productName,
+        category_given=body.categoryId,
+        mode="live",
+        source="custom",
+        text=text,
+        image=image,
+    )
+    return JSONResponse({"view": built.as_dict()})
+
+
+async def _run_draft_compare(scenario: DraftScenario) -> JSONResponse:
+    """시나리오를 두 변형으로 돌린다. **변형마다 새 클라이언트와 새 서비스를 쓴다.**
+
+    서비스를 공유하면 재사용 캐시가 둘째 변형을 가로채고, 클라이언트를 공유하면 카세트
+    순번이 이어져 둘째 변형이 첫째의 응답을 받는다.
+    """
+    text = await _run_draft_variant(scenario, with_image=False, label="(가) 이름 + 카테고리")
+    if isinstance(text, JSONResponse):
+        return text
+
+    image: draft_view.DraftVariantView | None = None
+    if scenario.image_entries is not None:
+        result = await _run_draft_variant(scenario, with_image=True, label="(나) + 사진 1장")
+        if isinstance(result, JSONResponse):
+            return result
+        image = result
+
+    built = draft_view.build_compare(
+        product_name=scenario.product_name,
+        category_given=scenario.category_id,
+        mode="replay",
+        source=scenario.id,
+        text=text,
+        image=image,
+    )
+    return JSONResponse({"view": built.as_dict()})
+
+
+async def _run_draft_variant(
+    scenario: DraftScenario, *, with_image: bool, label: str
+) -> draft_view.DraftVariantView | JSONResponse:
+    expected = scenario.expected_image_exit if with_image else scenario.expected_exit
+    settings = scenario.settings(with_image=with_image)
+    entries = scenario.image_entries if with_image else scenario.entries
+    recorder = DraftTraceRecorder()
+    service = DraftService(
+        llm=(None if scenario.llm_disabled else SequencedReplayClient(entries=dict(entries or {}))),
+        settings=settings,
+        recorder=recorder,
+    )
+    try:
+        response = await service.run(scenario.to_request(with_image=with_image))
+    except CassetteMiss as miss:
+        # 조용히 실패로 접지 않는다. 호출 실패는 EMPTY_CALL_FAILED 라서 빠진 카세트를
+        # 실패로 돌리면 콘솔이 거짓 단계를 그린다.
+        return _error(str(miss))
+    except DraftUnprocessable as error:
+        # 거부도 보여 줘야 하는 그림이다 -- 셀러센터가 사진을 줄여 다시 보내야 한다는 사실이
+        # 응답에 있다. **적어 둔 경로 검사를 똑같이 받는다**(아래 공통 분기).
+        built = _unprocessable_variant(label, error)
+    else:
+        built = draft_view.build_variant(
+            response,
+            label=label,
+            mode="replay" if settings.anthropic_api_key == "" else "live",
+            trace=recorder.trace,
+        )
+    if expected is not None and expected != built.exit_point:
+        # 틀린 그림을 정상 응답으로 내보내지 않는다. 사이드바에 시나리오 설명과
+        # expected_exit 가 떠 있으므로 다른 경로를 그리면 화면이 자기를 부정한다.
+        return _error(
+            f"시나리오가 적어 둔 경로와 다르게 돌았다. 변형={label} "
+            f"적어 둔 곳={expected} 실제={built.exit_point}. 카세트가 시나리오와 어긋났을 수 있다"
+        )
+    return built
+
+
+def _unprocessable_variant(label: str, error: DraftUnprocessable) -> draft_view.DraftVariantView:
+    """거부된 입력을 화면 모델로 옮긴다. **빈 성공으로 그리지 않는다.**"""
+    from datetime import UTC, datetime
+
+    from app.schemas.draft import (
+        DraftState,
+        ImageMode,
+        ImageReport,
+        ImageUsability,
+        ItemSignalOut,
+        SellerDraftResponse,
+    )
+    from app.seller_draft.catalog import ItemGrade, ResolvedBy
+    from app.seller_draft.prompt import draft_version_string
+
+    detail = str(error)
+    if error.max_long_edge_px is not None:
+        detail += f" (긴 변 {error.max_long_edge_px}px 이하로 줄여 보내라)"
+    response = SellerDraftResponse(
+        requestId="demo-unprocessable",
+        draftVersion=draft_version_string(),
+        state=DraftState.FAILED,
+        itemSignal=ItemSignalOut(grade=ItemGrade.OPAQUE, resolvedBy=ResolvedBy.NONE),
+        image=ImageReport(usability=ImageUsability.NO_IMAGE_SENT, rejected=True, detail=detail),
+        imageMode=ImageMode.ALWAYS,
+        failureDetail=detail,
+        generatedAt=datetime.now(UTC),
+    )
+    built = draft_view.build_variant(response, label=label, mode="replay", trace=None)
+    return built
+
+
+async def _run_draft_one(
+    *,
+    llm: Any,
+    settings: Settings,
+    product_name: str,
+    category_id: int | None,
+    label: str,
+    mode: str,
+    with_image: bool,
+) -> draft_view.DraftVariantView | JSONResponse:
+    """라이브 변형 하나. 사진은 **합성 헤더**라 모델이 읽을 그림은 없다.
+
+    그 한계를 콘솔이 적는다 -- 라이브에서 사진의 실제 효과를 보려면 하네스의 실제 픽스처가
+    필요하고, 여기서 보여 주는 것은 비용 구조와 분기다.
+    """
+    recorder = DraftTraceRecorder()
+    service = DraftService(llm=llm, settings=settings, recorder=recorder)
+    request = SellerDraftRequest(
+        requestId=f"demo-live-{'image' if with_image else 'text'}",
+        productName=product_name,
+        categoryId=category_id,
+        image=(draft_image() if with_image else None),
+    )
+    try:
+        response = await service.run(request)
+    except DraftUnprocessable as error:
+        return _unprocessable_variant(label, error)
+    return draft_view.build_variant(response, label=label, mode=mode, trace=recorder.trace)

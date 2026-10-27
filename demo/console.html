@@ -138,11 +138,32 @@
   .review { border-top: 1px solid var(--line); padding: 8px 0; font-size: 12.5px; }
   .review:first-child { border-top: 0; }
   .review .rid { font-weight: 600; margin-right: 7px; }
+  /* --- 초안 화면 전용 ---------------------------------------------------------------
+     두 입력 방식을 **나란히** 놓는다. 비용·지연·초안이 한 화면에 있어야 사람이 고를 수
+     있고, 그 비교가 이 탭의 존재 이유다. 좁은 화면에서는 한 열로 쌓는다. */
+  .side { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+  @media (max-width: 1100px) { .side { grid-template-columns: 1fr; } }
+  .variant { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .variant.text-only { border-color: var(--line); }
+  .variant.with-image { border-color: var(--cache); }
+  .variant h3 { margin: 0 0 8px; font-size: 13.5px; }
+  .field { border-top: 1px solid var(--line); padding: 6px 0; font-size: 12.5px; }
+  .field:first-child { border-top: 0; }
+  .field .fname { font-weight: 600; margin-right: 7px; }
+  /* 빈 필드의 사유 넷을 색으로 가른다. **"못 봤다"가 "없다"와 같은 색이면 거짓이다.** */
+  .field.filled .fname { color: var(--clear); }
+  .field.locked .fname { color: var(--cache); }
+  .field.notattempted .fname { color: var(--idle); }
+  .field.guard .fname { color: var(--skipped); }
+  .field.loud { background: #2a1f1a; border-radius: 6px; padding: 6px 8px; }
+  .field.loud .fname { color: var(--warn); }
+  .field .fval { color: var(--muted); display: block; margin-top: 2px; }
+  .delta { color: var(--accent); font-weight: 600; }
 </style>
 </head>
 <body>
 <header>
-  <h1>애착 AI 데모 콘솔 <span class="note">SCRUM-290 / SCRUM-310</span></h1>
+  <h1>애착 AI 데모 콘솔 <span class="note">SCRUM-290 / SCRUM-310 / SCRUM-311</span></h1>
   <p id="feature-note">
     상품 정보나 리뷰가 N0 규칙부터 N5 확정까지 어디를 지나는지 단계별로 본다.
     기본 모드는 모델을 부르지 않는 재생이다. 어드민 검수 화면은 이쪽 범위가 아니다(SCRUM-283).
@@ -152,6 +173,7 @@
 <nav class="tabs">
   <button id="feature-inspection" class="on" data-feature="inspection">콘텐츠 검수</button>
   <button id="feature-summary" data-feature="summary">리뷰 요약</button>
+  <button id="feature-draft" data-feature="draft">셀러 폼 초안</button>
 </nav>
 
 <main id="main-inspection">
@@ -264,6 +286,47 @@
   <section class="results">
     <p class="note" id="summary-empty">왼쪽에서 시나리오를 고르고 돌려라.</p>
     <div id="summary-out" class="hidden"></div>
+  </section>
+</main>
+
+<main id="main-draft" class="hidden">
+  <section class="controls">
+    <h2>모드</h2>
+    <div class="panel">
+      <div class="modes">
+        <button id="dmode-replay" class="primary" data-dmode="replay">재생 (카세트)</button>
+        <button id="dmode-live" data-dmode="live">라이브</button>
+      </div>
+      <p class="note" id="dmode-note"></p>
+    </div>
+
+    <div id="dpanel-replay">
+      <h2>시나리오</h2>
+      <div class="panel" id="draft-scenario-list"></div>
+    </div>
+
+    <div id="dpanel-live" class="hidden">
+      <h2>입력</h2>
+      <div class="panel">
+        <label for="draft-name">상품명 (셀러가 타이핑한 값)</label>
+        <input id="draft-name" type="text" value="강아지 목줄 M 네이비" />
+        <label for="draft-category">카테고리 id (비우면 미지정)</label>
+        <input id="draft-category" type="text" value="" />
+        <label><input type="checkbox" id="draft-with-image" /> 사진 변형도 같이 돌린다
+          <small>라이브의 사진은 합성 헤더다 — 비용 구조와 분기만 보여 준다</small></label>
+      </div>
+    </div>
+
+    <h2>설정</h2>
+    <div class="panel"><p class="note" id="draft-defaults"></p></div>
+
+    <button id="draft-run" class="primary" style="width:100%; padding:9px;">두 방식을 나란히 돌린다</button>
+    <p class="note" id="draft-status"></p>
+  </section>
+
+  <section class="results">
+    <p class="note" id="draft-empty">왼쪽에서 시나리오를 고르고 돌려라.</p>
+    <div id="draft-out" class="hidden"></div>
   </section>
 </main>
 
@@ -693,18 +756,28 @@ function renderRaw(verdict) {
 
 const sstate = { mode: "replay", scenario: null, meta: null };
 
+const FEATURES = ["inspection", "summary", "draft"];
+
+const FEATURE_NOTES = {
+  inspection:
+    "상품 정보나 리뷰가 N0 규칙부터 N5 확정까지 어디를 지나는지 단계별로 본다. 기본 모드는 모델을 부르지 않는 재생이다.",
+  summary:
+    "리뷰 묶음이 입력 게이트 -> 추출 -> 집계 -> 서술 -> 출력 게이트를 지나는 동안 무엇이 남고 무엇이 떨어지는지 본다. \"반복된다\"의 판정은 전부 코드가 한다.",
+  draft:
+    "셀러 상품 등록 폼 초안을 **두 입력 방식으로 나란히** 돌린다. (가) 상품명+카테고리만 / (나) 사진 한 장 추가. " +
+    "두 방식은 별 코드 경로가 아니라 이미지 블록 하나의 유무만 달라서 변수가 하나다 — 그래서 이 비교가 공정하다. " +
+    "어느 쪽을 켤지는 아직 미결이고 층별 한계 이득이 정한다(harness/run_draft.py).",
+};
+
 function setFeature(feature) {
-  ["inspection", "summary"].forEach((f) => {
+  FEATURES.forEach((f) => {
     $("feature-" + f).classList.toggle("on", f === feature);
     $("main-" + f).classList.toggle("hidden", f !== feature);
   });
-  $("feature-note").textContent =
-    feature === "inspection"
-      ? "상품 정보나 리뷰가 N0 규칙부터 N5 확정까지 어디를 지나는지 단계별로 본다. 기본 모드는 모델을 부르지 않는 재생이다."
-      : "리뷰 묶음이 입력 게이트 -> 추출 -> 집계 -> 서술 -> 출력 게이트를 지나는 동안 무엇이 남고 무엇이 떨어지는지 본다. \"반복된다\"의 판정은 전부 코드가 한다.";
+  $("feature-note").textContent = FEATURE_NOTES[feature];
 }
 
-["inspection", "summary"].forEach((f) => {
+FEATURES.forEach((f) => {
   $("feature-" + f).onclick = () => setFeature(f);
 });
 
@@ -1079,8 +1152,296 @@ function summaryRaw(message) {
   return wrap;
 }
 
+/* ==============================================================================
+   셀러 폼 초안 (SCRUM-311)
+
+   **별 상태와 별 렌더러로 둔다.** 검수는 통과와 미검사를 가르고, 요약은 "없다"와
+   "셌는데 문장이 없다"를 가르며, 초안은 **"설계상 안 채운다" / "품목을 몰라 안 채웠다" /
+   "가드가 비웠다" / "호출이 죽어서 못 봤다"** 넷을 가른다. 같은 함수에 넣으면 한쪽 어휘가
+   다른 쪽을 가린다.
+
+   이 탭의 존재 이유는 **두 방식을 나란히 놓는 것**이다. 한 건의 차이는 결론이 아니고,
+   층별 한계 이득은 하네스가 잰다 — 화면이 그 사실을 적는다.
+   ============================================================================== */
+
+const dstate = { mode: "replay", scenario: null, meta: null };
+
+const FIELD_CLASS = {
+  FILLED: "filled",
+  KEPT_LOCKED: "locked",
+  EMPTY_NOT_ATTEMPTED: "notattempted",
+};
+
+function fieldClass(status) {
+  return FIELD_CLASS[status] || "guard";
+}
+
+async function bootDraft() {
+  const meta = await (await fetch("/api/draft/scenarios")).json();
+  dstate.meta = meta;
+  const list = $("draft-scenario-list");
+  meta.scenarios.forEach((s) => {
+    const button = el("button", "scenario");
+    button.appendChild(el("strong", null, s.title));
+    button.appendChild(el("small", null, s.note));
+    button.appendChild(
+      el("small", null, s.hasImageVariant ? "사진 변형 있음 (" + s.imagePx + "px)" : "텍스트만")
+    );
+    button.onclick = () => {
+      dstate.scenario = s.id;
+      [...list.children].forEach((c) => c.classList.remove("on"));
+      button.classList.add("on");
+    };
+    list.appendChild(button);
+  });
+  if (meta.scenarios.length) list.children[0].click();
+
+  const d = meta.defaults;
+  $("draft-defaults").textContent =
+    "모델 " + d.draftModel + " · 이미지 모드 " + d.imageMode + " (운영 기본값) · 설명 " +
+    d.descriptionChars + "자 · max_tokens " + d.maxTokens + " · 타임아웃 " + d.timeoutSeconds +
+    "초 · 이미지 예산 " + d.imageMaxTokens + "토큰. 기능 운영 기본값: " +
+    (d.enabled ? "켜짐" : "꺼짐 — 구현하고 측정하고 기본은 끈다");
+
+  if (!meta.liveAvailable) {
+    $("dmode-live").disabled = true;
+    $("dmode-live").title = "AECHAK_AI_ANTHROPIC_API_KEY 가 없다";
+  }
+  setDraftMode("replay");
+}
+
+function setDraftMode(mode) {
+  dstate.mode = mode;
+  ["replay", "live"].forEach((m) => {
+    $("dmode-" + m).classList.toggle("primary", m === mode);
+  });
+  $("dpanel-replay").classList.toggle("hidden", mode !== "replay");
+  $("dpanel-live").classList.toggle("hidden", mode !== "live");
+  $("dmode-note").textContent =
+    mode === "replay"
+      ? "기록된 호출 응답으로 서비스를 그대로 돌린다. 모델을 부르지 않고 비용이 0이다."
+      : "실제 모델을 부른다. 돈이 든다. 사진은 합성 헤더라 모델이 읽을 그림이 없다 — 비용 구조와 분기만 본다.";
+}
+
+["replay", "live"].forEach((m) => {
+  $("dmode-" + m).onclick = () => setDraftMode(m);
+});
+
+$("draft-run").onclick = async () => {
+  $("draft-status").textContent = "돌리는 중...";
+  const body =
+    dstate.mode === "replay"
+      ? { mode: "replay", scenario: dstate.scenario }
+      : {
+          mode: "live",
+          productName: $("draft-name").value,
+          categoryId: Number($("draft-category").value) || null,
+          withImage: $("draft-with-image").checked,
+        };
+  try {
+    const response = await fetch("/api/draft", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+      $("draft-status").textContent = "오류: " + (data.error || response.status);
+      return;
+    }
+    $("draft-status").textContent = "";
+    renderDraft(data.view);
+  } catch (error) {
+    $("draft-status").textContent = "오류: " + error;
+  }
+};
+
+function renderDraft(view) {
+  $("draft-empty").classList.add("hidden");
+  const out = $("draft-out");
+  out.classList.remove("hidden");
+  out.textContent = "";
+
+  out.appendChild(draftHead(view));
+  out.appendChild(draftCompare(view));
+  out.appendChild(draftVariants(view));
+  out.appendChild(draftRaw(view));
+}
+
+function draftHead(view) {
+  const [wrap, panel] = section("입력");
+  panel.appendChild(el("div", "body-text", view.product_name));
+  panel.appendChild(
+    el("p", "note",
+      "카테고리 " + (view.category_given === null ? "미지정" : view.category_given) +
+      " · 모드 " + view.mode + " (" + view.source + ")")
+  );
+  panel.appendChild(el("p", "note", view.note));
+  return wrap;
+}
+
+function draftCompare(view) {
+  const [wrap, panel] = section("두 방식 비교 — 사람이 이 표를 읽고 고른다");
+  const scroll = el("div", "wrap");
+  const table = el("table");
+  const thead = el("thead");
+  const hr = el("tr");
+  ["지표", "(가) 텍스트", "(나) +사진", "차이", "읽는 법"].forEach((h) =>
+    hr.appendChild(el("th", null, h))
+  );
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  const tbody = el("tbody");
+  view.compare.forEach((row) => {
+    const tr = el("tr");
+    tr.appendChild(el("td", null, row.metric));
+    tr.appendChild(el("td", null, row.text_only));
+    tr.appendChild(el("td", null, row.with_image));
+    tr.appendChild(el("td", "delta", row.delta));
+    const note = el("td", "note", row.note);
+    note.style.whiteSpace = "normal";
+    tr.appendChild(note);
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  scroll.appendChild(table);
+  panel.appendChild(scroll);
+  return wrap;
+}
+
+function draftVariants(view) {
+  const wrap = el("div");
+  wrap.appendChild(el("h2", null, "방식별 결과"));
+  const side = el("div", "side");
+  view.variants.forEach((variant, index) => {
+    side.appendChild(draftVariant(variant, index === 0 ? "text-only" : "with-image"));
+  });
+  wrap.appendChild(side);
+  return wrap;
+}
+
+function draftVariant(v, kind) {
+  const box = el("div", "variant " + kind);
+  box.appendChild(el("h3", null, v.label));
+
+  const row = el("div", "exit");
+  row.appendChild(el("span", "badge", v.exit_label));
+  row.appendChild(pill(v.model_called ? "ran" : "free", v.model_called ? "모델 1회" : "모델 0회 (0원)"));
+  row.appendChild(pill("free", "게이트 " + v.item_grade));
+  if (v.image_attached) row.appendChild(pill("cache-hit", "사진 " + v.image_tokens + "tok"));
+  box.appendChild(row);
+  box.appendChild(el("p", "note", v.exit_note));
+  box.appendChild(
+    el("p", "note",
+      "게이트 근거 " + v.item_resolved_by +
+      (v.matched_terms.length ? " · 적중어 " + v.matched_terms.join(", ") : "") +
+      (v.candidate_leaf_ids.length ? " · 후보 " + v.candidate_leaf_ids.join(", ") : "") +
+      " · 사진 " + v.image_usability)
+  );
+  if (v.image_detail) box.appendChild(el("p", "warn", v.image_detail));
+
+  if (v.description) {
+    box.appendChild(el("h2", null, "설명 초안"));
+    box.appendChild(el("div", "body-text", v.description));
+  }
+  if (v.option_groups.length) {
+    box.appendChild(el("h2", null, "옵션 초안"));
+    v.option_groups.forEach((g) => {
+      box.appendChild(el("div", "note", g.name + ": " + g.values.join(" / ")));
+    });
+    box.appendChild(
+      el("p", "note",
+        "조합 " + v.option_combinations + "개는 **서버가 전수 데카르트곱으로** 만들었다. " +
+        "가격 0, 재고는 비움 — 모델이 조합을 내면 등록 불변식을 반드시 하나는 깬다.")
+    );
+  }
+  if (v.seller_notice) {
+    box.appendChild(el("h2", null, "셀러 안내"));
+    box.appendChild(el("div", "absence", v.seller_notice));
+  }
+
+  box.appendChild(el("h2", null, "필드마다 왜 그런가"));
+  v.fields.forEach((f) => {
+    const item = el("div", "field " + fieldClass(f.status) + (f.loud ? " loud" : ""));
+    item.appendChild(el("span", "fname", f.name));
+    item.appendChild(document.createTextNode(f.sentence + (f.basis ? " · 근거 " + f.basis : "")));
+    if (f.value !== null && f.value !== undefined && typeof f.value !== "object") {
+      item.appendChild(el("span", "fval", String(f.value)));
+    }
+    box.appendChild(item);
+  });
+
+  if (v.guard_drops.length) {
+    box.appendChild(el("h2", null, "가드가 떨어뜨린 것 (재생성 0회)"));
+    v.guard_drops.forEach((d) => {
+      const item = el("div", "finding dropped");
+      item.appendChild(el("b", null, d.field + " / " + d.kind_label + " "));
+      item.appendChild(document.createTextNode(d.detail));
+      box.appendChild(item);
+    });
+  }
+
+  if (v.stages.length) {
+    box.appendChild(el("h2", null, "단계"));
+    v.stages.forEach((stage) => {
+      const srow = el("div", "stage " + stage.status.toLowerCase());
+      srow.appendChild(el("div", "name", stage.label));
+      const bodyEl = el("div");
+      const pills = el("div", "pills");
+      pills.appendChild(pill(stage.status.toLowerCase(), stage.status_label));
+      pills.appendChild(pill(stage.paid ? "cache-hit" : "free", stage.paid ? "모델 호출" : "0원 단계"));
+      if (stage.outcome && stage.outcome !== "SUCCESS") pills.appendChild(pill("failed", stage.outcome));
+      bodyEl.appendChild(pills);
+      if (stage.note) bodyEl.appendChild(el("div", "why", stage.note));
+      if (stage.detail) bodyEl.appendChild(el("div", "warn", stage.detail));
+      const counts = Object.entries(stage.counts).filter(([, val]) => val);
+      if (counts.length) {
+        bodyEl.appendChild(el("div", "why", counts.map(([k, val]) => k + "=" + val).join(" · ")));
+      }
+      if (stage.paid) {
+        bodyEl.appendChild(
+          el("div", "why",
+            stage.model_id + " · " + stage.latency_ms + "ms · " +
+            money(stage.cost_micro_usd || 0, stage.cost_krw) +
+            " · 입력 " + (stage.input_tokens || 0) + " / 캐시읽기 " +
+            (stage.cache_read_input_tokens || 0) + " / 출력 " + (stage.output_tokens || 0))
+        );
+      }
+      srow.appendChild(bodyEl);
+      box.appendChild(srow);
+    });
+  }
+
+  if (v.ledger) {
+    box.appendChild(
+      el("p", "note",
+        "합 " + money(v.ledger.total_cost_micro_usd, v.ledger.total_cost_krw) + " · " +
+        v.ledger.total_latency_ms + "ms · 캐시 적중 " + v.ledger.cache_reads +
+        "회 — Haiku 4.5 의 최소 캐시 접두부가 4,096토큰이라 초안 접두부는 캐시되지 않는다. 0 이 정상이다.")
+    );
+  }
+
+  if (v.envelope_text) {
+    const details = el("details");
+    details.appendChild(el("summary", null, "모델에 실제로 나간 봉투"));
+    details.appendChild(el("pre", null, v.envelope_text));
+    box.appendChild(details);
+  }
+  return box;
+}
+
+function draftRaw(view) {
+  const wrap = el("div");
+  const details = el("details");
+  details.appendChild(el("summary", null, "화면 모델 전문 (DraftCompareView)"));
+  details.appendChild(el("pre", null, JSON.stringify(view, null, 2)));
+  wrap.appendChild(details);
+  return wrap;
+}
+
 boot();
 bootSummary();
+bootDraft();
 </script>
 </body>
 </html>

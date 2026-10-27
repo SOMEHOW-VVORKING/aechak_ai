@@ -318,17 +318,22 @@ def test_콘솔이_외부_자원을_불러오지_않는다() -> None:
 
 
 def test_콘솔에_중복_id가_없다() -> None:
-    """기능 탭이 둘이라 같은 레이아웃을 두 번 쓴다.
+    """기능 탭마다 같은 레이아웃을 한 번씩 쓴다.
 
-    ``id`` 로 두면 중복 ``id`` 가 되고 CSS 가 첫 섹션만 칠한다 -- 요약 탭이 여백 없이
+    ``id`` 로 두면 중복 ``id`` 가 되고 CSS 가 첫 섹션만 칠한다 -- 뒤쪽 탭이 여백 없이
     그려진다. 레이아웃은 클래스로, 자바스크립트가 집는 것만 ``id`` 로 둔다.
+
+    **탭 수를 상수로 적지 않고 탭 버튼에서 센다.** 적어 두면 탭을 더할 때마다 이 테스트를
+    고쳐야 하고, 고치는 동안 잡으려던 중복 ``id`` 를 못 보게 된다.
     """
     html = CONSOLE.read_text(encoding="utf-8")
     ids = re.findall(r'\bid="([^"]+)"', html)
+    tabs = len(re.findall(r'data-feature="', html))
 
     assert len(ids) == len(set(ids)), {i for i in ids if ids.count(i) > 1}
-    assert html.count('class="controls"') == 2
-    assert html.count('class="results"') == 2
+    assert tabs >= 2, "기능 탭을 버튼에서 세지 못했다"
+    assert html.count('class="controls"') == tabs
+    assert html.count('class="results"') == tabs
 
 
 def test_콘솔이_참조하는_id가_실재한다() -> None:
@@ -339,7 +344,15 @@ def test_콘솔이_참조하는_id가_실재한다() -> None:
 
     assert used <= ids, sorted(used - ids)
     # 문자열을 이어 만드는 id 도 실재해야 한다.
-    for dynamic in ("feature-inspection", "feature-summary", "main-summary", "smode-replay"):
+    for dynamic in (
+        "feature-inspection",
+        "feature-summary",
+        "feature-draft",
+        "main-summary",
+        "main-draft",
+        "smode-replay",
+        "dmode-replay",
+    ):
         assert dynamic in ids, dynamic
 
 
