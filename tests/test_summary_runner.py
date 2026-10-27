@@ -405,7 +405,9 @@ async def test_폴_간격_식이_실제_배치_수를_쓴다(settings: Settings)
 
     batches = math.ceil(settings.summary_max_new_reviews / settings.summary_extract_batch_max)
     one_call = 2 * settings.summary_timeout_seconds + 2.0
-    expected = one_call * (batches + settings.summary_scopes_per_message)
+    # 발행 재시도도 wall clock 이다. 식에서 빼면 재시도를 늘리는 변경이 폴 간격을 조용히 먹는다.
+    publish = (settings.kafka_publish_attempts - 1) * settings.kafka_publish_retry_seconds
+    expected = one_call * (batches + settings.summary_scopes_per_message) + publish
 
     assert settings.summary_worst_case_handle_seconds() == expected
     assert settings.kafka_summary_max_poll_interval_ms / 1000 >= expected, (
@@ -472,3 +474,161 @@ async def test_리뷰_상한의_계약_사본이_설정과_같다() -> None:
     from app.schemas.summary import _MAX_NEW_REVIEWS
 
     assert _MAX_NEW_REVIEWS == Settings().summary_max_new_reviews
+
+
+# --- 발행 실패를 계약 실패와 같은 등급으로 두지 않는다 -----------------------------------
+
+
+class _FailingProducer(FakeProducer):
+    """``send_and_wait`` 이 끝까지 실패하는 프로듀서."""
+
+    def __init__(self, *, failures: int) -> None:
+        super().__init__()
+        self.attempts = 0
+        self._failures = failures
+
+    async def send_and_wait(self, topic: str, value: bytes, key: bytes | None = None) -> None:
+        self.attempts += 1
+        if self.attempts <= self._failures:
+            from aiokafka.errors import KafkaTimeoutError
+
+            raise KafkaTimeoutError("브로커가 응답하지 않는다")
+        await super().send_and_wait(topic, value, key)
+
+
+async def test_발행_실패가_그_파티션을_영구히_막지_않는다(settings: Settings) -> None:
+    """**머리글이 "커밋하지 않는 경우는 둘뿐"이라 적었지만 사실이 아니었다.**
+
+    ``send_and_wait`` 이 ``handle()`` 안이라 발행 실패가 계약 불일치와 같은 분기로 떨어져
+    그 파티션을 **영구히** 막았다. 토픽이 1파티션이면 전 상품의 요약이 멈추고, ``/health``
+    는 검수만 보므로 아무도 깨지 않는다. 발행 실패는 코드를 고쳐야 풀리는 상태가 아니라
+    재배달로 풀리는 상태다 -- 루프를 세우고 커밋하지 않는 쪽이 사실에 맞다.
+    """
+    topic = settings.kafka_summary_request_topic
+    consumer = _RecordingConsumer(
+        [
+            _Record(topic, 0, 10, _envelope(_payload()).encode()),
+            _Record(topic, 0, 11, _envelope(_payload()).encode()),
+        ]
+    )
+    producer = _FailingProducer(failures=99)
+    runner = _runner(settings, producer)
+    runner._consumer = consumer  # type: ignore[attr-defined]
+    runner._healthy = True  # type: ignore[attr-defined]
+
+    from app.kafka.summary_runner import SummaryPublishFailed
+
+    with pytest.raises(SummaryPublishFailed):
+        await runner._loop()  # type: ignore[attr-defined]
+
+    # 커밋하지 않았으므로 **잃은 것이 없다.** 그리고 루프가 살아서 조용히 도는 것이 아니라
+    # 죽었고, 그 사실이 헬스에 보인다 -- 그것이 재배달을 받는 유일한 길이다.
+    # (``healthy`` 프로퍼티는 태스크 생존까지 보므로 직접 돌린 루프에서는 플래그를 본다.)
+    assert consumer.commits == []
+    assert runner._healthy is False  # type: ignore[attr-defined]
+    assert runner.blocked_partitions == 0, "발행 실패로 파티션을 막으면 영구 정지다"
+
+
+async def test_발행이_한_번_실패하면_모델을_다시_부르지_않고_발행만_다시_한다(
+    settings: Settings,
+) -> None:
+    """유료 호출을 다시 태우지 않는다. 재시도 대상은 **발행뿐**이다."""
+    topic = settings.kafka_summary_request_topic
+    consumer = _RecordingConsumer([_Record(topic, 0, 5, _envelope(_payload()).encode())])
+    producer = _FailingProducer(failures=1)
+    runner = _runner(settings, producer)
+    runner._consumer = consumer  # type: ignore[attr-defined]
+    runner._healthy = True  # type: ignore[attr-defined]
+
+    runs: list[int] = []
+    original = runner._service.run
+
+    async def counted(request: Any) -> Any:
+        runs.append(1)
+        return await original(request)
+
+    runner._service.run = counted  # type: ignore[assignment]
+    await runner._loop()  # type: ignore[attr-defined]
+
+    from aiokafka import TopicPartition
+
+    assert len(runs) == 1, "발행 재시도가 모델 호출까지 다시 태웠다"
+    assert producer.attempts == 2
+    assert len(producer.sent) == 1
+    assert consumer.commits == [{TopicPartition(topic, 0): 6}]
+
+
+async def test_발행_상한을_넘는_결과는_발행하지_않고_파티션을_막는다(settings: Settings) -> None:
+    """**설정 하나를 올리면 터지는 자리를 코드가 먼저 본다.**
+
+    ``summary_content_chars`` 나 ``summary_scopes_per_message`` 를 올리면 결과 엔벨로프가
+    프로듀서의 ``max_request_size`` 를 넘고, 그 실패가 지금은 발행 실패로 떨어져 파티션을
+    세운다. 크기 초과는 재배달로 풀리지 않는다 -- 코드나 설정을 고쳐야 하는 상태이므로
+    **발행을 시도하지 않고** 그 파티션만 막는다.
+    """
+    small = settings.model_copy(update={"kafka_max_request_size": 200})
+    topic = small.kafka_summary_request_topic
+    consumer = _RecordingConsumer([_Record(topic, 0, 1, _envelope(_payload()).encode())])
+    producer = FakeProducer()
+    runner = _runner(small, producer)
+    runner._consumer = consumer  # type: ignore[attr-defined]
+    runner._healthy = True  # type: ignore[attr-defined]
+
+    await runner._loop()  # type: ignore[attr-defined]
+
+    assert producer.sent == [], "상한을 넘는 메시지를 브로커에 보냈다"
+    assert consumer.commits == []
+    assert runner._healthy is True, "크기 초과가 컨슈머 전체를 세울 이유는 아니다"  # type: ignore[attr-defined]
+    assert runner.blocked_partitions == 1
+
+
+async def test_계약_상한을_꽉_채운_결과가_발행_상한_안에_든다() -> None:
+    """**세 설정과 ``max_request_size`` 의 관계를 테스트가 묶는다.**
+
+    ``summary_content_chars`` 400->800 과 ``summary_scopes_per_message`` 2->5 가 각각
+    상한을 넘긴다(실측). 그 관계가 테스트에 없으면 설정 한 줄을 올린 배포에서 요약이
+    멈추고, 멈춘 것을 아무도 모른다.
+    """
+    from harness.run_summary import worst_case_result_bytes
+
+    settings = Settings()
+    worst = worst_case_result_bytes(settings)
+
+    assert worst < settings.kafka_max_request_size, (
+        f"계약 상한을 꽉 채운 결과가 {worst}B 로 발행 상한 "
+        f"{settings.kafka_max_request_size}B 를 넘는다. 상한을 올렸으면 "
+        "max_request_size 도 같이 올려야 한다"
+    )
+
+
+async def test_요약이_켜졌는데_러너가_죽으면_헬스가_내려간다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**감시 공백이 코드에 적혀 있었다.** 이 필드를 보는 주체가 없다고.
+
+    ``enable_review_summary`` 가 참인데 요약 러너가 죽으면 전용 토픽의 메시지가 영구히
+    쌓이는데 ``/health`` 는 200 UP 이었다. 켜 둔 기능이 죽은 것은 DOWN 이다 -- 끈
+    배포에서는 영구 503 이 되지 않게 **켜졌을 때만** 본다.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from app.main import settings as app_settings
+
+    class _Dead:
+        healthy = False
+        blocked_partitions = 1
+
+    class _Alive:
+        healthy = True
+        blocked_partitions = 0
+
+    monkeypatch.setattr(app_settings, "enable_review_summary", True)
+    # **lifespan 을 돌리지 않는다.** 돌리면 실제 브로커에 붙으려 한다. 라우트만 부르고
+    # 러너 자리에는 생존 여부만 답하는 대역을 넣는다.
+    app.state.runner = _Alive()
+    app.state.summary_runner = _Dead()
+    response = TestClient(app).get("/health")
+
+    assert response.status_code == 503, response.json()
+    body = response.json()
+    assert body["reviewSummaryConsuming"] is False
+    assert body["status"] == "DOWN"

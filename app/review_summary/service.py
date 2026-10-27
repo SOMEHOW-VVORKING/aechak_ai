@@ -653,7 +653,7 @@ def _render_row(item: tally_mod.Repeated) -> str:
         mention_count=item.row.mentionCount,
         share=item.share,
         labels=list(item.row.labelSamples),
-        quotes=[quote.text for quote in item.row.quoteSamples],
+        quotes=[(quote.reviewId, quote.text) for quote in item.row.quoteSamples],
     )
 
 

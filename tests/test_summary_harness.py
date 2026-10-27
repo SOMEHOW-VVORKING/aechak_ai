@@ -209,3 +209,74 @@ def test_요약_비용표가_단가_정본에서_파생된다(monkeypatch: pytes
     after = run_summary._estimate_micro_usd()
     assert after["extract_batch_10"] == base["extract_batch_10"] * 2
     assert after["narrate_once"] == base["narrate_once"] * 2
+
+
+# --- 키가 없을 때 플래그가 조용히 무동작이 되지 않는다 -----------------------------------
+
+
+def _args(**overrides: object) -> object:
+    import argparse
+
+    defaults = {"count_tokens": False, "repeat": 3, "yes": False, "only": None}
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def test_키가_없으면_기본_리포트는_종료_코드_0이다(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    """옵션을 주지 않은 호출은 **키 없이 뽑는 리포트가 산출물**이고 성공이다."""
+    import asyncio
+
+    monkeypatch.setattr(run_summary, "OUT_ROOT", tmp_path)
+    monkeypatch.setenv("AECHAK_AI_ANTHROPIC_API_KEY", "")
+
+    assert asyncio.run(run_summary._main(_args())) == 0
+
+
+@pytest.mark.parametrize("flag", ["count_tokens", "yes"])
+def test_키가_없으면_키가_필요한_플래그는_종료_코드가_0이_아니다(
+    flag: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**이 플래그들은 조용히 무동작이었다.**
+
+    ``_main`` 의 "키가 없으면 리포트를 찍고 return 0" 이 ``--count-tokens`` 분기와 ``--yes``
+    분기 **위**에 있어서, 세 호출의 출력이 산출물 경로 줄만 빼고 글자 그대로 같았다
+    (diff 로 확인). 사람은 측정을 요청했는데 받은 것은 같은 리포트 한 장이고 종료 코드가
+    0 이라 스크립트도 성공으로 읽는다. 요청한 일을 하지 못했으면 그렇게 말해야 한다.
+    """
+    import asyncio
+
+    monkeypatch.setattr(run_summary, "OUT_ROOT", tmp_path)
+    monkeypatch.setenv("AECHAK_AI_ANTHROPIC_API_KEY", "")
+
+    assert asyncio.run(run_summary._main(_args(**{flag: True}))) != 0
+
+
+def test_산출물에_raw_jsonl이_항상_남는다(tmp_path: object) -> None:
+    """``if records:`` 가드 때문에 키 없는 경로에서는 **영구히 안 써졌다.**
+
+    산출물 디렉터리에 ``summary.tsv`` 하나만 있으면, 읽는 사람은 raw 를 잃었는지 애초에
+    없었는지 구별할 수 없다. 0줄이라도 파일이 있는 쪽이 사실에 가깝다.
+    """
+    from pathlib import Path
+
+    out = run_summary._write_out([], [("키", "값")], out_root=Path(str(tmp_path)))
+
+    assert (out / "summary.tsv").is_file()
+    assert (out / "raw.jsonl").is_file()
+    assert (out / "raw.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_같은_초에_두_번_돌아도_산출물이_덮이지_않는다(tmp_path: object) -> None:
+    """스탬프가 초 단위이고 ``mkdir(exist_ok=True)`` 라 **조용히 덮었다.**
+
+    동시에 두 번 돌려 확인했다 -- 디렉터리가 2개가 아니라 1개만 늘었다. 측정 결과를
+    조용히 잃는 자리라서 스탬프가 겹치면 다른 이름을 쓴다.
+    """
+    from pathlib import Path
+
+    root = Path(str(tmp_path))
+    first = run_summary._write_out([], [("키", "1")], out_root=root)
+    second = run_summary._write_out([], [("키", "2")], out_root=root)
+
+    assert first != second
+    assert sorted(p.name for p in root.iterdir()) == sorted([first.name, second.name])

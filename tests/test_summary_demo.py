@@ -378,3 +378,41 @@ def test_콘솔이_분석되지_않은_리뷰_수를_띄운다() -> None:
 
     assert "분석되지 않음" in html
     assert "reviews_unextracted" in html
+
+
+# --- 모의 모드 (사람이 자기 리뷰를 타이핑해 결과를 본다) ----------------------------------
+
+
+def test_요약_탭에_모의_모드가_있다() -> None:
+    """**검수 탭에는 있고 요약 탭에는 없던 비대칭이다.**
+
+    검수는 ``replay``·``mock``·``live`` 셋이고 요약은 ``replay``·``live`` 둘이었다. 키가
+    없으면 라이브 버튼이 내려가므로, 요약 기능에서는 **사람이 자기 리뷰를 넣어 보는 일이
+    아예 불가능했다** -- 적어 둔 시나리오 9개만 돌 수 있었다. 발표의 절반이 그 일이다.
+    """
+    from demo.app import SummaryBody
+
+    annotation = SummaryBody.model_fields["mode"].annotation
+    import typing
+
+    assert set(typing.get_args(annotation)) == {"replay", "mock", "live"}
+
+
+def test_모의_모드가_사람이_쓴_리뷰로_요약을_만든다(client: TestClient) -> None:
+    """대역은 **모델이 아니다.** 키워드 표로 답하는 결정론적 대역이고 비용이 0이다."""
+    reviews = [f"5|잘 먹어요 기호성이 좋아요 {i}번" for i in range(1, 13)]
+    response = client.post("/api/summary", json={"mode": "mock", "reviews": reviews})
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["view"]["mode"] == "mock"
+    message = body["message"]
+    assert [row["extracted"] for row in message["extracted"]] == ["EXTRACTED"] * len(reviews)
+    assert message["summaries"], message
+    assert message["summaries"][0]["pros"], "대역이 집계표의 PRO 줄에 한 줄도 붙이지 않았다"
+
+
+def test_모의_모드가_본문_없이는_거부한다(client: TestClient) -> None:
+    response = client.post("/api/summary", json={"mode": "mock", "reviews": []})
+
+    assert response.status_code == 400, response.json()

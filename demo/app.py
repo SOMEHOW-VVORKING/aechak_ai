@@ -51,6 +51,7 @@ from demo.draft_cassettes import DRAFT_BY_ID, DRAFT_SCENARIOS, DraftScenario, dr
 from demo.mock import MockLlmClient
 from demo.replay import CassetteMiss, ReplayLlmClient, SequencedReplayClient
 from demo.summary_cassettes import SUMMARY_BY_ID, SUMMARY_SCENARIOS
+from demo.summary_mock import MockSummaryLlmClient
 
 CONSOLE_HTML = Path(__file__).parent / "console.html"
 
@@ -214,11 +215,15 @@ class SummaryBody(BaseModel):
 
     ``mode`` 의 기본값이 재생인 것이 안전장치다 -- 검수 콘솔과 같은 논리이고, 사람이
     발표 중에 실수로 유료 경로를 밟지 않는 쪽이 기본이어야 한다.
+
+    **``mock`` 이 검수 탭에만 있고 여기 없던 것이 비대칭이었다.** 키가 없으면 라이브가
+    내려가므로 요약은 적어 둔 시나리오 9개밖에 돌 수 없었고, 사람이 자기 리뷰를 타이핑해
+    결과를 보는 일이 이 기능에서만 불가능했다.
     """
 
-    mode: Literal["replay", "live"] = "replay"
+    mode: Literal["replay", "mock", "live"] = "replay"
     scenario: str | None = None
-    # 라이브 모드에서 사람이 직접 넣는 리뷰. "5|본문" 한 줄에 한 건이다.
+    # 모의·라이브 모드에서 사람이 직접 넣는 리뷰. "5|본문" 한 줄에 한 건이다.
     reviews: list[str] = Field(default_factory=list)
     categoryPath: list[str] = Field(default_factory=lambda: ["강아지", "사료", "건식사료"])
     basisReviewCount: int = 20
@@ -273,31 +278,43 @@ async def summarize(body: SummaryBody) -> JSONResponse:
             expected_exit=scenario.expected_exit,
         )
 
-    settings = Settings()
-    if not settings.anthropic_api_key:
-        return _error("AECHAK_AI_ANTHROPIC_API_KEY 가 없어 라이브 모드를 쓸 수 없다. 재생으로 돌려라")
     reviews = _parse_reviews(body.reviews)
     if not reviews:
         return _error('리뷰를 한 줄에 한 건씩 "별점|본문" 모양으로 넣어라. 예: 5|잘 먹어요')
+    request = ReviewSummaryRequest(
+        requestId=f"demo-{body.mode}",
+        productId=42,
+        categoryPath=body.categoryPath,
+        totalVisibleReviews=body.basisReviewCount,
+        newReviews=reviews,
+        requestedScopes=[
+            RequestedScope(
+                scope=SummaryScope.PRODUCT,
+                basisReviewCount=body.basisReviewCount,
+                unextractedReviewCount=0,
+                tally=[],
+            )
+        ],
+    )
 
+    if body.mode == "mock":
+        # 대역은 **모델이 아니다.** 키워드 표로 답하고 비용이 0이다. 임계와 모델 ID 는
+        # 운영 기본값을 그대로 쓴다 -- 콘솔이 보여 주는 임계와 돌아가는 임계가 같아야 한다.
+        return await _run_summary(
+            request=request,
+            llm=MockSummaryLlmClient(),
+            settings=Settings(),
+            mode="mock",
+            source="custom",
+        )
+
+    settings = Settings()
+    if not settings.anthropic_api_key:
+        return _error("AECHAK_AI_ANTHROPIC_API_KEY 가 없어 라이브 모드를 쓸 수 없다. 재생이나 모의로 돌려라")
     llm = LlmClient(api_key=settings.anthropic_api_key, timeout_seconds=settings.summary_timeout_seconds)
     try:
         return await _run_summary(
-            request=ReviewSummaryRequest(
-                requestId="demo-live",
-                productId=42,
-                categoryPath=body.categoryPath,
-                totalVisibleReviews=body.basisReviewCount,
-                newReviews=reviews,
-                requestedScopes=[
-                    RequestedScope(
-                        scope=SummaryScope.PRODUCT,
-                        basisReviewCount=body.basisReviewCount,
-                        unextractedReviewCount=0,
-                        tally=[],
-                    )
-                ],
-            ),
+            request=request,
             llm=llm,
             settings=settings,
             mode="live",
