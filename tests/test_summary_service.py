@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -1122,3 +1123,31 @@ async def test_한_줄_요약도_길이와_마스킹_게이트를_지난다() ->
 
     assert message.summaries[0].pros == []
     assert message.dropped.outputGateBlocked == 1
+
+
+# --- 집계표가 모델에게 인용의 귀속을 알려 준다 -------------------------------------------
+
+
+def test_집계표가_인용마다_리뷰_번호를_준다() -> None:
+    """**모델이 돌려줄 수 없는 것을 요구하고 있었다.**
+
+    ``_gate_quotes`` 는 ``(reviewId, text)`` 쌍이 집계표의 검증된 인용과 같아야 통과시키는데,
+    렌더된 집계표 줄에는 인용 문자열만 있고 **리뷰 번호가 없었다.** 그래서 모델이 번호를
+    맞힐 길이 없고, 성실하게 답해도 전 인용이 ``QUOTE_NOT_IN_TALLY`` 로 떨어진다 -- 요약의
+    인용이 구조적으로 영구히 비는 자리였다. 재생 카세트는 사람이 번호를 알고 적었기
+    때문에 그 사실이 화면에서 보이지 않았다.
+    """
+    from app.review_summary.narrate_prompt import render_tally_row
+
+    row = render_tally_row(
+        aspect_code="PALATABILITY",
+        aspect_name="기호성",
+        polarity="PRO",
+        mention_count=3,
+        share=0.3,
+        labels=["잘 먹는다"],
+        quotes=[(7, "허겁지겁 먹어요")],
+    )
+
+    assert "허겁지겁 먹어요" in row
+    assert re.search(r"리뷰\s*7", row), f"인용의 리뷰 번호가 집계표에 없다: {row}"
