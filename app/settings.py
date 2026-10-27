@@ -80,6 +80,40 @@ class Settings(BaseSettings):
     # 기본 꺼짐. 백엔드 열거에 TRIAGE가 없는 동안 켜면 판정 전건이 격리 토픽으로 간다.
     enable_triage: bool = False
 
+    # --- 리뷰 요약(SCRUM-310). 검수와 모델·토픽·폴 간격을 공유하지 않는다 ------------
+    #
+    # 기본 모델이 Haiku 4.5 인 이유가 둘이다. 같은 토큰에서 Sonnet 5 의 절반이고, 더
+    # 중요하게 Sonnet 5 는 ``thinking`` 을 생략하면 adaptive 가 켜져 **사고 토큰이 출력
+    # 단가로 과금되는데 산출물 글자 수에는 나타나지 않는다.** 억제 레버는 effort 하나이고
+    # thinking 을 끄려면 손대지 않기로 한 client.py 를 고쳐야 한다.
+    summary_extract_model: str = "claude-haiku-4-5"
+    # Haiku 4.5 는 effort 를 받으면 400 이고 그 400 이 SCHEMA_INVALID 로 숨는다.
+    # 미지정이면 client 가 output_config 를 아예 보내지 않는다.
+    summary_extract_effort: OptionalEffort = None
+    summary_narrate_model: str = "claude-haiku-4-5"
+    summary_narrate_effort: OptionalEffort = None
+    # 배치 10건 x 항목 2~4개 + 펫 맥락. 좁으면 TRUNCATED 로 떨어져 비용을 쓰고도 못 쓴다.
+    max_tokens_summary_extract: int = 4096
+    max_tokens_summary_narrate: int = 2048
+    summary_timeout_seconds: float = 60.0
+    # 메시지당 상한 둘. **폴 간격 예산이 이 두 수를 정한다**(아래 산수 참조).
+    summary_extract_batch_max: int = 10
+    summary_scopes_per_message: int = 2
+    # 리뷰 본문 절단. 올리면 추출 입력 토큰이 그만큼 오른다.
+    # 리뷰 최대 길이는 백엔드 ReviewConstraints.CONTENT_MAX = 1000 이다.
+    summary_content_chars: int = 400
+    # 임계 넷. 비용으로는 차이가 없고(미달이면 모델을 안 부른다) **거짓 일반화 위험으로만**
+    # 정해야 한다. 리뷰 2건으로 "반복되는 장점"을 적는 것이 이 값들이 막는 것이다.
+    summary_min_reviews: int = 10
+    summary_min_segment_reviews: int = 8
+    summary_min_aspect_mentions: int = 3
+    summary_min_aspect_share: float = 0.10
+    # 요약 몫의 일 예산. daily_cost_alert_usd 안의 몫이고 경보는 어느 기능이 태웠는지
+    # 말해 주지 않는다 -- 기능별 경보 분리는 아직 없다.
+    summary_daily_budget_usd: float = 2.0
+    # 기본 꺼짐. enable_triage 선례 -- 구현하고 측정하고 기본은 끈다.
+    enable_review_summary: bool = False
+
     # 예산 경보. 프로세스 로컬이라 강제력이 없다.
     # 실제 상한은 워크스페이스 spend limit이 걸고, 이 값은 경보용이다.
     daily_cost_alert_usd: float = 5.0
@@ -93,6 +127,16 @@ class Settings(BaseSettings):
     # 커밋 안 된 오프셋이 재배달되고 같은 상품을 전액 재검수한다.
     # worst_case_handle_seconds()보다 넓게 두고, 테스트가 그 관계를 지킨다.
     kafka_max_poll_interval_ms: int = 600_000
+
+    # 요약은 **전용 토픽과 전용 컨슈머 그룹**이다. 기존 검수 토픽에 새 eventType 을 흘리면
+    # runner._REQUEST_TYPES 가 모르는 종류를 경고 후 그대로 커밋해 **영구히 버린다** --
+    # 구버전 AI 가 배포돼 있으면 배포 순서가 데이터 손실을 만든다. 신규 토픽은 컨슈머가
+    # 없으면 메시지가 기다린다.
+    kafka_summary_request_topic: str = "aechak.summary.requests"
+    kafka_summary_result_topic: str = "aechak.summary.results"
+    kafka_summary_group_id: str = "aechak-ai-summarizer"
+    # 검수 폴 간격과 **따로** 둔다. 섞으면 요약 쪽 상한을 올릴 때 검수 리밸런스가 흔들린다.
+    kafka_summary_max_poll_interval_ms: int = 900_000
 
     prompt_version: str = "inspection-v1"
 
@@ -116,13 +160,33 @@ class Settings(BaseSettings):
         triage = self.triage_timeout_seconds if self.enable_triage else 0.0
         return triage + judge + tail
 
+    def summary_worst_case_handle_seconds(self) -> float:
+        """요약 메시지 한 건의 최악 wall clock. **검수 예산과 섞지 않는다.**
+
+        검수의 ``worst_case_handle_seconds()`` 는 ``tests/test_runner.py`` 가 검수 폴
+        간격과의 관계를 단언한다. 요약을 거기 더하면 요약 상한을 올릴 때 검수 컨슈머의
+        리밸런스 여유가 조용히 줄어든다. 그래서 식도 폴 간격도 따로 둔다.
+
+        **상한만 올리고 폴 간격을 빠뜨리는 것이 이 레포가 실제로 밟은 함정이다.**
+        추출 배치 수와 스코프 수를 올리면 이 값이 커지고, 폴 간격이 좁으면 테스트가 떨어진다.
+        """
+        one_call = 2 * self.summary_timeout_seconds + JUDGE_RETRY_DELAY_SECONDS
+        return one_call * (1 + self.summary_scopes_per_message)
+
     def model_ids(self) -> tuple[str, ...]:
-        """설정에 적힌 모델 ID 전부. 부팅에서 가격표와 맞춰 보는 데 쓴다."""
+        """설정에 적힌 모델 ID 전부. 부팅에서 가격표와 맞춰 보는 데 쓴다.
+
+        요약 모델을 **반드시** 넣는다. 안 넣으면 ``validate_pricing`` 의 부팅 검증을 받지
+        못하고, 모델 ID 를 오타 내도 ``_FALLBACK_PRICING (15.0, 75.0)`` 으로 조용히 15배
+        비싸게 계상된다.
+        """
         return (
             self.screening_model,
             self.escalation_model,
             self.notice_model,
             self.triage_model,
+            self.summary_extract_model,
+            self.summary_narrate_model,
         )
 
 

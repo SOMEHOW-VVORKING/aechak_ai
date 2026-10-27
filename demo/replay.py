@@ -143,3 +143,92 @@ def cassette_key(tool: dict[str, Any]) -> CallKey:
                 if {c.value for c in spec.categories} == wanted:
                     return (name, spec.perspective)
     raise CassetteMiss(f"관점을 알 수 없는 판정 툴이다. categories={sorted(wanted)}")
+
+
+# (툴 이름, 그 툴의 몇 번째 호출인가). 0부터 센다.
+SequencedCallKey = tuple[str, int]
+
+
+@dataclass(slots=True)
+class SequencedReplayClient:
+    """같은 툴을 여러 번 부르는 흐름의 재생 클라이언트. 요약(SCRUM-310)이 쓴다.
+
+    위의 ``ReplayLlmClient`` 를 그대로 쓸 수 없다. 카세트 키가 **(툴 이름, 관점)** 이고
+    ``report_findings`` 가 아닌 툴은 ``(name, None)`` 이 되므로, 추출 배치가 두 번 있으면
+    같은 키가 두 번 나와 **같은 응답이 두 번 흘러 들어간다.** 요약은 배치 수가 리뷰 수에
+    따라 변하고 서술도 스코프마다 한 번씩이라 그 충돌이 정상 경로에서 난다.
+
+    그래서 키를 **(툴 이름, 그 툴의 호출 순번)** 으로 둔다. 호출 순서 전체로 두지 않는
+    이유는 그러면 추출과 서술이 섞인 순번이 되어 파이프라인 분기가 바뀔 때마다 조용히
+    어긋나기 때문이다 -- 툴별로 세면 "두 번째 추출 배치"가 흐름과 무관하게 같은 키다.
+
+    없는 키는 ``CassetteMiss`` 로 터뜨린다. 조용히 실패로 접으면 콘솔이 거짓 단계를
+    그린다 -- 추출 실패는 ``UNEXTRACTED`` 이고 서술 실패는 ``narrateFailure`` 라서
+    둘 다 "정상적으로 비어 있는 요약"과 화면에서 구별돼야 한다.
+    """
+
+    entries: dict[SequencedCallKey, ScriptedCall] = field(default_factory=dict)
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    _seen: dict[str, int] = field(default_factory=dict)
+
+    async def call_tool(
+        self,
+        *,
+        model: str,
+        effort: str | None,
+        max_tokens: int,
+        system_blocks: list[dict[str, Any]],
+        user_content: list[dict[str, Any]],
+        tool: dict[str, Any],
+        request_id: str,
+        timeout_seconds: float | None = None,
+    ) -> LlmResult:
+        name = str(tool.get("name"))
+        ordinal = self._seen.get(name, 0)
+        self._seen[name] = ordinal + 1
+        key = (name, ordinal)
+        scripted = self.entries.get(key)
+        if scripted is None:
+            raise CassetteMiss(
+                f"카세트에 없는 호출이다. key={name}#{ordinal} model={model}. "
+                "시나리오의 entries 에 이 키를 더해라"
+            )
+
+        call_id = f"{request_id}-{len(self.calls):02d}-{name}"
+        self.calls.append(
+            {
+                "key": key,
+                "model": model,
+                "effort": effort,
+                "max_tokens": max_tokens,
+                "timeout_seconds": timeout_seconds,
+                "tool": name,
+                "system_blocks": system_blocks,
+                "user_content": user_content,
+            }
+        )
+        model_id = scripted.model_id or model
+        return LlmResult(
+            call_id=call_id,
+            outcome=scripted.outcome,
+            model_id=model_id,
+            tool_input=scripted.tool_input if scripted.outcome is CallOutcome.SUCCESS else None,
+            input_tokens=scripted.input_tokens,
+            cache_read_input_tokens=scripted.cache_read_input_tokens,
+            cache_creation_input_tokens=scripted.cache_creation_input_tokens,
+            output_tokens=scripted.output_tokens,
+            # 단가표는 운영 코드의 것을 그대로 쓴다. 데모가 자기 단가표를 들면 원장의
+            # 숫자가 운영과 어긋나고, 그 숫자로 비용을 이야기할 수 없다.
+            cost_micro_usd=cost_micro_usd(
+                model_id,
+                input_tokens=scripted.input_tokens,
+                cache_read=scripted.cache_read_input_tokens,
+                cache_creation=scripted.cache_creation_input_tokens,
+                output_tokens=scripted.output_tokens,
+            ),
+            latency_ms=scripted.latency_ms,
+            detail=scripted.detail,
+        )
+
+    async def aclose(self) -> None:
+        return None

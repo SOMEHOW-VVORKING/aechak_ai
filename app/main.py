@@ -16,7 +16,9 @@ from fastapi.responses import JSONResponse
 
 from app.inspection.pipeline import InspectionPipeline
 from app.kafka.runner import InspectionRunner
+from app.kafka.summary_runner import SummaryRunner
 from app.llm.client import LlmClient, validate_pricing
+from app.review_summary.service import SummaryService
 from app.settings import settings
 
 log = logging.getLogger(__name__)
@@ -60,9 +62,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runner = InspectionRunner(settings=settings, pipeline=pipeline)
     app.state.runner = runner
     await runner.start()
+
+    # 요약은 **기본 꺼짐**이다(``enable_triage`` 선례 -- 구현하고 측정하고 기본은 끈다).
+    # 켜면 전용 토픽·전용 컨슈머 그룹으로 별 러너가 붙는다. 같은 프로세스이긴 하므로
+    # 요약 쪽 버그가 검수까지 세울 수 있고, 프로세스 분리는 아직 하지 않았다.
+    summary_runner: SummaryRunner | None = None
+    if settings.enable_review_summary:
+        summary_runner = SummaryRunner(
+            settings=settings,
+            service=SummaryService(llm=llm, settings=settings),
+        )
+        await summary_runner.start()
+    app.state.summary_runner = summary_runner
+
     try:
         yield
     finally:
+        if summary_runner is not None:
+            await summary_runner.stop()
         await runner.stop()
         if llm is not None:
             await llm.aclose()
@@ -76,12 +93,20 @@ async def health() -> JSONResponse:
     """소비 루프까지 살아 있는지 본다. 프로세스 생존만 보면 컨슈머가 죽은 것을 놓친다."""
     runner: InspectionRunner | None = getattr(app.state, "runner", None)
     consuming = runner.healthy if runner is not None else False
+
+    # 요약 컨슈머는 **별 축으로 보고한다.** ``consuming`` 에 AND 로 섞으면 요약 러너가
+    # 죽었을 때 검수가 멀쩡한데도 전체가 DOWN 이 되어 ECS 가 태스크를 교체하고,
+    # 요약을 끈 배포에서는 그 필드가 거짓이 되어 헬스체크가 영구 503 이 된다.
+    summary_runner: SummaryRunner | None = getattr(app.state, "summary_runner", None)
+    summary_consuming = summary_runner.healthy if summary_runner is not None else False
     status = 200 if consuming else 503
     return JSONResponse(
         status_code=status,
         content={
             "status": "UP" if consuming else "DOWN",
             "consuming": consuming,
+            "reviewSummaryEnabled": settings.enable_review_summary,
+            "reviewSummaryConsuming": summary_consuming,
             "promptVersion": settings.prompt_version,
             "schemaVersion": settings.supported_schema_version,
         },
