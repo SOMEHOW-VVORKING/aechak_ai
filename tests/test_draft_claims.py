@@ -168,3 +168,43 @@ def test_표현_하나당_한_번만_보고한다() -> None:
 def test_빈_문자열과_공백은_적중이_없다() -> None:
     assert claims.screen("") == []
     assert claims.screen("   \n ") == []
+
+
+# --- 커버리지 숫자가 순환이 아니어야 한다 -------------------------------------------------
+
+
+def test_보류_집합이_정책_예시와_겹치지_않는다() -> None:
+    """**겹치면 보류 집합이 순환이 되어 측정 도구가 하나 사라진다.**
+
+    ``POLICY_CLAIM_EXAMPLES`` 를 분모로 쓴 "8건 중 8건"은 커버리지가 아니다 -- 사전이
+    그 목록에서 나왔고 같은 목록이 프롬프트에도 들어간다. 미지의 표현에 대해 아무것도
+    말하지 않는데 리포트 한 줄로는 커버리지처럼 읽혔다.
+    """
+    assert set(claims.HOLDOUT_CLAIM_EXAMPLES).isdisjoint(set(claims.POLICY_CLAIM_EXAMPLES))
+    assert len(claims.HOLDOUT_CLAIM_EXAMPLES) >= 6
+
+
+def test_보류_집합이_프롬프트에_들어가지_않는다() -> None:
+    """들어가면 모델이 그 표현만 피해 보류 집합이 측정 도구로서 죽는다."""
+    block = claims.forbidden_examples_block()
+
+    for example in claims.HOLDOUT_CLAIM_EXAMPLES:
+        assert example not in block, example
+
+
+def test_보류_집합의_미탐을_숨기지_않는다() -> None:
+    """**네거티브 리스트는 못 적어 둔 표현을 놓친다. 낮은 것이 사실이다.**
+
+    이 테스트는 특정 적중 수를 고정하지 않는다 -- 고정하면 사전을 늘릴 때마다 깨지고,
+    보류 집합을 보고 사전을 고치는 쪽으로 압력이 생긴다. 고정하는 것은 **그 수를 리포트가
+    실제로 찍는다는 사실**이다.
+    """
+    from harness import run_draft
+
+    rows = dict(run_draft._report_guards())
+
+    assert "효능 사전 보류 집합" in rows
+    assert "비순환" in rows["효능 사전 보류 집합"]
+    # 지금은 0/8 이다. 0 이어도 찍혀야 한다 -- 숨기면 커버리지 숫자가 거짓이 된다.
+    hits = sum(1 for ex in claims.HOLDOUT_CLAIM_EXAMPLES if claims.screen(ex))
+    assert f"{hits}/{len(claims.HOLDOUT_CLAIM_EXAMPLES)}건" in rows["효능 사전 보류 집합"]

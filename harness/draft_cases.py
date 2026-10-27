@@ -69,6 +69,22 @@ class ImageVariant(StrEnum):
     WRONG = "WRONG"
 
 
+class WrongPhotoKind(StrEnum):
+    """오사진이 **어떻게** 틀렸는가. 셋이 서로 다른 난이도다.
+
+    한 가지로 뭉개면 "오사진 안전율"이 어느 종류에서 무너지는지 알 수 없다. 모델이
+    전혀 다른 품목 사진은 알아보고 **같은 품목 다른 종** 사진은 못 알아보는 것이
+    충분히 있을 수 있는데, 후자가 반려동물 커머스에서 더 흔하고 더 위험하다.
+    """
+
+    # 전혀 다른 품목(사료 상품명에 목줄 사진).
+    OTHER_ITEM = "OTHER_ITEM"
+    # 같은 품목, 다른 종(강아지 사료 상품명에 고양이 사료 사진).
+    OTHER_SPECIES = "OTHER_SPECIES"
+    # 상품이 안 찍힌 사진(사람·배경만).
+    NO_PRODUCT = "NO_PRODUCT"
+
+
 @dataclass(frozen=True, slots=True)
 class DraftCase:
     id: str
@@ -80,6 +96,8 @@ class DraftCase:
     # 카테고리의 한계 이득을 재려면 미지정 건이 반드시 있어야 한다.
     category_given: int | None = None
     image_variant: ImageVariant | None = None
+    # ``image_variant`` 가 ``WRONG`` 일 때만 뜻이 있다. 러너가 안전율을 종류별로 가른다.
+    wrong_photo_kind: WrongPhotoKind | None = None
     # 옵션 그룹명 채점은 집합 교집합으로 한다. 비면 채점하지 않는다.
     acceptable_option_group_names: frozenset[str] = frozenset()
     # 0단 규칙에 걸려 모델을 타지 않는 건. **정확도 분모에서 뺀다.**
@@ -101,6 +119,7 @@ CASES: tuple[DraftCase, ...] = (
         category_given=None,
         acceptable_option_group_names=_SIZE | _FLAVOR,
         note="'건식사료' 는 강아지/고양이 둘에 걸린다. '멍뭉이' 는 종 사전에 없다",
+        image_variant=ImageVariant.GOOD,
     ),
     DraftCase(
         "leaf-112-ambiguous",
@@ -109,6 +128,7 @@ CASES: tuple[DraftCase, ...] = (
         NameReveals.AMBIGUOUS,
         category_given=1,
         acceptable_option_group_names=_SIZE | _FLAVOR,
+        image_variant=ImageVariant.GOOD,
     ),
     DraftCase(
         "leaf-113-explicit",
@@ -116,6 +136,7 @@ CASES: tuple[DraftCase, ...] = (
         113,
         NameReveals.EXPLICIT,
         acceptable_option_group_names=_SIZE | _FLAVOR,
+        image_variant=ImageVariant.GOOD,
     ),
     DraftCase(
         "leaf-114-ambiguous",
@@ -124,6 +145,7 @@ CASES: tuple[DraftCase, ...] = (
         NameReveals.AMBIGUOUS,
         category_given=11,
         acceptable_option_group_names=_SIZE,
+        image_variant=ImageVariant.GOOD,
     ),
     DraftCase(
         "leaf-121-explicit",
@@ -132,6 +154,8 @@ CASES: tuple[DraftCase, ...] = (
         NameReveals.EXPLICIT,
         category_given=12,
         acceptable_option_group_names=_SIZE | _FLAVOR,
+        image_variant=ImageVariant.WRONG,
+        wrong_photo_kind=WrongPhotoKind.OTHER_ITEM,
     ),
     DraftCase(
         "leaf-122-explicit",
@@ -146,6 +170,8 @@ CASES: tuple[DraftCase, ...] = (
         123,
         NameReveals.AMBIGUOUS,
         acceptable_option_group_names=_SIZE | _FLAVOR,
+        image_variant=ImageVariant.WRONG,
+        wrong_photo_kind=WrongPhotoKind.OTHER_SPECIES,
     ),
     DraftCase(
         "leaf-124-ambiguous",
@@ -153,6 +179,8 @@ CASES: tuple[DraftCase, ...] = (
         124,
         NameReveals.AMBIGUOUS,
         acceptable_option_group_names=_SIZE | _FLAVOR,
+        image_variant=ImageVariant.WRONG,
+        wrong_photo_kind=WrongPhotoKind.OTHER_ITEM,
     ),
     DraftCase(
         "leaf-131-ambiguous",
@@ -161,6 +189,7 @@ CASES: tuple[DraftCase, ...] = (
         NameReveals.AMBIGUOUS,
         acceptable_option_group_names=_SIZE,
         note="효능 단정을 유도하는 품목이다. claims 가드가 실제로 걸리는지 보는 자리",
+        image_variant=ImageVariant.DARK,
     ),
     DraftCase(
         "leaf-132-explicit",
@@ -223,6 +252,8 @@ CASES: tuple[DraftCase, ...] = (
         NameReveals.EXPLICIT,
         category_given=152,
         acceptable_option_group_names=_SIZE | _COLOR,
+        image_variant=ImageVariant.WRONG,
+        wrong_photo_kind=WrongPhotoKind.NO_PRODUCT,
     ),
     DraftCase(
         "leaf-153-explicit",
@@ -281,6 +312,8 @@ CASES: tuple[DraftCase, ...] = (
         213,
         NameReveals.AMBIGUOUS,
         acceptable_option_group_names=_SIZE,
+        image_variant=ImageVariant.WRONG,
+        wrong_photo_kind=WrongPhotoKind.OTHER_SPECIES,
     ),
     DraftCase(
         "leaf-221-ambiguous",
@@ -599,6 +632,7 @@ CASES: tuple[DraftCase, ...] = (
         142,
         NameReveals.OPAQUE,
         image_variant=ImageVariant.WRONG,
+        wrong_photo_kind=WrongPhotoKind.OTHER_ITEM,
         acceptable_option_group_names=_SIZE | _COLOR,
         note="사진이 상품명과 다른 건. MISMATCHES_NAME 을 내고 이미지 유래 필드를 비워야 한다",
     ),

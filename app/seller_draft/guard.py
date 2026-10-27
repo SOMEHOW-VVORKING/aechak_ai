@@ -36,6 +36,8 @@
 from __future__ import annotations
 
 import itertools
+import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from app.inspection import rules
@@ -57,6 +59,17 @@ MAX_VALUES_PER_GROUP = 6
 MAX_COMBINATIONS = 36
 # ``OptionGroup.NAME_MAX`` / ``OptionValue.NAME_MAX`` 와 같은 수다.
 OPTION_NAME_MAX = 100
+
+# **셀러가 잠근 옵션의 상한. 위 제안 상한과 다른 수이고, 그 차이가 의도다.**
+#
+# 위 셋은 "초안이 얼마나 제안할지"의 수다. 셀러가 이미 셀러센터에서 타이핑한 값에 그것을
+# 적용하면 3그룹 옵션이 "상한 2 초과"로 통째로 비워져 **셀러의 입력이 응답에서 사라진다** --
+# 고치려던 것보다 나쁜 결함이다. 잠근 값에 걸 수 있는 상한은 **등록이 실제로 거부되는 수**,
+# 즉 백엔드 DTO 의 것이다(``ProductDraftSaveRequest.OPTION_GROUPS_MAX = 5``,
+# ``OPTION_COMBINATIONS_MAX = 200``, 그룹당 값 50).
+LOCKED_MAX_OPTION_GROUPS = 5
+LOCKED_MAX_VALUES_PER_GROUP = 50
+LOCKED_MAX_COMBINATIONS = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,14 +224,7 @@ def check_options(groups: list[OptionGroupDraft]) -> OptionVerdict:
         drops.append(GuardDrop(field="optionGroups", kind=kind, detail=detail))
         return OptionVerdict([], [], status, drops)
 
-    cleaned: list[OptionGroupDraft] = []
-    for group in groups:
-        name = (group.name or "").strip()
-        values = [value.strip() for value in group.values if value and value.strip()]
-        if not name or not values:
-            continue
-        cleaned.append(OptionGroupDraft(name=name, values=list(dict.fromkeys(values))))
-
+    cleaned = _clean(groups)
     if not cleaned:
         return OptionVerdict([], [], FieldStatus.EMPTY_SCHEMA_INVALID, drops)
 
@@ -229,14 +235,6 @@ def check_options(groups: list[OptionGroupDraft]) -> OptionVerdict:
             f"그룹이 {len(cleaned)}개로 상한 {MAX_OPTION_GROUPS}를 넘겨 옵션 제안을 비웠다",
         )
 
-    names = [group.name for group in cleaned]
-    if len(set(names)) != len(names):
-        return reject(
-            GuardKind.OPTION_RULE,
-            FieldStatus.EMPTY_GUARD_OPTION_RULE,
-            "그룹 이름이 겹쳐 옵션 제안을 비웠다",
-        )
-
     for group in cleaned:
         if len(group.values) > MAX_VALUES_PER_GROUP:
             return reject(
@@ -245,6 +243,101 @@ def check_options(groups: list[OptionGroupDraft]) -> OptionVerdict:
                 f"'{group.name}' 의 값이 {len(group.values)}개로 상한 "
                 f"{MAX_VALUES_PER_GROUP}를 넘겨 옵션 제안을 비웠다",
             )
+
+    invalid = _registration_invariants(cleaned, reject)
+    if invalid is not None:
+        return invalid
+
+    return _finish(cleaned, drops, reject, max_combinations=MAX_COMBINATIONS, what="옵션 제안")
+
+
+def check_locked_options(groups: list[OptionGroupDraft]) -> OptionVerdict:
+    """셀러가 잠근 옵션. **등록 불변식만 본다. 제안 상한은 보지 않는다.**
+
+    처음 판은 잠근 경로가 ``check_options()`` 를 **통째로 건너뛰었다.** 그래서 등록이
+    거부될 옵션(색상의 "블랙"과 패턴의 "블랙" -- 값 이름 전역 유일 위반)을
+    ``KEPT_LOCKED``(= "셀러가 쓴 값이니 괜찮다")로, **사유 없이** 돌려줬다. 셀러가 그대로
+    저장하면 등록이 거부되고 왜 거부되는지 알 길이 없다. ``guard`` 머리글이 "모델이
+    자연스럽게 위반하는 규칙이고 통과시키면 등록이 거부된다"고 적은 그 상태를 이 경로가
+    만들고 있었다.
+
+    그렇다고 ``check_options()`` 를 그대로 태울 수도 없다 -- 그 함수의 앞부분은 **제안
+    상한**이고, 셀러의 3그룹 옵션을 "상한 초과"로 비우면 그들의 입력이 사라진다.
+    그래서 등록 불변식 부분만 공유한다.
+
+    **데카르트곱은 세기 전에 곱으로 막는다.** ``build_combinations`` 를 먼저 부르고 길이를
+    보면 늦다 -- 5그룹 x 50값이면 거부 판정 전에 312,500,000개 객체가 이미 만들어져
+    셀러가 기다리는 동기 엔드포인트가 OOM 으로 죽는다. 계약이 그 입력을 역직렬화에서
+    막지만, 그 상한에 기대지 않고 여기서도 곱을 센다.
+    """
+    drops: list[GuardDrop] = []
+
+    def reject(kind: GuardKind, status: FieldStatus, detail: str) -> OptionVerdict:
+        drops.append(GuardDrop(field="optionGroups", kind=kind, detail=detail))
+        return OptionVerdict([], [], status, drops)
+
+    cleaned = _clean(groups)
+    if not cleaned:
+        return OptionVerdict([], [], FieldStatus.EMPTY_SCHEMA_INVALID, drops)
+
+    if len(cleaned) > LOCKED_MAX_OPTION_GROUPS:
+        return reject(
+            GuardKind.OPTION_RULE,
+            FieldStatus.EMPTY_GUARD_OPTION_RULE,
+            f"그룹이 {len(cleaned)}개로 등록 상한 {LOCKED_MAX_OPTION_GROUPS}를 넘는다",
+        )
+    for group in cleaned:
+        if len(group.values) > LOCKED_MAX_VALUES_PER_GROUP:
+            return reject(
+                GuardKind.OPTION_RULE,
+                FieldStatus.EMPTY_GUARD_OPTION_RULE,
+                f"'{group.name}' 의 값이 {len(group.values)}개로 등록 상한 "
+                f"{LOCKED_MAX_VALUES_PER_GROUP}를 넘는다",
+            )
+
+    product = math.prod(len(group.values) for group in cleaned)
+    if product > LOCKED_MAX_COMBINATIONS:
+        # **곱을 만들기 전에 거부한다.** 만든 뒤 길이를 보면 메모리가 이미 터진다.
+        return reject(
+            GuardKind.OPTION_RULE,
+            FieldStatus.EMPTY_GUARD_OPTION_RULE,
+            f"데카르트곱이 {product}개로 등록 상한 {LOCKED_MAX_COMBINATIONS}를 넘는다",
+        )
+
+    invalid = _registration_invariants(cleaned, reject)
+    if invalid is not None:
+        return invalid
+    return _finish(cleaned, drops, reject, max_combinations=LOCKED_MAX_COMBINATIONS, what="잠근 옵션")
+
+
+def _clean(groups: list[OptionGroupDraft]) -> list[OptionGroupDraft]:
+    """빈 이름·빈 값·중복 값을 떨어낸다. **거부가 아니라 정리다.**"""
+    cleaned: list[OptionGroupDraft] = []
+    for group in groups:
+        name = (group.name or "").strip()
+        values = [value.strip() for value in group.values if value and value.strip()]
+        if not name or not values:
+            continue
+        cleaned.append(OptionGroupDraft(name=name, values=list(dict.fromkeys(values))))
+    return cleaned
+
+
+def _registration_invariants(
+    cleaned: list[OptionGroupDraft],
+    reject: Callable[[GuardKind, FieldStatus, str], OptionVerdict],
+) -> OptionVerdict | None:
+    """**등록이 실제로 거부되는 조건**만 본다. 통과하면 ``None``.
+
+    모델 출력과 잠근 값이 **같은 함수**를 쓴다. 사본을 두면 한쪽만 고쳐져 잠근 값이
+    통과하고 모델 값은 떨어지는(또는 반대) 상태가 된다.
+    """
+    names = [group.name for group in cleaned]
+    if len(set(names)) != len(names):
+        return reject(
+            GuardKind.OPTION_RULE,
+            FieldStatus.EMPTY_GUARD_OPTION_RULE,
+            "그룹 이름이 겹쳐 옵션을 비웠다",
+        )
 
     flat = [value for group in cleaned for value in group.values]
     if len(set(flat)) != len(flat):
@@ -260,7 +353,7 @@ def check_options(groups: list[OptionGroupDraft]) -> OptionVerdict:
         return reject(
             GuardKind.LENGTH,
             FieldStatus.EMPTY_GUARD_LENGTH,
-            f"이름이 {OPTION_NAME_MAX}자를 넘는 항목이 있어 옵션 제안을 비웠다",
+            f"이름이 {OPTION_NAME_MAX}자를 넘는 항목이 있어 옵션을 비웠다",
         )
 
     for text in (*names, *flat):
@@ -268,19 +361,29 @@ def check_options(groups: list[OptionGroupDraft]) -> OptionVerdict:
         if not verdict.ok:
             assert verdict.status is not None and verdict.kind is not None
             return reject(verdict.kind, verdict.status, f"'{text}': {verdict.detail}")
+    return None
 
+
+def _finish(
+    cleaned: list[OptionGroupDraft],
+    drops: list[GuardDrop],
+    reject: Callable[[GuardKind, FieldStatus, str], OptionVerdict],
+    *,
+    max_combinations: int,
+    what: str,
+) -> OptionVerdict:
     combos = build_combinations(cleaned)
     if not combos:
         return reject(
             GuardKind.OPTION_RULE,
             FieldStatus.EMPTY_GUARD_OPTION_RULE,
-            "조합을 하나도 만들 수 없어 옵션 제안을 비웠다",
+            f"조합을 하나도 만들 수 없어 {what}을 비웠다",
         )
-    if len(combos) > MAX_COMBINATIONS:
+    if len(combos) > max_combinations:
         return reject(
             GuardKind.OPTION_RULE,
             FieldStatus.EMPTY_GUARD_OPTION_RULE,
-            f"데카르트곱이 {len(combos)}개로 상한 {MAX_COMBINATIONS}를 넘겨 옵션 제안을 비웠다",
+            f"데카르트곱이 {len(combos)}개로 상한 {max_combinations}를 넘겨 {what}을 비웠다",
         )
     return OptionVerdict(cleaned, combos, FieldStatus.FILLED, drops)
 
@@ -302,6 +405,9 @@ def build_combinations(groups: list[OptionGroupDraft]) -> list[OptionCombination
 
 
 __all__ = [
+    "LOCKED_MAX_COMBINATIONS",
+    "LOCKED_MAX_OPTION_GROUPS",
+    "LOCKED_MAX_VALUES_PER_GROUP",
     "MAX_COMBINATIONS",
     "MAX_OPTION_GROUPS",
     "MAX_VALUES_PER_GROUP",
@@ -311,6 +417,7 @@ __all__ = [
     "TextVerdict",
     "build_combinations",
     "build_description",
+    "check_locked_options",
     "check_options",
     "screen_text",
 ]

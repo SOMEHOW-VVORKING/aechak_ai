@@ -56,6 +56,7 @@ from typing import Any
 import anthropic
 
 from app.inspection import rules
+from app.llm.client import cost_micro_usd
 from app.schemas.draft import (
     Basis,
     FieldStatus,
@@ -86,16 +87,47 @@ IMAGE_ROOT = Path(__file__).parent / "draft_images"
 MODES = ("lexicon-only", "a", "a-blind", "b", "gated")
 VARIANTS = (640, 768, 896, 1024, 1500)
 
-# 건당 추정 microUSD. **추정이고 실측이 아니다.** ``--count-tokens`` 는 접두부 토큰만
-# 치환하고 이 표를 치환하지 않는다 -- 출력 토큰 전제까지 재려면 실호출이 필요하다.
+# 오사진 안전율을 숫자로 찍기 위한 최소 케이스 수. 미달이면 "판정 불가"로 찍는다.
+#
+# 그 줄은 스스로를 출시 게이트로 선언하므로 분모가 작으면 게이트가 운에 걸린다.
+# ``--repeat`` 는 같은 사진을 다시 보내는 것이라 분모를 늘리지 않는다 -- 필요한 것은
+# **서로 다른 오사진**이고, 특히 어휘 게이트가 비어 모델이 사진에 가장 많이 의존하는
+# OPAQUE 층에 있어야 한다.
+WRONG_PHOTO_MIN_CASES = 6
+
+# 건당 추정의 **토큰 가정값**. ``--count-tokens`` / ``--count-image-tokens`` 가 치환하는
+# 지점이 여기 한 곳이다.
 #
 # 전제: 접두부 2,200 토큰(지시 + 리프 경로 실측 글자 + 툴 스키마), user content 140,
-# 출력 450(설명 슬롯 4 + 옵션 2그룹 + 리프 + basis). Haiku 4.5 $1/$5.
-_DRAFT_ESTIMATE_MICRO_USD = {
-    "draft_text_haiku": 4_590,
-    # 896 사방 이미지의 **증분**. 1,024 토큰 x $1/MTok.
-    "draft_image_896_haiku": 1_024,
+# 출력 450(설명 슬롯 4 + 옵션 2그룹 + 리프 + basis). 896 사방 이미지 1,024 토큰.
+_DRAFT_TOKEN_ASSUMPTIONS = {
+    "draft_text_haiku": {"input_tokens": 2_340, "output_tokens": 450},
+    # 896 사방 이미지의 **증분**. 입력 토큰만 더한다.
+    "draft_image_896_haiku": {"input_tokens": 1_024, "output_tokens": 0},
 }
+
+
+def _estimate_micro_usd() -> dict[str, int]:
+    """건당 추정 microUSD. **단가 정본 함수에서 파생한다. 상수로 적지 않는다.**
+
+    처음 판은 손계산한 microUSD 를 표에 적어 뒀다. 값은 맞았지만 ``cost_micro_usd()`` 와
+    **연결이 없었다** -- 테스트는 이 표 아래쪽(비율·일 상한)의 파생만 고정하고 표 자체가
+    ``_PRICING`` 을 따라가는지는 아무도 보지 않았다. ``client.py`` 의 ``_PRICING`` 주석이
+    "모델 확정 시 공식 단가로 재확인한다"고 단가 변경을 예고하고 있어, 단가를 고치는 날
+    두 하네스의 모든 비용 줄과 일 예산 상한이 **조용히 과거 값으로 남고 테스트는 전부
+    초록**이었다. "상수로 적지 않고 비용표에서 파생한다"는 자랑이 표 아래쪽만 참이고
+    표 자체가 상수였던 것이다.
+
+    지금은 토큰 가정값만 상수이고 돈은 전부 여기서 계산된다.
+    """
+    model = Settings().draft_model
+    return {
+        key: cost_micro_usd(model, cache_read=0, cache_creation=0, **tokens)
+        for key, tokens in _DRAFT_TOKEN_ASSUMPTIONS.items()
+    }
+
+
+_DRAFT_ESTIMATE_MICRO_USD = _estimate_micro_usd()
 
 
 def _image_cost_ratio() -> float:
@@ -439,7 +471,29 @@ def _report_guards() -> list[tuple[str, str]]:
             f"정책 효능 위반 예시 {len(covered)}건 중 0단(rules.screen)이 잡는 것 "
             f"{zero_stage_hits}건 / claims 사전이 잡는 것 "
             f"{sum(1 for ex in covered if claims.screen(ex))}건 — "
-            "**0단이 0건인 것이 claims.py 를 새로 만든 이유다**",
+            "**0단이 0건인 것이 claims.py 를 새로 만든 이유다.** 다만 claims 쪽 숫자는 "
+            "**커버리지가 아니다** -- 분모가 사전의 출처와 같고 같은 목록이 프롬프트에도 "
+            "들어가므로 순환이며 미탐을 측정하지 못한다. 그 축은 아래 보류 집합이 본다",
+        )
+    )
+    holdout = claims.HOLDOUT_CLAIM_EXAMPLES
+    holdout_hits = sum(1 for ex in holdout if claims.screen(ex))
+    missed = [ex for ex in holdout if not claims.screen(ex)]
+    rows.append(
+        (
+            "효능 사전 보류 집합",
+            f"{holdout_hits}/{len(holdout)}건 — **사전을 쓸 때 참조하지 않은 표현이고 이것이 "
+            "유일한 비순환 숫자다.** 네거티브 리스트라 낮게 나오는 것이 사실이다"
+            + (
+                f" / 놓친 것: {', '.join(missed[:4])}" + (" ..." if len(missed) > 4 else "") if missed else ""
+            ),
+        )
+    )
+    rows.append(
+        (
+            "보류 집합을 보고 사전을 고치지 마라",
+            "고치는 순간 이 숫자도 순환이 되어 측정 도구가 하나 사라진다. "
+            "늘리고 싶으면 **새 보류 집합을 먼저 만들어라**",
         )
     )
     rows.append(
@@ -532,11 +586,41 @@ def _report_images() -> list[tuple[str, str]]:
         )
     )
     variants = Counter(case.image_variant.value for case in CASES if case.image_variant is not None)
+    wrong = variants.get(ImageVariant.WRONG.value, 0)
     rows.append(
         (
             "사진 등급 분포",
             ", ".join(f"{k}={v}" for k, v in sorted(variants.items()))
-            + f" — WRONG {variants.get(ImageVariant.WRONG.value, 0)}건이 **오사진 안전율**의 분모다",
+            + f" — WRONG {wrong}건이 **오사진 안전율**의 분모다"
+            + (
+                f" (최소 {WRONG_PHOTO_MIN_CASES}건 충족)"
+                if wrong >= WRONG_PHOTO_MIN_CASES
+                else f" / **최소 {WRONG_PHOTO_MIN_CASES}건에 미달해 그 줄은 판정 불가로 찍힌다**"
+            ),
+        )
+    )
+    kinds = Counter(case.wrong_photo_kind.value for case in CASES if case.wrong_photo_kind is not None)
+    rows.append(
+        (
+            "오사진 종류",
+            ", ".join(f"{k}={v}" for k, v in sorted(kinds.items()))
+            + " — 한 가지로 뭉개면 어느 종류에서 무너지는지 알 수 없다. "
+            "**OTHER_SPECIES(같은 품목 다른 종)가 반려동물 커머스에서 더 흔하고 더 위험하다**",
+        )
+    )
+    layer_image = {
+        layer.value: (
+            sum(1 for case in group if case.image_variant is not None),
+            len(group),
+        )
+        for layer, group in by_stratum().items()
+    }
+    rows.append(
+        (
+            "층별 사진 보유(케이스)",
+            " / ".join(f"{k}={v[0]}/{v[1]}" for k, v in sorted(layer_image.items()))
+            + " — **층별 한계 이득을 읽기 전에 이 줄을 봐야 한다.** 사진이 없는 건은 "
+            "(가)와 (나)가 같은 입력을 받으므로 그 층의 delta 에 이미지가 들어 있지 않다",
         )
     )
     return rows
@@ -908,6 +992,17 @@ def _accuracy_rows(mode: str, records: list[Record]) -> list[tuple[str, str]]:
             + " — **이 줄이 입력 방식 결정의 1순위 재료다**",
         )
     )
+    rows.append(
+        (
+            f"[{mode}] 층별 사진 보유",
+            " / ".join(
+                f"{layer}={sum(1 for r in group if r.image_variant is not None)}/{len(group)}"
+                for layer, group in sorted(by_layer.items())
+            )
+            + " — **이 줄 없이는 위 층별 숫자를 읽을 수 없다.** 사진이 없는 건은 (가)와 "
+            "(나)가 완전히 같은 입력을 받으므로 그 층의 delta 는 반복 불일치 잡음이다",
+        )
+    )
     declines = [r for r in pool if r.leaf_truth is None]
     if declines:
         rows.append(
@@ -916,6 +1011,29 @@ def _accuracy_rows(mode: str, records: list[Record]) -> list[tuple[str, str]]:
                 f"{sum(1 for r in declines if r.leaf_correct)}/{len(declines)} — "
                 "사람도 품목을 알 수 없는 이름에서 **고르지 않는 것이 정답이다**. "
                 "추측해서 맞히는 쪽이 유리하게 측정되지 않게 하는 분모다",
+            )
+        )
+    option_scored = [r for r in pool if r.option_group_hit is not None]
+    if option_scored:
+        hit = sum(1 for r in option_scored if r.option_group_hit)
+        rows.append(
+            (
+                f"[{mode}] 옵션 그룹 적중",
+                f"{hit}/{len(option_scored)}({hit / len(option_scored):.0%}) — "
+                "**리프 말고 유일하게 정답이 있는 내용 지표다.** 전에는 레코드에만 담고 "
+                "리포트에 찍지 않아 summary.tsv 를 읽는 사람에게는 없는 숫자였다",
+            )
+        )
+        by_layer_option: dict[str, list[Record]] = defaultdict(list)
+        for record in option_scored:
+            by_layer_option[record.name_reveals].append(record)
+        rows.append(
+            (
+                f"[{mode}] 옵션 그룹 적중 층별",
+                " / ".join(
+                    f"{layer}={sum(1 for r in group if r.option_group_hit)}/{len(group)}"
+                    for layer, group in sorted(by_layer_option.items())
+                ),
             )
         )
     return rows
@@ -973,7 +1091,25 @@ def _summarize(records: list[Record], mode: str) -> list[tuple[str, str]]:
                 ),
             )
         )
-        if wrong:
+        wrong_cases = {r.case_id for r in wrong}
+        if len(wrong_cases) < WRONG_PHOTO_MIN_CASES:
+            # **1건짜리 숫자로 출시 게이트를 통과·탈락시키지 않는다.**
+            #
+            # 이 줄은 스스로를 go/no-go 게이트로 선언한다("낮으면 정확도와 무관하게 켜지
+            # 않는다"). 그런데 분모가 사진 1장이면 값이 0/3·1/3·2/3·3/3 네 눈금만 갖고
+            # (``--repeat`` 는 같은 사진을 다시 보내는 것이라 분모를 늘리지 않는다),
+            # "상품명과 다른 사진을 믿고 자신 있게 틀린 리프를 확정하는가"라는 이미지
+            # 입장의 고유 위험이 **사진 한 장의 운**에 걸린다. 설계가 가장 피한다고 밝힌
+            # 실패(조용히 틀린 PINNED)의 측정이 여기인데 통계적으로 아무것도 말하지 못한다.
+            rows.append(
+                (
+                    f"[{mode}] 오사진 안전율",
+                    f"**판정 불가** — WRONG 등급 케이스가 {len(wrong_cases)}건이고 "
+                    f"최소 {WRONG_PHOTO_MIN_CASES}건이 필요하다. 1건짜리 숫자로 이미지를 "
+                    "켜거나 끄지 않는다. 층을 걸쳐 케이스를 더해라",
+                )
+            )
+        else:
             safe = sum(
                 1
                 for r in wrong
@@ -983,8 +1119,8 @@ def _summarize(records: list[Record], mode: str) -> list[tuple[str, str]]:
             rows.append(
                 (
                     f"[{mode}] 오사진 안전율",
-                    f"{safe}/{len(wrong)} — **이 숫자가 낮으면 정확도와 무관하게 이미지를 "
-                    "켜지 않는다.** 비용 문제가 아니라 거짓 문제다",
+                    f"{safe}/{len(wrong)} (케이스 {len(wrong_cases)}건) — **이 숫자가 낮으면 "
+                    "정확도와 무관하게 이미지를 켜지 않는다.** 비용 문제가 아니라 거짓 문제다",
                 )
             )
         basis_image = sum(1 for r in with_image if Basis.IMAGE.value in r.basis.values())
@@ -1019,39 +1155,91 @@ def _summarize(records: list[Record], mode: str) -> list[tuple[str, str]]:
 
 
 def _compare(baseline: list[Record], current: list[Record], *, label: str) -> list[tuple[str, str]]:
-    """**층별 한계 이득.** 평균만 보면 이미지가 값을 내는 구간이 묻힌다."""
-    rows: list[tuple[str, str]] = []
+    """**층별 한계 이득.** 평균만 보면 이미지가 값을 내는 구간이 묻힌다.
 
-    def acc(records: list[Record], layer: str | None) -> tuple[int, int]:
-        pool = [r for r in records if r.scorable and (layer is None or r.name_reveals == layer)]
+    ## 분모를 사진 보유 건으로 좁힌 짝 비교가 함께 나간다
+
+    처음 판은 층별 분모를 ``scorable and name_reveals`` 로만 걸렀다. 그런데 사진 픽스처가
+    걸린 케이스는 층별로 치우쳐 있어(실측: AMBIGUOUS 1/19, EXPLICIT 2/31, OPAQUE 16/16)
+    ``mode b`` 를 돌려도 AMBIGUOUS 층 19건 중 18건이 ``mode a`` 와 **완전히 같은 입력**을
+    받는다. 그 층의 delta 는 이미지 효과가 아니라 **반복 불일치 잡음**이다(결정성 레버가
+    API 층에 하나도 없다). 하필 그 줄에 "입력 방식 결정의 1순위 재료"가 붙어 있었다.
+
+    그래서 두 줄을 나란히 찍는다. 희석된 전체 비교(운영에서 그 모드를 켠 평균 효과)와
+    **사진 보유 건으로 좁힌 짝 비교**(이미지가 실제로 하는 일). 둘이 크게 다르면 읽는
+    사람이 희석을 알아야 한다.
+    """
+    rows: list[tuple[str, str]] = []
+    with_image = {r.case_id for r in current if r.image_variant is not None}
+
+    def acc(records: list[Record], layer: str | None, *, only_image: bool) -> tuple[int, int]:
+        pool = [
+            r
+            for r in records
+            if r.scorable
+            and (layer is None or r.name_reveals == layer)
+            and (not only_image or r.case_id in with_image)
+        ]
         return sum(1 for r in pool if r.leaf_correct), len(pool)
 
-    parts: list[str] = []
-    for layer in (None, *(reveal.value for reveal in NameReveals)):
-        base_hit, base_total = acc(baseline, layer)
-        cur_hit, cur_total = acc(current, layer)
-        if not base_total or not cur_total:
-            continue
-        delta = cur_hit / cur_total - base_hit / base_total
-        parts.append(f"{layer or '전체'}={delta:+.0%}")
-    rows.append((f"한계 이득 {label}", " / ".join(parts) + " — **층별로 읽어야 결론이 보인다**"))
+    def deltas(*, only_image: bool) -> str:
+        parts: list[str] = []
+        for layer in (None, *(reveal.value for reveal in NameReveals)):
+            base_hit, base_total = acc(baseline, layer, only_image=only_image)
+            cur_hit, cur_total = acc(current, layer, only_image=only_image)
+            if not base_total or not cur_total:
+                continue
+            delta = cur_hit / cur_total - base_hit / base_total
+            parts.append(f"{layer or '전체'}={delta:+.0%}(n={cur_total})")
+        return " / ".join(parts)
 
-    gained = [
-        r.case_id
-        for r in current
-        if r.leaf_correct
-        and r.scorable
-        and not any(b.leaf_correct for b in baseline if b.case_id == r.case_id)
-    ]
+    rows.append(
+        (
+            f"한계 이득 {label}",
+            deltas(only_image=False) + " — 전체 분모다. **사진이 없는 건이 섞여 있어 희석된 값이고**, "
+            "운영에서 그 모드를 켰을 때의 평균 효과에 가깝다",
+        )
+    )
+    if with_image:
+        rows.append(
+            (
+                f"한계 이득(사진 보유만) {label}",
+                deltas(only_image=True) + " — **이미지가 실제로 하는 일은 이 줄이다.** 위 줄과 크게 다르면 "
+                "그 차이가 희석의 크기다",
+            )
+        )
+    else:
+        rows.append(
+            (
+                f"한계 이득(사진 보유만) {label}",
+                "사진 픽스처가 0건이라 짝 비교를 만들 수 없다. **위 줄만으로 이미지를 "
+                "켜지 마라** — 그 숫자에 이미지가 들어 있지 않다",
+            )
+        )
+
+    # **케이스 집합으로 정규화한다.** 레코드 단위로 쌓으면 ``--repeat`` 에서 같은 케이스가
+    # 여러 번 들어가 "1건당 비용"의 분모가 반복 수만큼 부풀고, 바로 옆의 "n건"과 서로
+    # 곱해지지 않는 두 숫자가 된다.
+    baseline_correct = {r.case_id for r in baseline if r.leaf_correct}
+    gained = {
+        r.case_id for r in current if r.leaf_correct and r.scorable and r.case_id not in baseline_correct
+    }
     extra_cost = sum(r.cost_micro_usd for r in current) - sum(r.cost_micro_usd for r in baseline)
     if gained:
+        per_case = extra_cost / len(gained)
+        noise = sorted(gained - with_image)
         rows.append(
             (
                 f"추가로 맞힌 1건당 {label}",
-                f"{extra_cost / len(gained):.0f}uUSD "
-                f"({extra_cost / len(gained) * KRW_PER_USD / 1_000_000:.2f}원) x "
-                f"{len(set(gained))}건 — **이 숫자와 비용 증분율을 나란히 놓고 사람이 정한다.** "
-                "추정을 손익분기로 포장하지 않는다",
+                f"{per_case:.0f}uUSD ({per_case * KRW_PER_USD / 1_000_000:.2f}원) x "
+                f"{len(gained)}건 — **이 숫자와 비용 증분율을 나란히 놓고 사람이 정한다.** "
+                "추정을 손익분기로 포장하지 않는다"
+                + (
+                    f" / 그 가운데 {len(noise)}건은 **사진을 받지도 않았다**"
+                    f"({', '.join(noise[:4])}) — 잡음 역전이므로 이미지 공로가 아니다"
+                    if noise
+                    else ""
+                ),
             )
         )
     else:

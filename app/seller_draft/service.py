@@ -30,12 +30,12 @@ import base64
 import binascii
 import hashlib
 import logging
+import unicodedata
 from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import Any
 
 from app.inspection import rules
-from app.inspection.banned import fold
 from app.schemas.draft import (
     DRAFT_FIELDS,
     Basis,
@@ -90,6 +90,15 @@ _NEVER_ATTEMPTED: tuple[str, ...] = (
     "additionalImageKeys",
     "detailImageKeys",
 )
+
+
+def _identity_key(text: str) -> str:
+    """재사용 키의 상품명 조각. **NFKC + 공백 정규화뿐이다.**
+
+    반복 축약을 하지 않는 이유는 ``DraftService._cache_key`` 에 적었다 -- 요약 쪽
+    ``envelope.dedupe_key`` 와 같은 함수이고 같은 이유다.
+    """
+    return " ".join(unicodedata.normalize("NFKC", text).split())
 
 
 class DraftUnprocessable(ValueError):
@@ -234,13 +243,30 @@ class DraftService:
 
         판정 재사용을 ``contentHash + promptVersion`` 으로 잡은 관례와 같다. 버전을 올리면
         재사용이 끊기는 것도 같다.
+
+        **상품명은 ``fold()`` 로 접지 않는다.** 처음 판이 그 함수를 썼고 그것이 결함이었다.
+        ``banned.fold()`` 는 금지 성분 우회 표기를 잡으려고 **같은 글자 반복을 한 번으로
+        줄이므로** 상품명의 수량·중량·사이즈가 접힌다. 실측이다.
+
+            fold('고양이 모래 2kg')  == fold('고양이 모래 22kg')  -> '고양이모래2kg'
+            fold('츄르 20개')        == fold('츄르 200개')       -> '츄르2o개'
+            fold('강아지 목줄 S')     == fold('강아지 목줄 SS')     -> '강아지목줄s'
+
+        그래서 "고양이 모래 2kg" 로 받은 초안이 "22kg" 요청에 ``reusedFromCache=True`` 로
+        그대로 돌아갔고, 설명이 "2kg 포장"인데 ``fieldStatus=FILLED`` · ``basis=NAME`` 이라
+        셀러 화면은 그것을 "상품명 근거로 채운 사실"로 읽었다. **다른 상품의 초안이다.**
+
+        ``fold()`` 는 금지어 매칭 전용이고 **동일성 판정에 쓰면 안 된다** -- 요약 쪽
+        ``envelope.dedupe_key`` 가 같은 이유로 그 함수를 거부한 선례가 이미 있었다.
+        여기서는 NFKC + 공백 정규화만 한다. 공백·전각 차이는 같은 상품이고 숫자 차이는
+        다른 상품이다.
         """
         locked = request.lockedFields
         parts = [
             DRAFT_VERSION,
             _CATALOG_VERSION,
             mode.value,
-            fold(request.productName),
+            _identity_key(request.productName),
             str(request.categoryId),
             hashlib.sha256(image_bytes).hexdigest() if image_bytes else "-",
             (locked.model_dump_json() if locked is not None else "-"),
@@ -412,10 +438,21 @@ class DraftService:
 
         # (ㄹ) 옵션. 그룹·값만 받고 조합은 서버가 만든다.
         if locked is not None and locked.optionGroups:
-            status["optionGroups"] = FieldStatus.KEPT_LOCKED
-            status["optionCombinations"] = FieldStatus.KEPT_LOCKED
-            draft.optionGroups = list(locked.optionGroups)
-            draft.optionCombinations = guard.build_combinations(list(locked.optionGroups))
+            # **잠근 값도 ``check_options()`` 를 지난다.** 처음 판은 건너뛰었고 그것이
+            # 결함이었다 -- 값 이름 전역 유일 같은 ``ProductOptions`` 불변식을 어긴 옵션을
+            # ``KEPT_LOCKED``(= "셀러가 쓴 값이니 괜찮다")로, **사유 없이** 돌려줬다.
+            # 셀러가 그대로 저장하면 등록이 거부되고, 왜 거부되는지 알 길이 없다.
+            #
+            # 잠근 값을 버리는 것이 목적이 아니다. 불변식을 지키면 그대로 ``KEPT_LOCKED``
+            # 이고, 어기면 사유와 함께 비워 셀러가 고칠 수 있게 한다.
+            verdict = guard.check_locked_options(list(locked.optionGroups))
+            drops.extend(verdict.drops)
+            kept = verdict.status is FieldStatus.FILLED
+            locked_status = FieldStatus.KEPT_LOCKED if kept else verdict.status
+            status["optionGroups"] = locked_status
+            status["optionCombinations"] = locked_status
+            draft.optionGroups = verdict.groups or None
+            draft.optionCombinations = verdict.combinations or None
             basis["optionGroups"] = Basis.NONE
         elif item_unknown:
             status["optionGroups"] = FieldStatus.EMPTY_ITEM_UNIDENTIFIED

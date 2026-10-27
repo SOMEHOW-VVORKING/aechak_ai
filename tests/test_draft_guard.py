@@ -220,3 +220,58 @@ def test_공백만_든_값은_정리하고_중복은_접는다() -> None:
 
 def test_조합이_하나도_안_나오면_비운다() -> None:
     assert guard.build_combinations([]) == []
+
+
+def test_옵션_상한의_계약_사본이_가드와_같다() -> None:
+    """**사본이 표류하면 계약이 받아들인 입력이 데카르트곱을 폭발시킨다.**
+
+    ``app/schemas/draft.py`` 는 ``guard`` 에서 상한을 import 할 수 없다(``guard`` 가 그
+    모듈의 ``OptionGroupDraft`` 를 쓰므로 순환이다). 그래서 사본을 두고 여기서 고정한다.
+    """
+    from app.schemas import draft as draft_schema
+
+    assert draft_schema._LOCKED_MAX_OPTION_GROUPS == guard.LOCKED_MAX_OPTION_GROUPS
+    assert draft_schema._LOCKED_MAX_VALUES_PER_GROUP == guard.LOCKED_MAX_VALUES_PER_GROUP
+    assert draft_schema._OPTION_NAME_MAX == guard.OPTION_NAME_MAX
+
+
+# --- 잠근 옵션은 제안 상한이 아니라 등록 불변식으로 본다 ----------------------------------
+
+
+def test_잠근_옵션은_제안_상한에_걸리지_않는다() -> None:
+    """**제안 상한을 잠근 값에 적용하면 셀러의 입력이 사라진다.**
+
+    그룹 2개는 "초안이 얼마나 제안할지"의 수다. 셀러가 셀러센터에서 3그룹을 타이핑했으면
+    그것은 등록이 허용하는 값이고(백엔드 DTO 상한은 5), 비울 근거가 없다.
+    """
+    groups = _groups(("용량", ["5L", "10L"]), ("향", ["무향"]), ("색", ["흰색"]))
+
+    assert guard.check_options(groups).status is FieldStatus.EMPTY_GUARD_OPTION_RULE
+    verdict = guard.check_locked_options(groups)
+    assert verdict.status is FieldStatus.FILLED
+    assert [group.name for group in verdict.groups] == ["용량", "향", "색"]
+
+
+def test_잠근_옵션도_값_이름_전역_유일을_지켜야_한다() -> None:
+    """등록이 실제로 거부되는 조건은 잠근 값에도 적용된다. **같은 함수를 쓴다.**"""
+    groups = _groups(("색상", ["블랙", "화이트"]), ("패턴", ["블랙", "스트라이프"]))
+    verdict = guard.check_locked_options(groups)
+
+    assert verdict.status is FieldStatus.EMPTY_GUARD_OPTION_RULE
+    assert verdict.groups == []
+    assert "블랙" in verdict.drops[0].detail
+
+
+def test_데카르트곱을_만들기_전에_곱으로_거부한다() -> None:
+    """**만든 뒤 길이를 보면 늦다.** 거부 판정 전에 메모리가 이미 터진다.
+
+    4그룹 x 20값은 160,000개 객체이고, 백엔드 DTO 상한만큼(5 x 50) 보내면
+    312,500,000개라 셀러가 기다리는 동기 엔드포인트가 OOM 으로 죽는다.
+    """
+    groups = _groups(*((f"g{i}", [f"v{i}_{j}" for j in range(20)]) for i in range(4)))
+    verdict = guard.check_locked_options(groups)
+
+    assert verdict.status is FieldStatus.EMPTY_GUARD_OPTION_RULE
+    assert verdict.combinations == [], "곱을 만들고 나서 거부했다"
+    assert "160000" in verdict.drops[0].detail
+    assert str(guard.LOCKED_MAX_COMBINATIONS) in verdict.drops[0].detail

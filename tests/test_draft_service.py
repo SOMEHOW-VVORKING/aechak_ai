@@ -759,3 +759,129 @@ def test_초안_모델이_부팅_가격표_검증을_받는다() -> None:
 
     assert Settings().draft_model in Settings().model_ids()
     validate_pricing(Settings().model_ids())
+
+
+# --- 재사용 키가 다른 상품을 같은 것으로 읽지 않는다 -------------------------------------
+
+
+async def test_중량과_수량이_다른_상품명을_같은_초안으로_읽지_않는다() -> None:
+    """**``fold()`` 를 신원 키로 쓰면 안 된다.** 그 함수는 금지 성분 우회 표기를 잡으려고
+    같은 글자 반복을 한 번으로 줄이므로 상품명의 수량·중량·사이즈가 접힌다.
+
+        fold('고양이 모래 2kg')  == fold('고양이 모래 22kg')
+        fold('츄르 20개')        == fold('츄르 200개')
+        fold('강아지 목줄 S')     == fold('강아지 목줄 SS')
+
+    실측했다: "고양이 모래 2kg" 로 초안을 받은 뒤 "고양이 모래 22kg" 로 요청하면
+    ``reusedFromCache=True`` 로 1차 응답이 그대로 돌아오고 설명이 "2kg 포장"이다.
+    ``fieldStatus.description=FILLED``, ``basis=NAME`` 이라 셀러 화면은 그것을
+    "상품명 근거로 채운 사실"로 읽는다.
+
+    같은 레포의 요약 쪽에서 ``dedupe_key`` 가 같은 이유로 ``fold()`` 를 거부했는데
+    초안은 그 함수를 신원 키로 썼다.
+    """
+    llm = FakeLlmClient(
+        [
+            ok(_tool_input(leaf=251), model="claude-haiku-4-5"),
+            ok(_tool_input(leaf=251), model="claude-haiku-4-5"),
+            ok(_tool_input(leaf=251), model="claude-haiku-4-5"),
+        ]
+    )
+    service = DraftService(llm=llm, settings=_settings(draft_cache_entries=8))
+
+    await service.run(SellerDraftRequest(requestId="a", productName="고양이 모래 2kg"))
+    second = await service.run(SellerDraftRequest(requestId="b", productName="고양이 모래 22kg"))
+    third = await service.run(SellerDraftRequest(requestId="c", productName="고양이 모래 222kg"))
+
+    assert second.reusedFromCache is False
+    assert third.reusedFromCache is False
+    assert len(llm.calls) == 3
+
+
+async def test_공백과_전각_차이만_있으면_재사용한다() -> None:
+    """신원 키가 **NFKC + 공백 정규화**다. 내용이 같은 것은 여전히 재사용해야 한다."""
+    llm = FakeLlmClient([ok(_tool_input(leaf=152), model="claude-haiku-4-5")])
+    service = DraftService(llm=llm, settings=_settings(draft_cache_entries=8))
+
+    await service.run(SellerDraftRequest(requestId="a", productName="강아지 목줄 M"))
+    second = await service.run(SellerDraftRequest(requestId="b", productName="  강아지  목줄   M "))
+
+    assert second.reusedFromCache is True
+    assert len(llm.calls) == 1
+
+
+# --- 잠근 옵션도 등록 불변식을 지나야 한다 -----------------------------------------------
+
+
+async def test_잠근_옵션이_등록_불변식을_어기면_KEPT_LOCKED_로_적지_않는다() -> None:
+    """**``check_options()`` 를 통째로 건너뛰었다.**
+
+    값 이름 전역 유일은 ``ProductOptions`` 의 불변식이고 모델이 자연스럽게 위반하는
+    규칙이라 가드가 그것을 잡는다. 그런데 잠근 경로가 가드를 지나지 않아, 등록이 거부될
+    옵션을 ``KEPT_LOCKED``(= "셀러가 쓴 값이니 괜찮다")로, **사유 없이** 돌려줬다.
+    """
+    llm = FakeLlmClient([ok(_tool_input(leaf=251), model="claude-haiku-4-5")])
+    locked = LockedFields(
+        optionGroups=[
+            OptionGroupDraft(name="색상", values=["블랙", "화이트"]),
+            OptionGroupDraft(name="패턴", values=["블랙", "스트라이프"]),
+        ]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request("고양이모래 벤토나이트", lockedFields=locked)
+    )
+
+    assert response.fieldStatus["optionGroups"] is FieldStatus.EMPTY_GUARD_OPTION_RULE
+    assert response.fieldStatus["optionCombinations"] is FieldStatus.EMPTY_GUARD_OPTION_RULE
+    assert response.draft.optionGroups is None
+    assert response.draft.optionCombinations is None
+    # **사유가 있어야 셀러가 왜 거부될지 안다.**
+    assert any(drop.field == "optionGroups" for drop in response.guardDrops)
+    assert any("블랙" in (drop.detail or "") for drop in response.guardDrops)
+
+
+async def test_등록_불변식을_지키는_잠근_옵션은_그대로_유지한다() -> None:
+    """가드를 태우는 것이 목적이고 잠근 값을 버리는 것이 목적이 아니다."""
+    llm = FakeLlmClient([ok(_tool_input(leaf=251), model="claude-haiku-4-5")])
+    locked = LockedFields(optionGroups=[OptionGroupDraft(name="용량", values=["5L", "10L"])])
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request("고양이모래 벤토나이트 10L", lockedFields=locked)
+    )
+
+    assert response.fieldStatus["optionGroups"] is FieldStatus.KEPT_LOCKED
+    assert [group.name for group in response.draft.optionGroups or []] == ["용량"]
+    assert len(response.draft.optionCombinations or []) == 2
+    assert response.guardDrops == []
+
+
+async def test_잠근_옵션의_그룹_수와_값_수에_계약_상한이_있다() -> None:
+    """상한이 없어 ``build_combinations`` 가 무제한 입력을 받았다.
+
+    4그룹 x 20값이면 **160,000개** 객체를 만든다(``MAX_COMBINATIONS`` 는 36이다).
+    백엔드 DTO 상한만큼(그룹 5 / 그룹당 값 50) 보내면 50^5 = 312,500,000 조합이라
+    셀러가 기다리는 **동기 엔드포인트가 OOM 으로 죽는다.** 가드에서 거부하는 것으로는
+    늦다 -- 거부 판정 전에 곱이 이미 만들어진다.
+    """
+    from pydantic import ValidationError
+
+    from app.seller_draft.guard import LOCKED_MAX_OPTION_GROUPS as MAX_OPTION_GROUPS
+    from app.seller_draft.guard import LOCKED_MAX_VALUES_PER_GROUP as MAX_VALUES_PER_GROUP
+
+    too_many_groups = [{"name": f"g{i}", "values": ["v"]} for i in range(MAX_OPTION_GROUPS + 2)]
+    with pytest.raises(ValidationError):
+        LockedFields(optionGroups=too_many_groups)  # type: ignore[arg-type]
+
+    too_many_values = [{"name": "g", "values": [f"v{i}" for i in range(MAX_VALUES_PER_GROUP + 2)]}]
+    with pytest.raises(ValidationError):
+        LockedFields(optionGroups=too_many_values)  # type: ignore[arg-type]
+
+
+async def test_잠근_옵션의_이름_길이에_계약_상한이_있다() -> None:
+    from pydantic import ValidationError
+
+    from app.seller_draft.guard import OPTION_NAME_MAX
+
+    with pytest.raises(ValidationError):
+        LockedFields(optionGroups=[{"name": "가" * (OPTION_NAME_MAX + 1), "values": ["v"]}])  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        LockedFields(optionGroups=[{"name": "g", "values": ["가" * (OPTION_NAME_MAX + 1)]}])  # type: ignore[arg-type]

@@ -294,3 +294,29 @@ def test_초안이_검수_폴_간격_계산에_들어가지_않는다() -> None:
     louder = settings.model_copy(update={"draft_timeout_seconds": 600.0})
 
     assert louder.worst_case_handle_seconds() == before
+
+
+def test_도커_헬스체크와_CMD_가_같은_포트_변수를_읽는다() -> None:
+    """**같은 이미지가 두 서비스를 띄운다.** 포트가 각자 박혀 있으면 한쪽이 영구 unhealthy 다.
+
+    초안 앱은 별 ASGI 앱이고 권장 포트가 8200 인데, 전에는 ``HEALTHCHECK`` 가 8000 을
+    이미지에 구워 두었다. 그러면 CMD 만 덮어 초안 서비스를 올릴 때 컨테이너는 8200 을
+    듣는데 헬스체크는 8000 을 찔러 ECS 가 태스크를 무한 교체한다.
+    """
+    from pathlib import Path
+
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
+
+    assert "ENV PORT=8000" in dockerfile
+    healthcheck = next(line for line in dockerfile.splitlines() if "/health" in line and "CMD" in line)
+    assert "PORT" in healthcheck, "헬스체크가 포트를 박아 두었다"
+    assert "127.0.0.1:8000/health" not in dockerfile
+    cmd = next(line for line in dockerfile.splitlines() if line.startswith("CMD"))
+    assert "${PORT" in cmd, "CMD 가 포트 변수를 읽지 않는다"
+
+
+def test_초안_앱에_헬스체크_경로가_있다() -> None:
+    """포트만 맞으면 되는 문제였다는 근거다. 경로가 없으면 변수로는 못 고친다."""
+    from app.draft_api.app import app as draft_app
+
+    assert "/health" in {route.path for route in draft_app.routes}

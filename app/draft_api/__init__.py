@@ -9,4 +9,12 @@ Dockerfile 의 ``COPY app ./app`` 에 들어가야 한다. 같은 이미지, 다
 다른 ECS 서비스다.
 
     uv run uvicorn app.draft_api.app:app --port 8200
+
+컨테이너로 띄울 때는 **``PORT`` 와 ``CMD`` 를 같이 준다.** Dockerfile 의 ``CMD`` 와
+``HEALTHCHECK`` 가 둘 다 ``$PORT`` 를 읽으므로 그 변수 하나만 맞추면 둘이 같이 움직인다.
+전에는 ``HEALTHCHECK`` 가 8000 을 박아 두어, 초안 서비스를 8200 으로 띄우면 컨테이너는
+8200 을 듣는데 헬스체크는 8000 을 찔러 **영구 unhealthy** 가 됐다.
+
+    docker run -e PORT=8200 <image> \
+        sh -c 'exec uvicorn app.draft_api.app:app --host 0.0.0.0 --port ${PORT}'
 """

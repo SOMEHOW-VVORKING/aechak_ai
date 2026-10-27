@@ -35,11 +35,23 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.seller_draft.catalog import ItemGrade, ResolvedBy
 
 DRAFT_SCHEMA_VERSION = 1
+
+# 잠근 옵션 상한의 **계약 사본**. 정본은 ``app/seller_draft/guard.py`` 의 같은 이름 상수다.
+#
+# 거기서 import 하지 않는 이유는 순환이다 -- ``guard`` 가 이 모듈의 ``OptionGroupDraft`` 를
+# 쓴다. 사본을 두고 **표류를 테스트가 막는다**(``tests/test_draft_guard.py``).
+# 가드 상한을 올리면서 계약을 빠뜨리면 ``build_combinations`` 가 다시 무제한 입력을 받는다.
+#
+# **제안 상한(그룹 2 / 값 6)이 아니라 등록 상한(그룹 5 / 값 50)이다.** 제안 상한을 걸면
+# 셀러의 3그룹 옵션이 역직렬화에서 거절되는데 그것은 등록이 허용하는 값이다.
+_LOCKED_MAX_OPTION_GROUPS = 5
+_LOCKED_MAX_VALUES_PER_GROUP = 50
+_OPTION_NAME_MAX = 100
 
 
 class Basis(StrEnum):
@@ -168,6 +180,14 @@ class DraftImage(BaseModel):
 
 
 class OptionGroupDraft(BaseModel):
+    """옵션 그룹 하나. **상한을 걸지 않는다.**
+
+    이 타입은 모델 출력과 셀러의 잠근 값이 **함께 쓰는 모양**이다. 여기에 상한을 걸면
+    모델이 값 7개를 돌려줄 때 역직렬화가 터지고, ``guard`` 가 사유와 함께 우아하게
+    거부하도록 만든 설계가 무력해진다 -- 가드의 존재 이유가 "모델은 지시를 어긴다"다.
+    상한은 신뢰할 수 없는 **요청 본문** 쪽, 즉 ``LockedFields`` 에 건다.
+    """
+
     model_config = ConfigDict(extra="ignore")
 
     name: str
@@ -199,7 +219,36 @@ class LockedFields(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     description: str | None = None
-    optionGroups: list[OptionGroupDraft] | None = None
+    optionGroups: list[OptionGroupDraft] | None = Field(default=None, max_length=_LOCKED_MAX_OPTION_GROUPS)
+
+    @field_validator("optionGroups")
+    @classmethod
+    def _bound_option_groups(cls, groups: list[OptionGroupDraft] | None) -> list[OptionGroupDraft] | None:
+        """**값 수와 이름 길이를 역직렬화에서 막는다.**
+
+        상한이 없으면 ``guard.build_combinations`` 가 무제한 입력을 받는다. 4그룹 x 20값이면
+        160,000개 객체를 만들고, 백엔드 DTO 상한만큼(그룹 5 / 그룹당 값 50) 보내면
+        50^5 = 312,500,000 조합이라 셀러가 기다리는 **동기 엔드포인트가 OOM 으로 죽는다.**
+        가드가 곱을 세기 전에 거부하도록 고쳤지만 방어를 그 한 겹에 걸지 않는다.
+
+        ``OptionGroupDraft`` 자체에 상한을 걸지 않는 이유는 그 타입이 **모델 출력과 함께
+        쓰는 모양**이기 때문이다 -- 거기 걸면 모델이 값 7개를 돌려줄 때 역직렬화가 터지고,
+        가드가 사유와 함께 우아하게 거부하도록 만든 설계가 무력해진다.
+
+        수는 **백엔드 DTO 의 것**이다(``ProductDraftSaveRequest``). 초안의 제안 상한
+        (그룹 2 / 값 6)을 쓰면 셀러의 3그룹 옵션이 역직렬화에서 거절되는데, 그것은 등록이
+        허용하는 값이라 거절할 근거가 없다.
+        """
+        if groups is None:
+            return None
+        for group in groups:
+            if len(group.values) > _LOCKED_MAX_VALUES_PER_GROUP:
+                raise ValueError(f"잠근 옵션의 값은 그룹당 {_LOCKED_MAX_VALUES_PER_GROUP}개 이하여야 한다")
+            if len(group.name) > _OPTION_NAME_MAX or any(
+                len(value) > _OPTION_NAME_MAX for value in group.values
+            ):
+                raise ValueError(f"잠근 옵션의 이름은 {_OPTION_NAME_MAX}자 이하여야 한다")
+        return groups
 
 
 class SellerDraftRequest(BaseModel):

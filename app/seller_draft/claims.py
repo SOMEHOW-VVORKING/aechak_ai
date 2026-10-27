@@ -71,6 +71,29 @@ POLICY_CLAIM_EXAMPLES: tuple[str, ...] = (
 # 쓰지 않게 하는 것이 맞는 방어이고, 그래서 사실 슬롯에 원산지 자리를 두지 않았다.
 UNCOVERED_POLICY_EXAMPLES: tuple[str, ...] = ("국내산(실제 수입품)",)
 
+# **보류 집합. 사전을 쓸 때 쓰지 않았고, 앞으로도 이 목록을 보고 사전을 고치지 않는다.**
+#
+# 위 ``POLICY_CLAIM_EXAMPLES`` 를 분모로 커버리지를 재면 그 숫자는 **순환이다** -- 사전이
+# 그 목록에서 나왔고 같은 목록이 프롬프트에도 들어간다(``forbidden_examples_block``).
+# 8/8 은 미지의 표현에 대해 아무것도 말하지 않는데 리포트 한 줄로는 커버리지처럼 읽힌다.
+#
+# 그래서 사전을 만들 때 참조하지 않은 표현을 따로 둔다. 셀러가 실제로 쓸 만하고 등록 시점
+# 검수의 MEDICAL_CLAIM·EFFICACY_OVERCLAIM 관점이 잡을 문구들이다. **이 목록에 맞춰 사전을
+# 늘리면 그 순간 이것도 순환이 되어 측정 도구가 하나 사라진다** -- 늘리고 싶으면 새 보류
+# 집합을 먼저 만들어라.
+#
+# 네거티브 리스트의 성질상 이 숫자는 낮게 나온다. 낮은 것이 사실이고, 숨기는 것보다 낫다.
+HOLDOUT_CLAIM_EXAMPLES: tuple[str, ...] = (
+    "염증을 가라앉혀 줍니다",
+    "피부병이 사라집니다",
+    "면역력을 높여 질병을 예방합니다",
+    "사용 2주 후 통증이 줄어듭니다",
+    "눈에 띄게 좋아졌다는 후기가 많습니다",
+    "3일이면 달라집니다",
+    "장 건강을 되찾아 줍니다",
+    "알러지를 잡아 줍니다",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ClaimTerm:
@@ -272,6 +295,7 @@ def forbidden_examples_block() -> str:
 
 __all__ = [
     "CLAIM_TERMS",
+    "HOLDOUT_CLAIM_EXAMPLES",
     "POLICY_CLAIM_EXAMPLES",
     "UNCOVERED_POLICY_EXAMPLES",
     "ClaimHit",

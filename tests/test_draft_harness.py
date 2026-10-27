@@ -10,6 +10,8 @@ import inspect
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from app.inspection import rules
 from app.schemas.draft import ImageMode
 from app.seller_draft import catalog
@@ -263,3 +265,27 @@ def test_하네스가_운영_이미지에_들어가지_않는다() -> None:
     copied = [line for line in dockerfile.splitlines() if line.strip().startswith("COPY")]
 
     assert not any("harness" in line for line in copied), copied
+
+
+def test_비용표가_단가_정본에서_파생된다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**표 아래쪽만 파생이고 표 자체가 상수였다.**
+
+    손계산한 microUSD 를 적어 두면 ``client._PRICING`` 을 고치는 날 모든 비용 줄과 일
+    예산 상한이 조용히 과거 값으로 남고 테스트는 전부 초록이다. 그 주석이 "모델 확정 시
+    공식 단가로 재확인한다"고 단가 변경을 예고하고 있어 실제로 일어날 일이다.
+    """
+    from app.llm import client
+
+    base = run_draft._estimate_micro_usd()
+    assert base == run_draft._DRAFT_ESTIMATE_MICRO_USD
+
+    model = Settings().draft_model
+    doubled = dict(client._PRICING)
+    doubled[model] = tuple(price * 2 for price in client._PRICING[model])
+    monkeypatch.setattr(client, "_PRICING", doubled)
+
+    after = run_draft._estimate_micro_usd()
+    assert after["draft_text_haiku"] == base["draft_text_haiku"] * 2, (
+        "단가를 올렸는데 비용표가 따라 움직이지 않았다 -- 표가 상수다"
+    )
+    assert after["draft_image_896_haiku"] == base["draft_image_896_haiku"] * 2
