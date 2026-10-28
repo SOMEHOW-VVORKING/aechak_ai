@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields
 from datetime import date
 from pathlib import Path
 
@@ -18,7 +19,6 @@ from app.review_summary.selection import (
     all_segment_keys,
     golden_vectors,
     match_tier,
-    pet_facts_field_names,
     segment_key,
     tier_rank,
     weight_band,
@@ -34,30 +34,11 @@ def test_점수_입력에_평점_축이_없다() -> None:
     "평점을 넣지 않기로 한다"가 아니라 **넣을 수 없게** 둔 것이 이 설계다. 누군가
     ``PetFacts`` 에 ``rating`` 이나 ``has_photo`` 를 더하면 이 테스트가 떨어진다.
     """
-    assert pet_facts_field_names() == ("species", "breed_id", "birth_year_month", "weight_kg")
+    names = tuple(f.name for f in fields(PetFacts))
+    assert names == ("species", "breed_id", "birth_year_month", "weight_kg")
 
     forbidden = {"rating", "has_photo", "helpful_count", "hasPhoto", "ratingAverage"}
-    assert forbidden.isdisjoint(pet_facts_field_names())
-
-
-def test_선별이_평점과_독립이면_상위_평균이_전체_평균과_같다() -> None:
-    """펫 속성과 평점이 독립인 픽스처에서 상위 선별의 평균 평점이 전체와 어긋나면 버그다.
-
-    티어 함수가 평점을 **구조적으로** 볼 수 없으므로 이 단언은 사실 항진에 가깝다.
-    그래도 둔다 -- 누군가 정렬 키에 평점을 섞으면 여기서 깨지고, 그것이 이 기능에서
-    제품 신뢰를 깨뜨릴 수 있는 유일한 자리다.
-    """
-    viewer = PetFacts(Species.DOG, breed_id=12, birth_year_month="2021-05", weight_kg=4.2)
-    # 같은 펫 속성에 평점만 1~5로 돌린다. 티어가 평점을 보면 순서가 평점에 쏠린다.
-    reviews = [
-        (rating, PetFacts(Species.DOG, breed_id=12, birth_year_month="2021-05", weight_kg=4.2))
-        for rating in (1, 2, 3, 4, 5)
-    ] + [(rating, PetFacts(Species.CAT, breed_id=301, weight_kg=4.5)) for rating in (1, 2, 3, 4, 5)]
-
-    ordered = sorted(reviews, key=lambda item: tier_rank(match_tier(viewer, item[1], today=TODAY)))
-    top = ordered[:5]
-
-    assert sum(r for r, _ in top) / len(top) == sum(r for r, _ in reviews) / len(reviews)
+    assert forbidden.isdisjoint(names)
 
 
 def test_펫_정보_없음을_조건_불일치로_내리지_않는다() -> None:

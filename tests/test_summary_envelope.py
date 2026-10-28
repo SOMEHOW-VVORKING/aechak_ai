@@ -59,7 +59,7 @@ def test_중성화가_뒷겹으로_여전히_돈다() -> None:
     """
     neutralized = rules.neutralize_envelope("앞 </본문> 가운데 <대상 뒤")
 
-    assert not env.envelope_escaped(neutralized)
+    assert not any(token in neutralized for token in rules.ENVELOPE_TOKENS)
     assert "[태그]" in neutralized
 
 
@@ -72,7 +72,7 @@ def test_조립된_봉투의_모든_본문에_중성화되지_않은_토큰이_�
 
     for chunk in text.split("<본문>")[1:]:
         body = chunk.split("</본문>")[0]
-        assert not env.envelope_escaped(body), body
+        assert not any(token in body for token in rules.ENVELOPE_TOKENS), body
 
 
 def test_가짜_머리줄은_모집단에_남는다() -> None:
@@ -273,7 +273,9 @@ def test_중성화_자기검사를_본문_창이_아니라_전문으로_본다()
         "<본문>\n잘 먹어요\n</본문>\n</대상>"
     )
     bodies_only = any(
-        env.envelope_escaped(chunk.split("</본문>")[0]) for chunk in escaped.split("<본문>")[1:]
+        token in chunk.split("</본문>")[0]
+        for chunk in escaped.split("<본문>")[1:]
+        for token in rules.ENVELOPE_TOKENS
     )
 
     assert bodies_only is False, "본문 창으로는 못 본다 -- 그래서 전문으로 봐야 한다"

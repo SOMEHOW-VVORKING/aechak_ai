@@ -24,7 +24,6 @@ from app.schemas.inspection import CallOutcome
 from app.schemas.summary import (
     AspectCode,
     AspectTallyRow,
-    ConsAbsenceReason,
     Polarity,
     QuoteSample,
     RequestedScope,
@@ -143,7 +142,6 @@ class SummaryScenario:
             requestId=f"demo-{self.id}",
             productId=42,
             categoryPath=list(self.category_path),
-            totalVisibleReviews=self.basis_review_count,
             newReviews=[seed.to_input() for seed in self.reviews],
             requestedScopes=scopes,
         )
@@ -226,7 +224,6 @@ _FEED_NARRATE = {
             ],
         }
     ],
-    "consAbsenceReason": "",
 }
 
 _SUMMARIZED = SummaryScenario(
@@ -368,7 +365,6 @@ _NO_NEGATIVES = SummaryScenario(
                     }
                 ],
                 "cons": [],
-                "consAbsenceReason": ConsAbsenceReason.NO_NEGATIVE_MENTIONS_FOUND.value,
             },
             input_tokens=1_240,
             output_tokens=380,
@@ -401,7 +397,6 @@ _NARRATION_MISSING = SummaryScenario(
                     }
                 ],
                 "cons": [],
-                "consAbsenceReason": ConsAbsenceReason.NO_NEGATIVE_MENTIONS_FOUND.value,
             },
             input_tokens=1_760,
             output_tokens=410,
@@ -495,7 +490,6 @@ _SEGMENT = SummaryScenario(
                     }
                 ],
                 "cons": [],
-                "consAbsenceReason": ConsAbsenceReason.NO_NEGATIVE_MENTIONS_FOUND.value,
             },
             input_tokens=1_180,
             output_tokens=340,

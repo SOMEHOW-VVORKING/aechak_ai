@@ -305,7 +305,6 @@ async def summarize(body: SummaryBody) -> JSONResponse:
         requestId=f"demo-{body.mode}",
         productId=42,
         categoryPath=body.categoryPath,
-        totalVisibleReviews=basis,
         newReviews=reviews,
         requestedScopes=[
             RequestedScope(

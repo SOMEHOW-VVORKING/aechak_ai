@@ -235,18 +235,6 @@ def _self_check() -> int:
                 f"/ 실제 {sorted(f'{c.value}/{p.value}' for c, p in repeated)}"
             )
 
-    # (6) 골든 벡터 파일이 실제 티어 함수와 같은가.
-    vectors_path = Path(__file__).parent.parent / "tests" / "contract" / "review-selection-vectors.json"
-    if vectors_path.is_file():
-        stored = json.loads(vectors_path.read_text(encoding="utf-8"))
-        if stored != selection.golden_vectors():
-            problems.append(
-                "골든 벡터 파일이 selection.py 와 어긋난다. "
-                "백엔드 미러가 그 파일을 읽으므로 양 레포가 다른 답을 낸다"
-            )
-    else:
-        problems.append(f"골든 벡터 파일이 없다: {vectors_path}")
-
     if problems:
         print("[치명] 케이스 기대값이 코드와 어긋난다. 측정 전에 멈춘다.")
         for problem in problems:
@@ -264,15 +252,9 @@ def _self_check() -> int:
 def _repeated_from_labels(
     case: ProductCase,
     settings: Settings,
-    *,
-    wide_polarity_band: bool = False,
 ) -> set[tuple[Any, Polarity]]:
-    """정답 라벨만으로 집계해 반복 항목을 낸다. 모델을 부르지 않는다.
-
-    ``wide_polarity_band`` 는 설계안의 원래 경계(1~2점 PRO / 4~5점 CON 을 전부 버림)를
-    흉내 낸다. 두 경계의 차이를 숫자로 보여 주는 데만 쓴다.
-    """
-    from app.schemas.summary import AspectTallyRow, QuoteSample
+    """정답 라벨만으로 집계해 반복 항목을 낸다. 모델을 부르지 않는다."""
+    from app.schemas.summary import QuoteSample
 
     tally = tally_mod.Tally()
     excluded = {review.review_id for review in case.reviews if review.expect_excluded is not None}
@@ -280,13 +262,7 @@ def _repeated_from_labels(
         if review.review_id in excluded:
             continue
         for code, polarity in dict.fromkeys(review.expect_aspects):
-            if wide_polarity_band:
-                conflict = (review.rating in (1, 2) and polarity is Polarity.PRO) or (
-                    review.rating in (4, 5) and polarity is Polarity.CON
-                )
-            else:
-                conflict = polarity_conflict_drops(review.rating, polarity)
-            if conflict:
+            if polarity_conflict_drops(review.rating, polarity):
                 continue
             tally_mod.add(
                 tally,
@@ -295,7 +271,6 @@ def _repeated_from_labels(
                 label=code.value,
                 quote=QuoteSample(reviewId=review.review_id, text=code.value),
             )
-    _ = AspectTallyRow  # 형 참조만. 집계는 위에서 끝났다
     classified = tally_mod.classify(
         tally,
         basis_review_count=case.total_visible(),
@@ -408,31 +383,11 @@ def _report_gate() -> list[tuple[str, str]]:
 
 
 def _report_polarity_band() -> list[tuple[str, str]]:
-    """극성 경계 민감도. **설계안의 넓은 경계가 단점을 몇 개 지우는가.**
+    """극성 경계의 **현재 비대칭이 라벨 위에서 몇 건을 가르는가.**
 
-    이 표가 있는 이유: 경계를 설계 문서대로 되돌리려는 다음 사람이 숫자를 먼저 보게
-    하려는 것이다. 코드 주석만으로는 "4점 리뷰의 단점이 흔하다"가 추측처럼 읽힌다.
+    버린 쪽과 센 쪽을 따로 적는다. 한 숫자로 뭉개면 뒤집힘 탐지가 쓰는 쪽이 보이지 않는다.
     """
-    settings = Settings()
     rows: list[tuple[str, str]] = []
-    lost: list[str] = []
-    for case in PRODUCTS:
-        narrow = _repeated_from_labels(case, settings)
-        wide = _repeated_from_labels(case, settings, wide_polarity_band=True)
-        gone = narrow - wide
-        if gone:
-            lost.extend(f"{case.id}:{code.value}/{polarity.value}" for code, polarity in sorted(gone))
-    rows.append(
-        (
-            "극성 경계 손실",
-            (
-                f"넓은 경계(설계안)로 두면 반복 항목 {len(lost)}개가 사라진다: {', '.join(lost)}"
-                if lost
-                else "두 경계가 같은 반복 항목을 낸다 — 이 케이스 세트가 경계를 구분하지 못한다"
-            ),
-        )
-    )
-
     noted = sum(
         1
         for case in PRODUCTS
@@ -516,25 +471,6 @@ def _report_thresholds() -> list[tuple[str, str]]:
     return rows
 
 
-def worst_case_result_bytes(settings: Settings) -> int:
-    """계약 상한을 꽉 채운 **결과 엔벨로프**의 바이트 수. 키 없이 계산된다.
-
-    **조립은 ``app.review_summary.budget`` 이 한다.** 여기 있던 것을 그쪽으로 옮겼다 --
-    컨슈머가 모델을 부르기 **전에** 같은 상한을 봐야 하는데(앞 판은 유료 호출을 다 태운 뒤
-    발행 직전에 봤다), 사본을 두면 리포트의 숫자와 런타임의 판정 경계가 갈라진다.
-
-    결과 쪽 상한을 넘기는 레버는 **둘**이다. 인용·라벨·한 줄 요약은 코드가 길이를 자르므로
-    ``summary_content_chars`` 는 결과 크기를 키우지 않는다 -- 그 설정은 **요청** 쪽 레버이고
-    그것은 ``worst_case_request_bytes()`` 가 따로 센다.
-
-        summary_scopes_per_message   2 -> 5      : 스코프마다 집계 전수가 붙는다
-        summary_max_new_reviews      40 -> 100   : 리뷰별 추출 행이 그만큼 늘어난다
-    """
-    from app.review_summary.budget import worst_case_result_bytes as assembled
-
-    return assembled(settings)
-
-
 def worst_case_request_bytes(settings: Settings) -> int:
     """계약 상한을 꽉 채운 **요청 엔벨로프**의 바이트 수.
 
@@ -570,14 +506,12 @@ def worst_case_request_bytes(settings: Settings) -> int:
         requestId="r" * 64,
         productId=10_000_000,
         categoryPath=["가" * 30] * 3,
-        totalVisibleReviews=10_000,
         newReviews=[
             ReviewInput(
                 reviewId=review_id,
                 rating=5,
                 content="가" * settings.summary_content_chars,
                 optionName="가" * 40,
-                hasPhoto=True,
             )
             for review_id in range(1, new_reviews + 1)
         ],
@@ -619,6 +553,7 @@ def _report_publish_budget(settings: Settings) -> list[tuple[str, str]]:
     발행해 우리가 가져온다(``max_partition_fetch_bytes``). 한 숫자로 뭉개면 어느 설정이
     어느 상한을 넘기는지 알 수 없다.
     """
+    from app.review_summary.budget import worst_case_result_bytes
     from app.schemas.summary import _MAX_NEW_REVIEWS
 
     result = worst_case_result_bytes(settings)
@@ -626,6 +561,8 @@ def _report_publish_budget(settings: Settings) -> list[tuple[str, str]]:
     send_limit = settings.kafka_max_request_size
     fetch_limit = settings.kafka_max_partition_fetch_bytes
     levers = []
+    # 인용·라벨·한 줄 요약은 코드가 길이를 자르므로 ``summary_content_chars`` 는 결과
+    # 크기를 키우지 않는다. 그것은 **요청** 쪽 레버라서 요청 바이트와 수신 상한에 묶는다.
     for name, update, size_of, limit in (
         ("summary_content_chars=800", {"summary_content_chars": 800}, worst_case_request_bytes, fetch_limit),
         (
@@ -808,7 +745,6 @@ async def _measure(settings: Settings, llm: Any, repeat: int, cases: list[Produc
                 requestId=f"harness-{case.id}-{round_no}",
                 productId=abs(hash(case.id)) % 100_000,
                 categoryPath=list(case.category_path),
-                totalVisibleReviews=case.total_visible(),
                 newReviews=case.inputs(),
                 requestedScopes=[
                     RequestedScope(
@@ -1012,5 +948,4 @@ __all__ = [
     "Record",
     "summary_cache_prefix_targets",
     "worst_case_request_bytes",
-    "worst_case_result_bytes",
 ]

@@ -62,9 +62,6 @@ class Tally:
             key=lambda row: (-row.mentionCount, row.aspectCode.value, row.polarity.value),
         )
 
-    def get(self, code: AspectCode, polarity: Polarity) -> AspectTallyRow | None:
-        return self.rows.get((code, polarity))
-
 
 def from_rows(rows: list[AspectTallyRow]) -> Tally:
     """백엔드가 보낸 기존 집계표를 읽는다."""

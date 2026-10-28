@@ -987,7 +987,9 @@ function summaryScope(scope) {
   panel.appendChild(aspectBlock("장점", "pro", scope.pros));
   panel.appendChild(aspectBlock("단점", "con", scope.cons));
 
-  if (!scope.cons.length && scope.cons_absence_sentence) {
+  // 분모 미달이면 위 박스가 **같은 문장**을 이미 띄웠다(``CONS_ABSENCE_SENTENCES`` 의
+  // ``NOT_ENOUGH_REVIEWS`` 가 그 문구와 같은 바이트다). 두 번 굵게 찍으면 사유가 둘인 것처럼 읽힌다.
+  if (!scope.cons.length && scope.cons_absence_sentence && !scope.not_enough_reason) {
     // **"없다"와 "못 찾았다"를 가른 문장을 그대로 띄운다.**
     const box = el("div", "absence");
     box.appendChild(el("b", null, scope.cons_absence_sentence));

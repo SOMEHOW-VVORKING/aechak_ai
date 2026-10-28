@@ -69,13 +69,43 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "requestId": "rs-1",
         "productId": 42,
         "categoryPath": ["강아지", "사료", "건식사료"],
-        "totalVisibleReviews": 12,
         "newReviews": [],
         "requestedScopes": [{"scope": "PRODUCT", "segmentKey": None, "basisReviewCount": 12, "tally": []}],
         "schemaVersion": 1,
     }
     base.update(overrides)
     return base
+
+
+def test_읽지_않는_입력_키를_백엔드가_보내도_거부하지_않는다() -> None:
+    """요청 계약에서 필드 넷을 뺐다. **배포 순서가 메시지를 버리게 하면 안 된다.**
+
+    ``hasPhoto``·``createdAt``·``totalVisibleReviews``·``ratingBuckets`` 는 요약 판정·봉투·
+    서술이 한 번도 읽지 않았고(실제 분모는 ``RequestedScope.basisReviewCount`` 다) 그래서
+    지웠다. 백엔드가 아직 보내는 동안 ``extra="forbid"`` 였다면 전건 ``ValidationError`` 이고,
+    러너는 그것을 경고 후 커밋해 영구히 버린다.
+    """
+    from app.schemas.summary import ReviewSummaryRequest
+
+    request = ReviewSummaryRequest.model_validate(
+        _payload(
+            totalVisibleReviews=12,
+            ratingBuckets=[{"rating": 5, "count": 9}],
+            newReviews=[
+                {
+                    "reviewId": 1,
+                    "rating": 5,
+                    "content": "잘 먹어요",
+                    "hasPhoto": True,
+                    "createdAt": "2026-10-28T00:00:00Z",
+                }
+            ],
+        )
+    )
+
+    assert [review.reviewId for review in request.newReviews] == [1]
+    assert not hasattr(request, "totalVisibleReviews")
+    assert not hasattr(request.newReviews[0], "hasPhoto")
 
 
 async def test_결과를_전용_토픽에_발행한다(settings: Settings) -> None:
@@ -589,7 +619,7 @@ async def test_계약_상한을_꽉_채운_결과가_발행_상한_안에_든다
     상한을 넘긴다(실측). 그 관계가 테스트에 없으면 설정 한 줄을 올린 배포에서 요약이
     멈추고, 멈춘 것을 아무도 모른다.
     """
-    from harness.run_summary import worst_case_result_bytes
+    from app.review_summary.budget import worst_case_result_bytes
 
     settings = Settings()
     worst = worst_case_result_bytes(settings)

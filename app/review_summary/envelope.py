@@ -280,15 +280,6 @@ def render_envelope(category_path: list[str], prepared: list[PreparedReview]) ->
     return "\n".join(lines)
 
 
-def envelope_escaped(text: str) -> bool:
-    """중성화되지 않은 봉투 토큰이 남아 있는가. **조각 하나**를 볼 때만 쓴다.
-
-    조립된 봉투 전문에는 정당한 토큰이 들어 있으므로 이 함수로 볼 수 없다. 전문은
-    ``envelope_wellformed()`` 로 본다.
-    """
-    return any(token in text for token in rules.ENVELOPE_TOKENS)
-
-
 def envelope_wellformed(text: str, *, review_count: int) -> bool:
     """조립된 봉투 전문에 **여분의** 봉투 토큰이 없는가.
 
@@ -336,7 +327,6 @@ __all__ = [
     "PreparedReview",
     "batches",
     "dedupe_key",
-    "envelope_escaped",
     "envelope_wellformed",
     "header_safe",
     "mask_heavy",
