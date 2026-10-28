@@ -720,6 +720,34 @@ async def test_레이트_리밋은_한_번만_다시_쏜다() -> None:
     assert {row.extracted for row in message.extracted} == {ExtractStatus.EXTRACTED}
 
 
+async def test_재시도_전_첫_호출도_원장에_남는다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """재시도가 나면 **두 호출이 다 과금된다.** 둘째만 적으면 비용과 실패가 사라진다.
+
+    추출과 서술을 한 케이스에서 같이 본다 -- 재시도 헬퍼가 하나라 두 호출부가 같이
+    어긋나거나 같이 맞는다.
+    """
+    import app.review_summary.service as service_module
+
+    monkeypatch.setattr(service_module, "JUDGE_RETRY_DELAY_SECONDS", 0.0)
+    client = _client(
+        extract0=ScriptedCall(outcome=CallOutcome.RATE_LIMITED, output_tokens=200),
+        extract1=ScriptedCall(tool_input=_THREE_EXTRACT, output_tokens=200),
+        narrate0=ScriptedCall(outcome=CallOutcome.RATE_LIMITED, output_tokens=200),
+        narrate1=ScriptedCall(
+            tool_input={"pros": [], "cons": [], "consAbsenceReason": ""}, output_tokens=200
+        ),
+    )
+
+    message = await SummaryService(llm=client, settings=_settings()).run(_request(_THREE))
+
+    assert len(client.calls) == 4
+    assert [row.stage for row in message.calls] == ["EXTRACT", "EXTRACT", "NARRATE", "NARRATE"], (
+        "재시도 전 첫 호출이 원장에서 사라졌다"
+    )
+    assert len({row.callId for row in message.calls}) == 4, "원장이 같은 호출을 두 번 적었다"
+    assert all(row.costMicroUsd > 0 for row in message.calls), "실패한 호출의 출력 토큰도 과금된다"
+
+
 async def test_모델이_없으면_전건이_UNEXTRACTED다() -> None:
     """stub 모드다. 모델 클라이언트가 없는 것을 "항목 없음"으로 적지 않는다."""
     message = await SummaryService(llm=None, settings=_settings()).run(_request(_THREE))

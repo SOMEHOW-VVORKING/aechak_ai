@@ -273,8 +273,12 @@ class InspectionPipeline:
         # 직렬로 두는 이유는 레이트 리밋 압력을 한 요청 안에서 분산하는 것 하나다.
         specs = specs_for(request.target_type, fanout=self._settings.perspective_fanout)
         for spec in specs:
-            result = await self._judge(spec, request, rule_result.redacted, request_id)
-            calls.extend(self._usage(result, request_id, perspective=spec.perspective))
+            # 재시도가 나면 두 시도가 다 과금된다. **둘 다 원장에 싣는다** -- 판정에 쓰는
+            # 것은 마지막 하나다.
+            attempts = await self._judge(spec, request, rule_result.redacted, request_id)
+            for attempt in attempts:
+                calls.extend(self._usage(attempt, request_id, perspective=spec.perspective))
+            result = attempts[-1]
             perspective_result, found, reported = self._interpret(spec, result, rule_result.redacted)
             perspectives.append(perspective_result)
             violations.extend(found)
@@ -408,7 +412,12 @@ class InspectionPipeline:
         request: InspectionRequest,
         redacted: str,
         request_id: str,
-    ) -> LlmResult:
+    ) -> list[LlmResult]:
+        """쏜 호출을 **전부** 돌려준다. 마지막이 판정에 쓰는 것이다.
+
+        마지막 하나만 돌려주면 재시도 전 호출의 비용과 실패가 원장에서 사라진다 -- 하네스와
+        데모가 그 목록을 합산하므로 재시도가 난 건의 비용·실패 표시가 틀어진다.
+        """
         assert self._llm is not None
         tool = findings_tool(spec)
         system_blocks = _system_blocks()
@@ -425,13 +434,13 @@ class InspectionPipeline:
         )
         # 예산 소진과 상한 초과는 다시 쏴도 같은 결과다. 재시도는 출력 토큰만 한 번 더 태운다.
         if result.ok or result.outcome in (CallOutcome.BUDGET_EXHAUSTED, CallOutcome.TRUNCATED):
-            return result
+            return [result]
 
         # 한 번만 다시 시도한다. 두 번 넘게 매달리면 카프카 파티션이 그만큼 막히고,
         # 미검사로 기록하는 편이 안전하다. 대기 시간이 설정 모듈에 있는 이유는
         # Settings.worst_case_handle_seconds()가 같은 값을 봐야 하기 때문이다.
         await asyncio.sleep(JUDGE_RETRY_DELAY_SECONDS)
-        return await self._llm.call_tool(
+        retried = await self._llm.call_tool(
             model=self._settings.screening_model,
             effort=self._settings.screening_effort,
             max_tokens=self._settings.max_tokens_screening,
@@ -440,6 +449,7 @@ class InspectionPipeline:
             tool=tool,
             request_id=request_id,
         )
+        return [result, retried]
 
     def _interpret(
         self,

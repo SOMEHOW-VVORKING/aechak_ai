@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -465,7 +466,7 @@ async def test_호출_실패를_제안할_것이_없었다로_적지_않는다()
     assert response.modelCalled is True
     assert response.skipReason is None, "호출은 했으므로 건너뛴 것이 아니다"
     assert "실패" in (response.failureDetail or "")
-    assert len(response.usage) == 1
+    assert len(response.usage) == 2, "두 번 쐈으면 원장에 두 행이다. 재시도도 과금된다"
 
 
 async def test_상품명을_절대_제안하지_않는다() -> None:
@@ -696,6 +697,26 @@ async def test_레이트_리밋은_한_번만_다시_쏜다(monkeypatch: pytest.
 
     assert len(llm.calls) == 2
     assert response.state is DraftState.OK
+
+
+async def test_재시도_전_첫_호출도_원장에_남는다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """재시도가 나면 **두 호출이 다 과금된다.** 둘째만 적으면 비용과 실패가 사라진다."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    dropped = replace(
+        failed(CallOutcome.RATE_LIMITED),
+        call_id="call-first",
+        output_tokens=200,
+        cost_micro_usd=300,
+    )
+    llm = FakeLlmClient([dropped, ok(_tool_input(leaf=152), model="claude-haiku-4-5")])
+
+    response = await DraftService(llm=llm, settings=_settings()).run(_request())
+
+    assert response.state is DraftState.OK
+    assert len(response.usage) == 2, "재시도 전 첫 호출이 원장에서 사라졌다"
+    assert response.usage[0].callId == "call-first"
+    assert response.usage[0].outcome == CallOutcome.RATE_LIMITED.value
+    assert response.total_cost_micro_usd() == 300 + 5000
 
 
 async def test_예산_소진과_절단은_다시_쏘지_않는다() -> None:

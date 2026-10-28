@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -167,6 +168,37 @@ async def test_예산_소진은_재시도하지_않는다(settings: Settings) ->
     assert len(llm.calls) == 2, "예산이 없는데 다시 부르면 400을 한 번 더 받을 뿐이다"
     outcomes = {p.perspective: p for p in verdict.perspectives}
     assert outcomes[Perspective.DISPLAY_ADS].skipReason == CallOutcome.BUDGET_EXHAUSTED.value
+
+
+async def test_재시도_전_첫_호출도_원장에_남는다(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """재시도가 나면 **두 호출이 다 과금된다.** 둘째만 적으면 비용과 실패가 사라진다.
+
+    ``SCHEMA_INVALID`` 를 쓰는 이유: 토큰과 비용이 있는 응답도 그 분류로 떨어진다
+    (``llm/client.py`` 의 분류). 0원 사례에 한정된 결함이 아니다.
+    """
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    dropped = replace(
+        failed(CallOutcome.SCHEMA_INVALID),
+        call_id="call-first",
+        output_tokens=200,
+        cost_micro_usd=300,
+    )
+    llm = FakeLlmClient([dropped, ok(NO_FINDING), ok(NO_FINDING)])
+    pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+    verdict = await pipeline.run(product("글루코사민 함유"))
+
+    assert len(llm.calls) == 3
+    assert len(verdict.calls) == 3, "재시도 전 첫 호출이 원장에서 사라졌다"
+    first = next((c for c in verdict.calls if c.callId == "call-first"), None)
+    assert first is not None, "버려진 호출의 callId 가 원장에 없다"
+    assert first.outcome is CallOutcome.SCHEMA_INVALID
+    assert first.perspective is Perspective.DISPLAY_ADS, "재시도한 관점으로 적는다"
+    assert sum(c.costMicroUsd for c in verdict.calls) == 300 + 5000 + 5000
+
+
+async def _no_sleep(_seconds: float) -> None:
+    return None
 
 
 async def test_원문에_없는_인용은_판정으로_쓰지_않는다(settings: Settings) -> None:

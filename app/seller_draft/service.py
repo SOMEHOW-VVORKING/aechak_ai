@@ -352,8 +352,11 @@ class DraftService:
             text = next(part["text"] for part in content if part.get("type") == "text")
             self._recorder.envelope(text, image_attached=block is not None)
 
-        result = await self._call(request.requestId, content)
-        usage = _usage(request.requestId, result)
+        # 재시도가 나면 두 시도가 다 과금된다. **둘 다 원장에 싣는다** -- 조립에 쓰는
+        # 것은 마지막 하나다.
+        attempts = await self._call(request.requestId, content)
+        usage = [_usage(request.requestId, attempt) for attempt in attempts]
+        result = attempts[-1]
 
         if not result.ok:
             self._record_generate(result, failed=True)
@@ -370,11 +373,14 @@ class DraftService:
             usage=usage,
         )
 
-    async def _call(self, request_id: str, user_content: list[dict[str, Any]]) -> Any:
-        """호출 한 번 + 조건부 재시도 1회. 예산을 한 자리에서 보이게 둔다.
+    async def _call(self, request_id: str, user_content: list[dict[str, Any]]) -> list[Any]:
+        """호출 한 번 + 조건부 재시도 1회. 쏜 호출을 **전부** 돌려준다.
 
         ``BUDGET_EXHAUSTED`` 와 ``TRUNCATED`` 는 다시 쏴도 같은 결과다 -- 재시도는 출력
         토큰만 한 번 더 태운다. ``pipeline._judge`` 의 조건이 선례다.
+
+        마지막 하나만 돌려주면 재시도 전 호출의 비용과 실패가 ``usage`` 에서 사라진다 --
+        ``_alert_cost`` 와 하네스가 그 목록을 합산하므로 재시도가 난 건의 비용이 낮게 적힌다.
         """
         assert self._llm is not None
         settings = self._settings
@@ -390,10 +396,11 @@ class DraftService:
         }
         result = await self._llm.call_tool(**kwargs)
         if result.ok or result.outcome in (CallOutcome.BUDGET_EXHAUSTED, CallOutcome.TRUNCATED):
-            return result
+            return [result]
         log.info("초안 호출 실패. 한 번만 다시 쏜다. outcome=%s", result.outcome.value)
         await asyncio.sleep(JUDGE_RETRY_DELAY_SECONDS)
-        return await self._llm.call_tool(**kwargs)
+        retried = await self._llm.call_tool(**kwargs)
+        return [result, retried]
 
     def _assemble(
         self,
@@ -404,7 +411,7 @@ class DraftService:
         mode: ImageMode,
         use_image: bool,
         tool_input: dict[str, Any],
-        usage: DraftCallUsage,
+        usage: list[DraftCallUsage],
     ) -> SellerDraftResponse:
         """N2 가드 + N3 조립. **모델이 돌려준 어떤 값도 그냥 통과하지 않는다.**"""
         settings = self._settings
@@ -527,7 +534,7 @@ class DraftService:
             guardDrops=drops,
             sellerNotice=notice,
             modelCalled=True,
-            usage=[usage],
+            usage=usage,
             generatedAt=datetime.now(UTC),
         )
 
@@ -651,7 +658,7 @@ class DraftService:
         signal: ItemSignal,
         image_meta: imagemeta.ImageMeta | None,
         mode: ImageMode,
-        usage: DraftCallUsage,
+        usage: list[DraftCallUsage],
         result: Any,
     ) -> SellerDraftResponse:
         """호출이 죽었다. **"제안할 것이 없었다"로 적지 않는다.**
@@ -671,7 +678,7 @@ class DraftService:
             basis=dict.fromkeys(("categoryId", "description", "optionGroups"), Basis.NONE),
             fieldStatus=status,
             modelCalled=True,
-            usage=[usage],
+            usage=usage,
             failureDetail=f"초안 호출이 실패했다: {result.outcome.value}"
             + (f" ({result.detail})" if result.detail else ""),
             generatedAt=datetime.now(UTC),

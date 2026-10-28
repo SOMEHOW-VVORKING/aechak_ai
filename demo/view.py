@@ -565,9 +565,12 @@ def _stages_from_verdict(verdict: ContentVerdict) -> list[StageView]:
     """
     rows = {p.perspective: p for p in verdict.perspectives}
     model_rows = _model_rows(verdict.perspectives)
+    # **마지막 호출로 덮는다.** 재시도가 난 관점은 원장에 두 행이 있고, 단계 줄이 보여야
+    # 하는 것은 판정에 쓴 호출이다(깊은 추적도 그 하나를 적는다). 첫 행으로 두면 재시도한
+    # 관점의 단계 줄이 버려진 시도의 비용·지연을 띄운다.
     calls_by_perspective: dict[str, Any] = {}
     for call in verdict.calls:
-        calls_by_perspective.setdefault(call.perspective.value, call)
+        calls_by_perspective[call.perspective.value] = call
 
     views: list[StageView] = []
 
