@@ -210,12 +210,11 @@ def test_보류_집합의_수를_숨기지_않고_순환임을_함께_적는다(
 
     hits = sum(1 for ex in claims.HOLDOUT_CLAIM_EXAMPLES if claims.screen(ex))
     assert f"{hits}/{len(claims.HOLDOUT_CLAIM_EXAMPLES)}건" in line
-    if claims.HOLDOUT_IS_CIRCULAR:
-        assert "순환이다" in line, line
-        assert "유일한 비순환" not in line, line
-        assert "비순환 숫자가 지금 없다" in rows
-    else:
-        assert "유일한 비순환" in line, line
+    assert "순환이다" in line, line
+    assert "이미 보고 고친 회귀 사례 수" in line, line
+    assert "유일한 비순환" not in line, line
+    assert "비순환 숫자가 지금 없다" in rows
+    assert claims.HOLDOUT_CLAIM_EXAMPLES, "목록을 지우지 않는다 -- 무엇을 보고 고쳤는지가 근거다"
 
 
 # --- 비순환 재현율이 0/8 이었다 ----------------------------------------------------------
@@ -275,17 +274,6 @@ def test_정상_문구를_막지_않는다() -> None:
         "2kg 포장이고 하루 두 번 급여합니다",
     ):
         assert not claims.screen(text), f"{text!r} 이 과탐으로 걸렸다: {claims.screen(text)}"
-
-
-def test_앞_보류_집합이_순환임을_선언한다() -> None:
-    """**사전을 고친 순간 그 측정 도구는 사라졌다. 사라진 것을 사라졌다고 적는다.**
-
-    모듈 머리글이 "이 목록에 맞춰 사전을 늘리면 그 순간 이것도 순환이 된다 -- 늘리고
-    싶으면 새 보류 집합을 먼저 만들어라" 라고 적어 뒀다. 질병명 층을 쓸 때 그 목록을
-    보았으므로 ``HOLDOUT_CLAIM_EXAMPLES`` 는 이제 비순환 숫자가 아니다.
-    """
-    assert claims.HOLDOUT_IS_CIRCULAR is True
-    assert claims.HOLDOUT_CLAIM_EXAMPLES, "목록을 지우지 않는다 -- 무엇을 보고 고쳤는지가 근거다"
 
 
 # --- 이름 0단과 출력 가드를 같은 사전에 걸지 않는다 -----------------------------------------
@@ -370,12 +358,6 @@ def test_이름_0단이_출력_가드보다_좁다() -> None:
 def test_출력_가드가_효능_문구를_통과시키지_않는다() -> None:
     missed = [text for text in claims.SECOND_HOLDOUT_CLAIM_EXAMPLES if not claims.screen(text)]
     assert not missed, f"효능 문구가 출력 가드를 통과한다: {missed}"
-
-
-def test_두번째_보류_집합도_순환임을_선언한다() -> None:
-    """**보고 고쳤으면 순환이다.** 숨기는 것보다 적어 두는 쪽이 낫다."""
-    assert claims.SECOND_HOLDOUT_IS_CIRCULAR is True
-    assert len(claims.SECOND_HOLDOUT_CLAIM_EXAMPLES) >= 12
 
 
 def test_없이가_뒤_표현의_부정으로_읽히지_않는다() -> None:

@@ -86,7 +86,9 @@ UNCOVERED_POLICY_EXAMPLES: tuple[str, ...] = ("국내산(실제 수입품)",)
 # 네거티브 리스트의 성질상 이 숫자는 낮게 나온다. 낮은 것이 사실이고, 숨기는 것보다 낫다.
 #
 # **그 숫자가 0/8 이었고, 그래서 사전을 고쳤다. 고친 순간 이 목록은 순환이 되었다.**
-# 아래 ``HOLDOUT_IS_CIRCULAR`` 가 그 사실을 상수로 들고 있고 하네스가 그렇게 찍는다.
+# 하네스 리포트가 그 사실을 숫자와 같은 줄에 적는다(``run_draft._report_guards``). 리터럴
+# 한 줄씩 더해 메우지는 않았다 -- 축이 다른 규칙 넷을 더했고(질병명·완치 동사·기간 단정·
+# 후기 인용) 그 규칙들이 목록의 문장을 지나간다. 그래도 목록을 **보면서** 썼으므로 순환이다.
 # 목록을 지우지 않는 이유는 **무엇을 보고 고쳤는지가 근거**이기 때문이다. 다음 사람이
 # 비순환 숫자를 원하면 이 목록이 아니라 **실제 셀러 문구**에서 새 집합을 받아야 한다 --
 # 내가 새로 지어낸 문장으로 만든 집합은 규칙을 쓴 사람이 같아서 증거가 약하다.
@@ -101,13 +103,6 @@ HOLDOUT_CLAIM_EXAMPLES: tuple[str, ...] = (
     "알러지를 잡아 줍니다",
 )
 
-# **위 목록을 보고 사전을 고쳤는가.** 참이면 그 목록으로 잰 재현율은 커버리지가 아니다.
-#
-# 리터럴 한 줄씩 더해 메우지는 않았다 -- 축이 다른 규칙 넷을 더했고(질병명·완치 동사·
-# 기간 단정·후기 인용) 그 규칙들이 목록의 문장을 지나간다. 그래도 목록을 **보면서** 썼으므로
-# 순환이다. 숨기는 것보다 적어 두는 쪽이 낫다.
-HOLDOUT_IS_CIRCULAR = True
-
 # **두 번째 보류 집합.** 첫 집합이 순환이 된 뒤 사전을 보지 않고 새로 쓴 것이고, 잰 결과
 # 재현율이 5/18 이었다 -- 전건이 ``guardDrops=[]`` 로 ``description`` 에 실려 나갔다.
 #
@@ -115,7 +110,7 @@ HOLDOUT_IS_CIRCULAR = True
 # 보지 못했다('구취가 사라져요'·'설사가 멈춥니다'·'기력이 돌아옵니다'). 그래서 리터럴을
 # 베끼지 않고 **그 구조를 세는 층**을 더했다(``_BODY_PART`` x ``_CURE_ACTION`` 공기).
 #
-# **이 목록도 보고 고쳤으므로 순환이다.** 숨기지 않고 상수로 들고 있다. 비순환 숫자를 원하면
+# **이 목록도 보고 고쳤으므로 순환이다.** 리포트가 숨기지 않고 함께 적는다. 비순환 숫자를 원하면
 # 실제 셀러 문구에서 세 번째 집합을 받아야 한다 -- 내가 지어낸 문장으로 만든 집합은 규칙을
 # 쓴 사람이 같아서 증거가 약하다.
 SECOND_HOLDOUT_CLAIM_EXAMPLES: tuple[str, ...] = (
@@ -138,7 +133,6 @@ SECOND_HOLDOUT_CLAIM_EXAMPLES: tuple[str, ...] = (
     "눈물자국이 사라집니다",
     "변 냄새가 줄어드는 효과를 봤다는 후기",
 )
-SECOND_HOLDOUT_IS_CIRCULAR = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +194,36 @@ _MEDICAL: tuple[ClaimTerm, ...] = (
     ),
 )
 
+# **출력 가드(``_EFFICACY``)와 이름 0단(``_NAME_STRICT``)이 둘 다 드는 셋.**
+#
+# 앞 판은 같은 선언을 두 사전에 **글자까지 같게** 복붙해 두고 있었다. 한쪽만 고치면 이름
+# 0단과 출력 가드가 조용히 갈린다 -- 같은 객체를 양쪽에서 가리켜 그 갈림을 막는다.
+# ``ClaimTerm`` 은 frozen 이라 공유가 안전하다.
+#
+# **두 사전을 통째로 합치지는 않는다.** 나머지는 **의도된 차이**다 -- ``특효`` 는 이름 쪽만
+# ``특효약`` alias 를 갖고, ``식약처인증`` 은 이름 전용 좁은 항목이며, ``의약품`` 은
+# ``_MEDICAL`` 에 있고 이름 쪽만 파우치·보관·함 예외를 더한다.
+_COMPLETE_FIX_TERM = ClaimTerm(
+    "완전해결",
+    aliases=("완전해소", "말끔히해결", "싹사라집"),
+    note="효과를 단정한다",
+)
+_ALL_PETS_TERM = ClaimTerm(
+    "모든반려동물에게효과",
+    aliases=(
+        "모든강아지에게효과",
+        "모든고양이에게효과",
+        "모든아이에게효과",
+        "누구에게나효과",
+    ),
+    note="수치 없이 효과를 단정한다",
+)
+_NO_SIDE_EFFECT_TERM = ClaimTerm(
+    "부작용이전혀없",
+    aliases=("부작용은전혀없", "부작용없음", "부작용이없습니다"),
+    note="부작용이 없다고 단정한다",
+)
+
 # 수치나 단정으로 효과를 부풀리는 표현.
 _EFFICACY: tuple[ClaimTerm, ...] = (
     # fold() 가 반복 글자를 줄이므로 "100%"는 "10%"로 접힌다. 사전과 입력에 같은 함수를
@@ -217,26 +241,9 @@ _EFFICACY: tuple[ClaimTerm, ...] = (
         deny_suffix=("배송", "발송", "출고", "환불"),
         note="즉각적인 효과를 단정한다",
     ),
-    ClaimTerm(
-        "완전해결",
-        aliases=("완전해소", "말끔히해결", "싹사라집"),
-        note="효과를 단정한다",
-    ),
-    ClaimTerm(
-        "모든반려동물에게효과",
-        aliases=(
-            "모든강아지에게효과",
-            "모든고양이에게효과",
-            "모든아이에게효과",
-            "누구에게나효과",
-        ),
-        note="수치 없이 효과를 단정한다",
-    ),
-    ClaimTerm(
-        "부작용이전혀없",
-        aliases=("부작용은전혀없", "부작용없음", "부작용이없습니다"),
-        note="부작용이 없다고 단정한다",
-    ),
+    _COMPLETE_FIX_TERM,
+    _ALL_PETS_TERM,
+    _NO_SIDE_EFFECT_TERM,
     ClaimTerm("특효", aliases=("만병통치",), note="효과를 단정한다"),
 )
 
@@ -451,26 +458,9 @@ _IMMEDIATE_TERM = ClaimTerm("즉각 효과 단정", note="먹이면 바로 효�
 # 본다. 느슨한 층은 출력 가드에 남는다 -- 거기서는 슬롯 하나를 비우는 비용이다.
 _NAME_STRICT: tuple[ClaimTerm, ...] = (
     ClaimTerm("특효", aliases=("만병통치", "특효약"), note="효과를 단정한다"),
-    ClaimTerm(
-        "부작용이전혀없",
-        aliases=("부작용은전혀없", "부작용없음", "부작용이없습니다"),
-        note="부작용이 없다고 단정한다",
-    ),
-    ClaimTerm(
-        "모든반려동물에게효과",
-        aliases=(
-            "모든강아지에게효과",
-            "모든고양이에게효과",
-            "모든아이에게효과",
-            "누구에게나효과",
-        ),
-        note="수치 없이 효과를 단정한다",
-    ),
-    ClaimTerm(
-        "완전해결",
-        aliases=("완전해소", "말끔히해결", "싹사라집"),
-        note="효과를 단정한다",
-    ),
+    _NO_SIDE_EFFECT_TERM,
+    _ALL_PETS_TERM,
+    _COMPLETE_FIX_TERM,
     # 규제 주장이다. 기관명이 붙은 것만 둔다 -- 'KC 인증 장난감' 은 정상 상품명이다.
     ClaimTerm("식약처인증", aliases=("식약처허가", "식약처승인"), note="확인되지 않은 인증을 주장한다"),
     ClaimTerm(
@@ -590,10 +580,8 @@ def forbidden_examples_block() -> str:
 __all__ = [
     "CLAIM_TERMS",
     "HOLDOUT_CLAIM_EXAMPLES",
-    "HOLDOUT_IS_CIRCULAR",
     "POLICY_CLAIM_EXAMPLES",
     "SECOND_HOLDOUT_CLAIM_EXAMPLES",
-    "SECOND_HOLDOUT_IS_CIRCULAR",
     "UNCOVERED_POLICY_EXAMPLES",
     "ClaimHit",
     "ClaimTerm",

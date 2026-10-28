@@ -59,17 +59,14 @@ def test_매직_바이트가_아니면_못_읽는다() -> None:
     assert imagemeta.read_dimensions(b"not an image at all") is None
 
 
-def test_선언_치수가_어긋나면_실측값으로_예산을_계산한다() -> None:
-    """**선언만 믿으면 예산이 조용히 세 배가 된다.**"""
+def test_선언_치수를_보지_않고_실측값으로_예산을_계산한다() -> None:
+    """**선언만 믿으면 예산이 조용히 세 배가 된다.** 그래서 선언을 아예 받지 않는다."""
     meta = imagemeta.parse(
         synthetic_png(1024, 1024),
         declared_media_type="image/png",
-        declared_width_px=512,
-        declared_height_px=512,
         max_tokens=4000,
     )
 
-    assert meta.declared_mismatch is True
     assert (meta.width_px, meta.height_px) == (1024, 1024)
     assert meta.estimated_tokens == imagemeta.estimate_tokens(1024, 1024)
 
@@ -124,7 +121,8 @@ def test_해상도_대비_용량이_작으면_힌트만_올린다() -> None:
 
     assert thin.low_fidelity is True
     assert thin.problem is None, "저품질은 차단이 아니다"
-    assert thin.bytes_per_pixel < imagemeta.LOW_FIDELITY_BYTES_PER_PIXEL
+    # 임계는 ``parse()`` 안에서 계산한다. 그 값을 여기서 다시 세어 임계와 맞춰 본다.
+    assert thin.bytes_len / (thin.width_px * thin.height_px) < imagemeta.LOW_FIDELITY_BYTES_PER_PIXEL
 
 
 def test_충분한_용량은_저품질로_읽지_않는다() -> None:

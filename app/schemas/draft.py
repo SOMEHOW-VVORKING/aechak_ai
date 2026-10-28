@@ -177,7 +177,8 @@ class DraftImage(BaseModel):
     base64 는 AI 서버가 네트워크를 타지 않아 의존성·권한·네트워크 면이 모두 깨끗하다 --
     대가는 요청 본문 33% 팽창뿐이다.
 
-    선언 치수는 **비교용으로만** 받는다. 실측과 어긋나면 실측값으로 예산을 다시 계산한다.
+    선언 치수는 **받기만 하고 읽지 않는다.** 예산은 매직 바이트로 읽은 실측 치수로만
+    계산한다(``imagemeta.parse``). 셀러센터가 이미 보내는 필드라 계약에서 빼지 않았다.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -325,7 +326,6 @@ class ImageReport(BaseModel):
     heightPx: int = 0
     bytes: int = 0
     estimatedTokens: int = 0
-    declaredMismatch: bool = False
     lowFidelity: bool = False
     rejected: bool = False
     problem: str | None = None

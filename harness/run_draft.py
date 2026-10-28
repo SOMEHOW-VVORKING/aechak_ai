@@ -155,14 +155,6 @@ def _daily_draft_ceiling() -> int:
 DAILY_DRAFT_CEILING = _daily_draft_ceiling()
 
 
-def model_earns_its_keep(acc_model: float, acc_lexicon: float) -> bool:
-    """**기계적 중단 규칙.** 0단이 공짜인데 모델이 더 못 맞히면 그 호출은 비용만 더한다.
-
-    선별 하네스의 손익분기와 같은 성질이고 비용표 없이도 성립한다. 테스트가 고정한다.
-    """
-    return acc_model > acc_lexicon
-
-
 @dataclass(slots=True)
 class Record:
     """케이스 한 건의 결과 한 줄."""
@@ -180,10 +172,9 @@ class Record:
     leaf_correct: bool
     scorable: bool
     model_called: bool
-    image_used: bool
+    # 사진을 썼는가·설명이 채워졌는가·옵션이 채워졌는가는 **아래 둘에서 읽는다** --
+    # ``image_usability == 'USED'`` 와 ``field_status`` 가 같은 사실을 더 자세히 들고 있다.
     image_usability: str
-    description_filled: bool
-    option_groups_filled: bool
     option_group_names: list[str]
     option_group_hit: bool | None
     field_status: dict[str, str]
@@ -518,10 +509,7 @@ def _lexicon_only_records() -> list[Record]:
                 leaf_correct=(predicted == case.leaf_truth),
                 scorable=case in scorable(),
                 model_called=False,
-                image_used=False,
                 image_usability=ImageUsability.NO_IMAGE_SENT.value,
-                description_filled=False,
-                option_groups_filled=False,
                 option_group_names=[],
                 option_group_hit=None,
                 field_status={},
@@ -610,13 +598,10 @@ def _report_guards() -> list[tuple[str, str]]:
         (
             "효능 사전 보류 집합",
             f"{holdout_hits}/{len(holdout)}건"
-            + (
-                " — **이 숫자는 이제 순환이다.** 이 집합이 0/8 이었고 그것을 보고 사전을 "
-                "고쳤다(질병명·완치 동사·기간 단정·후기 인용 네 층을 더했다). 리터럴을 "
-                "베끼지는 않았지만 목록을 보면서 썼으므로 미탐을 측정하지 못한다"
-                if claims.HOLDOUT_IS_CIRCULAR
-                else " — **사전을 쓸 때 참조하지 않은 표현이고 이것이 유일한 비순환 숫자다.**"
-            )
+            " — **이 숫자는 재현율 검증이 아니라 이미 보고 고친 회귀 사례 수다.** 이 집합이 "
+            "0/8 이었고 그것을 보고 사전을 고쳤다(질병명·완치 동사·기간 단정·후기 인용 네 층을 "
+            "더했다). 리터럴을 베끼지는 않았지만 목록을 보면서 썼으므로 순환이다 -- 미탐을 "
+            "측정하지 못한다"
             + (
                 f" / 놓친 것: {', '.join(missed[:4])}" + (" ..." if len(missed) > 4 else "") if missed else ""
             ),
@@ -918,7 +903,8 @@ def _report_estimate(repeat: int) -> list[tuple[str, str]]:
         (
             "중단 규칙",
             "acc(a) <= acc(lexicon-only) 면 모델을 부르지 마라 — 0단이 공짜인데 모델이 더 못 "
-            "맞히면 그 호출은 비용만 더한다. 기계적이고 테스트로 고정된다",
+            "맞히면 그 호출은 비용만 더한다. **자동 중단은 없다** -- 이 리포트의 두 숫자를 "
+            "보고 사람이 적용한다",
         ),
     ]
     return rows
@@ -1151,10 +1137,7 @@ async def _measure(
                     leaf_correct=(predicted == case.leaf_truth),
                     scorable=case.id in scorable_ids,
                     model_called=response.modelCalled,
-                    image_used=response.imageUsability is ImageUsability.USED,
                     image_usability=response.imageUsability.value,
-                    description_filled=response.fieldStatus.get("description") is FieldStatus.FILLED,
-                    option_groups_filled=response.fieldStatus.get("optionGroups") is FieldStatus.FILLED,
                     option_group_names=names,
                     option_group_hit=(
                         bool(set(names) & case.acceptable_option_group_names)
@@ -1192,10 +1175,7 @@ def _unprocessable_record(
         leaf_correct=(case.leaf_truth is None),
         scorable=case.id in scorable_ids,
         model_called=False,
-        image_used=False,
         image_usability=ImageUsability.NO_IMAGE_SENT.value,
-        description_filled=False,
-        option_groups_filled=False,
         option_group_names=[],
         option_group_hit=None,
         field_status={},
@@ -1730,6 +1710,5 @@ __all__ = [
     "image_reachable_cases",
     "load_records",
     "model_called_cases",
-    "model_earns_its_keep",
     "wrong_photo_reachable_cases",
 ]

@@ -67,8 +67,6 @@ class ImageMeta:
     height_px: int
     bytes_len: int
     estimated_tokens: int
-    # 선언 치수가 실측과 달랐는가. 예산을 선언값으로 계산하면 조용히 넘친다.
-    declared_mismatch: bool
     low_fidelity: bool
     problem: ImageProblem | None
     detail: str | None = None
@@ -85,11 +83,6 @@ class ImageMeta:
     @property
     def usable(self) -> bool:
         return self.problem is None
-
-    @property
-    def bytes_per_pixel(self) -> float:
-        pixels = self.width_px * self.height_px
-        return (self.bytes_len / pixels) if pixels else 0.0
 
 
 def estimate_tokens(width: int, height: int) -> int:
@@ -185,15 +178,12 @@ def parse(
     data: bytes,
     *,
     declared_media_type: str,
-    declared_width_px: int = 0,
-    declared_height_px: int = 0,
     max_tokens: int,
 ) -> ImageMeta:
     """헤더 선검사 전부. **0원이고 네트워크를 타지 않는다.**
 
-    선언 치수는 신뢰하지 않고 비교용으로만 받는다. 어긋나면 ``declared_mismatch`` 를 올리고
-    **실측값으로 예산을 다시 계산한다** -- 그 한 줄이 "896 이라고 적고 2576 을 보내는"
-    경로를 막는다.
+    **선언 치수를 보지 않는다.** 매직 바이트로 읽은 실측값으로만 예산을 계산하고, 그것이
+    "896 이라고 적고 2576 을 보내는" 경로를 막는다.
     """
     read = read_dimensions(data)
     if read is None:
@@ -203,7 +193,6 @@ def parse(
             height_px=0,
             bytes_len=len(data),
             estimated_tokens=0,
-            declared_mismatch=bool(declared_width_px or declared_height_px),
             low_fidelity=False,
             problem=ImageProblem.UNREADABLE_HEADER,
             detail="헤더에서 치수를 읽을 수 없다. 이미지 없이 진행한다",
@@ -217,17 +206,12 @@ def parse(
             height_px=height,
             bytes_len=len(data),
             estimated_tokens=0,
-            declared_mismatch=False,
             low_fidelity=False,
             problem=ImageProblem.UNSUPPORTED_MEDIA_TYPE,
             detail=f"받지 않는 미디어 타입이다: {media_type}",
         )
 
     tokens = estimate_tokens(width, height)
-    mismatch = bool(
-        (declared_width_px and declared_width_px != width)
-        or (declared_height_px and declared_height_px != height)
-    )
     pixels = width * height
     low = bool(pixels) and (len(data) / pixels) < LOW_FIDELITY_BYTES_PER_PIXEL
 
@@ -239,7 +223,6 @@ def parse(
             height_px=height,
             bytes_len=len(data),
             estimated_tokens=tokens,
-            declared_mismatch=mismatch,
             low_fidelity=low,
             problem=ImageProblem.TOKEN_BUDGET_EXCEEDED,
             detail=(
@@ -256,7 +239,6 @@ def parse(
             height_px=height,
             bytes_len=len(data),
             estimated_tokens=tokens,
-            declared_mismatch=mismatch,
             low_fidelity=low,
             problem=ImageProblem.TOO_SMALL,
             detail=f"긴 변이 {MIN_LONG_EDGE_PX}px 에 못 미친다. 이미지 없이 진행한다",
@@ -268,7 +250,6 @@ def parse(
         height_px=height,
         bytes_len=len(data),
         estimated_tokens=tokens,
-        declared_mismatch=mismatch,
         low_fidelity=low,
         problem=None,
     )

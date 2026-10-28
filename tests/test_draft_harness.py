@@ -158,17 +158,6 @@ def test_일_상한도_비용표에서_파생한다() -> None:
     assert run_draft.DAILY_DRAFT_CEILING == int(budget * 1_000_000 // table["draft_text_haiku"])
 
 
-def test_기계적_중단_규칙이_성립한다() -> None:
-    """0단이 공짜인데 모델이 더 못 맞히면 그 호출은 비용만 더한다.
-
-    **비용표 없이도 성립하는 유일한 기계적 규칙이다** -- 이미지 쪽은 이런 규칙을 만들 수
-    없고, 만든 척하지 않는다.
-    """
-    assert run_draft.model_earns_its_keep(0.7, 0.5) is True
-    assert run_draft.model_earns_its_keep(0.5, 0.5) is False
-    assert run_draft.model_earns_its_keep(0.3, 0.5) is False
-
-
 def test_호출_건수가_서비스와_같은_이름_가드를_쓴다(monkeypatch: pytest.MonkeyPatch) -> None:
     """하네스가 ``claims.screen`` 을, 서비스는 ``claims.screen_name`` 을 쓰고 있었다.
 
@@ -501,10 +490,7 @@ def _record(**overrides: object) -> run_draft.Record:
         "leaf_correct": True,
         "scorable": True,
         "model_called": True,
-        "image_used": False,
         "image_usability": "NO_IMAGE_SENT",
-        "description_filled": True,
-        "option_groups_filled": False,
         "option_group_names": [],
         "option_group_hit": None,
         "option_group_scorable": True,

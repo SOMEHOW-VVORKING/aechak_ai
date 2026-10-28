@@ -54,6 +54,10 @@ from app.seller_draft import claims
 # 옵션 제안 상한. **툴 스키마가 아니라 코드로 건다** -- ``strict`` 모드가 개수 제약을 받지
 # 않는다. 백엔드 임시저장 DTO 의 상한은 그룹 5 · 조합 200 · 그룹당 값 50 이라 훨씬 넉넉한데,
 # 초안이 그만큼 제안할 근거가 없고 데카르트곱이 커지면 셀러가 지우는 데 더 오래 걸린다.
+# **셋은 함께 움직인다.** 그룹당 값 상한을 그룹 수만큼 제곱한 것이 조합 상한과 정확히 같아서
+# (6의 2제곱 = 36) 앞의 둘을 통과한 입력은 조합 상한을 넘길 수 없다. 그래서 조합을 만든 뒤에
+# 다시 세는 분기를 두지 않는다. 하나만 올리면 그 맞물림이 깨지고
+# ``test_그룹_값_상한의_곱이_조합_상한과_정확히_같다`` 가 red 가 된다.
 MAX_OPTION_GROUPS = 2
 MAX_VALUES_PER_GROUP = 6
 MAX_COMBINATIONS = 36
@@ -124,13 +128,11 @@ def screen_text(text: str) -> TextVerdict:
 
 @dataclass(slots=True)
 class DescriptionResult:
-    """설명 조립 결과. **살아남은 슬롯과 떨어진 슬롯을 함께 든다.**"""
+    """설명 조립 결과. **떨어진 슬롯은 사유와 함께 든다.**"""
 
     text: str | None = None
     status: FieldStatus = FieldStatus.EMPTY_SCHEMA_INVALID
     drops: list[GuardDrop] = field(default_factory=list)
-    kept_slots: list[str] = field(default_factory=list)
-    truncated: bool = False
 
 
 def build_description(
@@ -143,7 +145,7 @@ def build_description(
 
     길이 초과는 **폐기가 아니라 문장 경계 절단**이다. 상품명이면 절단이 뜻을 바꾸지만
     설명은 뒤를 자르는 것이 비우는 것보다 셀러에게 쓸모 있다. 그리고 절단은 손실이라
-    플래그로 남긴다 -- 조용히 자르면 셀러가 모델이 그만큼만 썼다고 읽는다.
+    ``LENGTH`` 사유로 남긴다 -- 조용히 자르면 셀러가 모델이 그만큼만 썼다고 읽는다.
     """
     result = DescriptionResult()
     survivors: list[str] = []
@@ -162,7 +164,6 @@ def build_description(
             )
             continue
         survivors.append(piece)
-        result.kept_slots.append(key)
 
     if not survivors:
         # 슬롯이 전부 떨어졌으면 **가드 사유를 쓴다.** 하나도 안 왔으면 모델이 안 낸 것이다.
@@ -171,7 +172,7 @@ def build_description(
 
     joined = "\n\n".join(survivors)
     if len(joined) > max_chars:
-        joined, result.truncated = _truncate_at_sentence(joined, max_chars)
+        joined = _truncate_at_sentence(joined, max_chars)
         result.drops.append(
             GuardDrop(
                 field="description",
@@ -184,14 +185,14 @@ def build_description(
     return result
 
 
-def _truncate_at_sentence(text: str, limit: int) -> tuple[str, bool]:
+def _truncate_at_sentence(text: str, limit: int) -> str:
     """문장 경계에서 자른다. 경계가 없으면 글자 수로 자른다."""
     head = text[:limit]
     for mark in ("다.", ".", "!", "?", "\n"):
         at = head.rfind(mark)
         if at >= limit // 2:
-            return head[: at + len(mark)].rstrip(), True
-    return head.rstrip(), True
+            return head[: at + len(mark)].rstrip()
+    return head.rstrip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,7 +249,8 @@ def check_options(groups: list[OptionGroupDraft]) -> OptionVerdict:
     if invalid is not None:
         return invalid
 
-    return _finish(cleaned, drops, reject, max_combinations=MAX_COMBINATIONS, what="옵션 제안")
+    # 상한 셋이 맞물려 있어 여기 온 입력의 곱은 ``MAX_COMBINATIONS`` 이하다(상수 머리 주석).
+    return OptionVerdict(cleaned, build_combinations(cleaned), FieldStatus.FILLED, drops)
 
 
 def check_locked_options(groups: list[OptionGroupDraft]) -> OptionVerdict:
@@ -307,7 +309,7 @@ def check_locked_options(groups: list[OptionGroupDraft]) -> OptionVerdict:
     invalid = _registration_invariants(cleaned, reject)
     if invalid is not None:
         return invalid
-    return _finish(cleaned, drops, reject, max_combinations=LOCKED_MAX_COMBINATIONS, what="잠근 옵션")
+    return OptionVerdict(cleaned, build_combinations(cleaned), FieldStatus.FILLED, drops)
 
 
 def _clean(groups: list[OptionGroupDraft]) -> list[OptionGroupDraft]:
@@ -362,30 +364,6 @@ def _registration_invariants(
             assert verdict.status is not None and verdict.kind is not None
             return reject(verdict.kind, verdict.status, f"'{text}': {verdict.detail}")
     return None
-
-
-def _finish(
-    cleaned: list[OptionGroupDraft],
-    drops: list[GuardDrop],
-    reject: Callable[[GuardKind, FieldStatus, str], OptionVerdict],
-    *,
-    max_combinations: int,
-    what: str,
-) -> OptionVerdict:
-    combos = build_combinations(cleaned)
-    if not combos:
-        return reject(
-            GuardKind.OPTION_RULE,
-            FieldStatus.EMPTY_GUARD_OPTION_RULE,
-            f"조합을 하나도 만들 수 없어 {what}을 비웠다",
-        )
-    if len(combos) > max_combinations:
-        return reject(
-            GuardKind.OPTION_RULE,
-            FieldStatus.EMPTY_GUARD_OPTION_RULE,
-            f"데카르트곱이 {len(combos)}개로 상한 {max_combinations}를 넘겨 {what}을 비웠다",
-        )
-    return OptionVerdict(cleaned, combos, FieldStatus.FILLED, drops)
 
 
 def build_combinations(groups: list[OptionGroupDraft]) -> list[OptionCombinationDraft]:

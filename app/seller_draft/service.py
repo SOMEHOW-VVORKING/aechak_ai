@@ -267,8 +267,6 @@ class DraftService:
         meta = imagemeta.parse(
             data,
             declared_media_type=request.image.mediaType,
-            declared_width_px=request.image.declaredWidthPx,
-            declared_height_px=request.image.declaredHeightPx,
             max_tokens=self._settings.draft_image_max_tokens,
         )
         if meta.rejected:
@@ -909,7 +907,6 @@ def _image_report(
         heightPx=meta.height_px,
         bytes=meta.bytes_len,
         estimatedTokens=meta.estimated_tokens,
-        declaredMismatch=meta.declared_mismatch,
         lowFidelity=meta.low_fidelity,
         rejected=meta.rejected,
         problem=meta.problem.value if meta.problem else None,

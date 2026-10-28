@@ -88,7 +88,7 @@ def test_걸린_슬롯만_떨어뜨리고_나머지를_살린다() -> None:
     )
 
     assert result.status is FieldStatus.FILLED
-    assert result.kept_slots == ["materialOrSpec", "usage"]
+    assert result.text == "글루코사민 500mg 함유. 60정.\n\n1일 1정을 사료에 섞어 급여하세요."
     assert "치료" not in (result.text or "")
     assert [drop.kind for drop in result.drops] == [GuardKind.CLAIM]
 
@@ -114,8 +114,8 @@ def test_길이_초과는_폐기가_아니라_문장_경계_절단이다() -> No
     result = guard.build_description({"itemSummary": long_text}, order=_ORDER, max_chars=100)
 
     assert result.status is FieldStatus.FILLED
-    assert result.truncated is True
     assert len(result.text or "") <= 100
+    assert len(result.text or "") < len(long_text)
     assert (result.text or "").endswith("다.")
     assert [drop.kind for drop in result.drops] == [GuardKind.LENGTH]
 
@@ -182,14 +182,24 @@ def test_그룹과_값_상한을_코드로_건다() -> None:
     assert too_many_values.status is FieldStatus.EMPTY_GUARD_OPTION_RULE
 
 
-def test_데카르트곱_상한을_넘기면_비운다() -> None:
-    verdict = guard.check_options(
-        _groups(("사이즈", ["1", "2", "3", "4", "5", "6"]), ("색상", ["a", "b", "c", "d", "e", "f"]))
-    )
+def test_그룹_값_상한의_곱이_조합_상한과_정확히_같다() -> None:
+    """**상한 셋이 맞물려 있다.** 앞의 둘을 통과한 최악 입력이 조합 상한을 정확히 포화시킨다.
 
-    assert len(guard.build_combinations(verdict.groups or _groups())) <= guard.MAX_COMBINATIONS
+    그래서 조합을 만든 뒤 다시 세는 분기가 필요 없다(도달 불가라 지웠다). 그 대신 셋의
+    맞물림을 여기서 지킨다 -- ``MAX_VALUES_PER_GROUP`` 을 하나만 올리면 이 테스트가 red 가
+    되고, 그것이 사후 분기를 지운 자리를 메우는 방지선이다.
+    """
+    worst = _groups(
+        *(
+            (f"그룹{g}", [f"값{g}-{v}" for v in range(guard.MAX_VALUES_PER_GROUP)])
+            for g in range(guard.MAX_OPTION_GROUPS)
+        )
+    )
+    verdict = guard.check_options(worst)
+
+    assert guard.MAX_VALUES_PER_GROUP**guard.MAX_OPTION_GROUPS == guard.MAX_COMBINATIONS
     assert verdict.status is FieldStatus.FILLED
-    assert len(verdict.combinations) == 36
+    assert len(verdict.combinations) == guard.MAX_COMBINATIONS
 
 
 def test_이름_길이_상한을_넘기면_길이_사유다() -> None:
