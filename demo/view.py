@@ -2,7 +2,7 @@
 
 여기가 데모의 판단 코드다. 두 가지를 소유한다.
 
-1. **탈출 지점 판별.** 다섯 자리를 ``ContentVerdict`` 하나만으로 가른다. 관측 지점을 더하지
+1. **탈출 지점 판별.** 여덟 자리를 ``ContentVerdict`` 하나만으로 가른다. 관측 지점을 더하지
    않아도 "어디서 끝났는가"는 알아볼 수 있고, 그래서 추적이 없는 얕은 재생에서도 배지가 나온다.
 2. **통과와 미검사의 분리.** 단계 줄마다 ``status``(돌았는지)와 ``outcome``(무엇으로
    판정됐는지)을 따로 싣고 라벨도 따로 준다. 한 값으로 합치면 콘솔이 "안 봤다"를 "문제
@@ -200,7 +200,6 @@ class StageView:
     detail: str | None = None
     note: str | None = None
     perspective: str | None = None
-    call_id: str | None = None
     model_id: str | None = None
     latency_ms: int | None = None
     cost_micro_usd: int | None = None
@@ -224,7 +223,6 @@ class ViolationView:
 
 @dataclass(frozen=True, slots=True)
 class CallView:
-    call_id: str
     perspective: str
     model_id: str
     input_tokens: int
@@ -457,7 +455,6 @@ def _model_rows(perspectives: list[PerspectiveResult]) -> list[PerspectiveResult
 def _ledger(verdict: ContentVerdict) -> LedgerView:
     rows = [
         CallView(
-            call_id=call.callId,
             perspective=call.perspective.value,
             model_id=call.modelId,
             input_tokens=call.inputTokens,
@@ -531,7 +528,6 @@ def _stages_from_trace(trace: Trace) -> list[StageView]:
                     detail=record.detail,
                     note=record.note,
                     perspective=record.perspective.value if record.perspective is not None else None,
-                    call_id=record.call_id,
                     model_id=record.model_id,
                     latency_ms=record.latency_ms,
                     cost_micro_usd=record.cost_micro_usd,
@@ -610,7 +606,6 @@ def _stages_from_verdict(verdict: ContentVerdict) -> list[StageView]:
                 skip_reason_label=_skip_label(triage_row.skipReason),
                 decision="CLEAR" if cleared else None,
                 perspective=Perspective.TRIAGE.value,
-                call_id=getattr(triage_call, "callId", None),
                 model_id=getattr(triage_call, "modelId", None),
                 latency_ms=getattr(triage_call, "latencyMs", None),
                 cost_micro_usd=getattr(triage_call, "costMicroUsd", None),
@@ -645,7 +640,6 @@ def _stages_from_verdict(verdict: ContentVerdict) -> list[StageView]:
                 skip_reason=row.skipReason,
                 skip_reason_label=_skip_label(row.skipReason),
                 perspective=row.perspective.value,
-                call_id=getattr(call, "callId", None),
                 model_id=getattr(call, "modelId", None),
                 latency_ms=getattr(call, "latencyMs", None),
                 cost_micro_usd=getattr(call, "costMicroUsd", None),

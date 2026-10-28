@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from conftest import FakeLlmClient, failed, ok
 
+from app.inspection import rules
 from app.inspection.pipeline import InspectionPipeline
 from app.schemas.inspection import (
     CallOutcome,
@@ -424,3 +425,59 @@ async def test_뒤집힘_신호는_통과_판정에만_붙는다(settings: Setti
         verdict = await pipeline.run(product(quote))
 
         assert not (verdict.criticOverturned and verdict.verdict is Verdict.FLAG), verdict.verdict
+
+
+def test_자사_도메인을_접두로_단_외부_호스트는_차단된다() -> None:
+    """부정 전방탐색이 **호스트 경계를 보지 않으면** 자사 도메인이 접두사로 쓰인다.
+
+    ``aechak.co.kr.evil.example`` 의 실제 호스트는 ``evil.example`` 이고, 자사 도메인
+    예외는 그 문자열이 호스트의 **끝**일 때만 성립한다. 서브도메인 허용은 유지해야 한다.
+    """
+    outside = (
+        "자세한 건 https://aechak.co.kr.evil.example/buy 에서",
+        "자세한 건 https://aechak.co.kr-evil.example/buy 에서",
+    )
+    for text in outside:
+        categories = {h.category for h in rules.screen(text).blocking}
+        assert ViolationCategory.OFF_PLATFORM in categories, f"실제 호스트는 자사가 아니다: {text!r}"
+
+    inside = rules.screen("상세 정보는 https://shop.aechak.co.kr/p/1 참고")
+    assert inside.hits == [], "서브도메인과 경로는 그대로 통과해야 한다"
+
+
+def test_같은_규칙_적중_두_건이_서로_다른_구간을_가리킨다() -> None:
+    """구간을 원문에서 되찾을 때 **탐색 위치를 들고 가지 않으면** 둘째가 첫 구간을 가리킨다.
+
+    판정은 FLAG 로 같지만 계약에 실리는 ``spanStart``/``spanEnd`` 와 콘솔 하이라이트가
+    둘 다 첫 번째를 가리켜, 두 번째 연락처는 가려지지 않은 것처럼 보인다.
+    """
+    text = "문의 010-1234-5678 / 010-1234-5678"
+    spans = [(h.start, h.end) for h in rules.screen(text).hits if h.start is not None]
+
+    assert spans == [(3, 16), (19, 32)], "두 적중이 같은 구간을 가리킨다"
+    assert [text[s:e] for s, e in spans] == ["010-1234-5678"] * 2
+
+
+async def test_비평에_1차_판정_사유가_간다(settings: Settings) -> None:
+    """``Violation`` 은 모델이 적은 ``reason`` 을 버리고 ``suggestion`` 만 든다.
+
+    그 자리에 제안을 넣으면 라벨이 "사유"인데 값이 제안이고, 제안이 없는 건은
+    "사유: 제안 없음" 이 나간다 -- 비평이 1차 판정의 근거를 아예 못 본 채로
+    오탐 여부를 답하게 된다.
+    """
+    quote = "관절염 치료에 효과가 있습니다"
+    llm = FakeLlmClient(
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "UPHOLD", "reason": "타당"}),
+            ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
+        ]
+    )
+    pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+    await pipeline.run(product(quote))
+
+    sent = llm.calls[2]["user_content"][0]["text"]
+    assert "정책 위반" in sent, "비평이 1차 판정 사유를 못 본다"
+    assert "제안 없음" not in sent, "사유 자리에 제안을 넣어 거짓 라벨이 됐다"

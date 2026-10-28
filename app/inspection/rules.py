@@ -38,7 +38,11 @@ _MESSENGER = re.compile(
     r"(카톡|카카오\s*톡|오픈\s*채팅|open\.kakao|텔레\s*그램|telegram|라인\s*아이디|insta|디엠|dm)",
     re.I,
 )
-_EXTERNAL_URL = re.compile(r"https?://(?!(?:[a-z0-9-]+\.)*aechak\.co\.kr)[^\s]+", re.I)
+# 부정 전방탐색 끝에 **호스트 경계**를 둔다. 경계가 없으면 자사 도메인이 접두사로 쓰여
+# ``aechak.co.kr.evil.example`` 의 실제 호스트(``evil.example``)가 자사로 읽혔다.
+# 경계는 호스트가 끝나는 자리에 올 수 있는 글자뿐이고, 그래서 서브도메인(``shop.``)과
+# 경로(``/p/1``) 허용은 그대로 남는다.
+_EXTERNAL_URL = re.compile(r"https?://(?!(?:[a-z0-9-]+\.)*aechak\.co\.kr(?:[:/?#]|\s|$))[^\s]+", re.I)
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 # 판정자를 향한 지시형 문장. 강도를 둘로 가른다.
 #
@@ -80,13 +84,8 @@ _NEUTRALIZED = "[태그]"
 # 만든다 -- 모델은 폭 0 문자를 사이에 둔 토큰을 닫는 태그로 읽을 수 있고, 그러면 본문이
 # 봉투를 닫는다.
 #
-# **코드포인트를 손으로 적지 않는다. 그것이 이 자리의 세 번째 결함이었다.** 앞 판은
-# ``[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]`` 를 적어 두었고,
-# 그래서 **적어 둔 것의 바로 옆 글자가 전부 열려 있었다** -- ``U+2060-2064`` 를 넣고
-# ``U+206A-206F`` 를 빠뜨렸고, ``U+202A-202E`` 를 넣고 그 짝인 ``U+2066-2069``(bidi
-# isolate)를 빠뜨렸다. 실측으로 28종이 차단과 중성화를 **둘 다** 통과했고, 한국어 본문에서
-# 가장 쓰기 쉬운 한글 필러(``U+3164``·``U+115F``·``U+1160``·``U+FFA0``)와 이형자
-# 선택자(``U+FE00-FE0F``)가 그 안에 있었다.
+# **코드포인트를 손으로 적지 않는다.** 손으로 적은 열거가 바로 옆 글자를 전부 열어 둔 것이
+# 이 자리의 세 번째 결함이었다.
 #
 # 그래서 근거를 **유니코드 분류**로 옮긴다. ``Cf``(format) 전부 + 분류가 ``Cf`` 가 아니면서
 # 폭이 0인 글자 집합이고, 후자만 열거한다. 테스트가 유니코드 전 범위를 훑어 이 둘의 합집합이
@@ -260,14 +259,22 @@ def screen(text: str) -> RuleResult:
 
 
 def _realign(hits: list[RuleHit], original: str) -> None:
-    """적중 문자열을 원문에서 다시 찾아 구간을 맞춘다. 못 찾으면 그대로 둔다."""
+    """적중 문자열을 원문에서 다시 찾아 구간을 맞춘다. 못 찾으면 그대로 둔다.
+
+    **인용별 탐색 위치를 들고 간다.** 같은 문자열이 두 번 나오면 둘째 적중도 첫 구간을
+    가리켜, 계약의 ``spanStart``/``spanEnd`` 와 콘솔 하이라이트가 둘 다 첫 번째를 가리킨다.
+    못 찾은 적중은 위치를 올리지 않는다 -- 정규화로 길이가 달라진 경우라서 그 뒤 적중의
+    탐색 범위를 좁힐 근거가 없다.
+    """
+    cursor: dict[str, int] = {}
     for hit in hits:
         if hit.start is None:
             continue
-        found = original.find(hit.quote)
+        found = original.find(hit.quote, cursor.get(hit.quote, 0))
         if found >= 0:
             hit.start = found
             hit.end = found + len(hit.quote)
+            cursor[hit.quote] = hit.end
 
 
 def _redact(text: str) -> str:

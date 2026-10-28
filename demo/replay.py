@@ -24,7 +24,7 @@ from typing import Any
 from app.inspection import triage
 from app.inspection.perspectives import specs_for
 from app.llm.client import LlmResult, cost_micro_usd
-from app.schemas.inspection import CallOutcome, Perspective, TargetType
+from app.schemas.inspection import CallOutcome, Perspective
 
 # (툴 이름, 관점). 관점이 없는 호출(비평·수정문구)은 None 이다.
 CallKey = tuple[str, Perspective | None]
@@ -138,10 +138,9 @@ def cassette_key(tool: dict[str, Any]) -> CallKey:
     wanted = set(categories)
 
     for fanout in (True, False):
-        for target in TargetType:
-            for spec in specs_for(target, fanout=fanout):
-                if {c.value for c in spec.categories} == wanted:
-                    return (name, spec.perspective)
+        for spec in specs_for(fanout=fanout):
+            if {c.value for c in spec.categories} == wanted:
+                return (name, spec.perspective)
     raise CassetteMiss(f"관점을 알 수 없는 판정 툴이다. categories={sorted(wanted)}")
 
 

@@ -85,7 +85,6 @@ BLOCKING_TERMS: tuple[BannedTerm, ...] = (
         (
             "xylitol",
             "자작나무설탕",
-            "자작나무 설탕",
             "birch sugar",
             "birch sap",
             "birch bark extract",
@@ -104,7 +103,12 @@ BLOCKING_TERMS: tuple[BannedTerm, ...] = (
         ("cacao",),
         # 메신저·금융 서비스 이름과 글자가 겹친다. 거르지 않으면 "카카오톡으로 문의"가
         # 금지 성분으로 기록된다 — 어차피 연락처 규칙이 차단하지만 분류가 틀린다.
-        deny_suffix=("톡", "페이", "뱅크", "맵", "T", "모빌리티", "엔터"),
+        #
+        # ``T`` 는 뺐다. ``fold`` 가 소문자로 내리므로 **tail 이 t 로 시작하는 표기가
+        # 전부 제외됐고**, ``cacao tea``·``cacao tree`` 가 적중 0이 됐다. 대가로
+        # ``카카오T`` 가 성분으로 걸릴 수 있다 -- 반려동물 상품·리뷰에서 그 언급보다
+        # 영문 표기의 거짓 음성이 비싸다고 보아 이쪽을 택했다.
+        deny_suffix=("톡", "페이", "뱅크", "맵", "모빌리티", "엔터"),
         note="초콜릿과 같은 메틸잔틴 원료",
     ),
     BannedTerm(
@@ -142,9 +146,7 @@ ADVISORY_TERMS: tuple[BannedTerm, ...] = (
         "알코올", ("alcohol", "에탄올", "ethanol", "주정"), blocking=False, note="위생용품에 정당하게 쓰인다"
     ),
     BannedTerm("아보카도", ("avocado",), blocking=False, note="개·고양이에게는 ASPCA가 명시하지 않는다"),
-    BannedTerm(
-        "코코넛오일", ("coconut oil", "코코넛 오일"), blocking=False, note="반려동물 샴푸·간식에 흔하다"
-    ),
+    BannedTerm("코코넛오일", ("coconut oil",), blocking=False, note="반려동물 샴푸·간식에 흔하다"),
     BannedTerm(
         "우유",
         ("milk", "유제품"),
@@ -209,7 +211,6 @@ class TermHit:
     """
 
     term: BannedTerm
-    matched_form: str
 
 
 def find_terms(text: str) -> list[TermHit]:
@@ -227,7 +228,7 @@ def find_terms(text: str) -> list[TermHit]:
         deny = term.folded_deny()
         for form in term.folded_forms():
             if _matches(folded, form, deny):
-                hits.append(TermHit(term, form))
+                hits.append(TermHit(term))
                 break
     return hits
 

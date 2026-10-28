@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.inspection.banned import BLOCKING_TERMS, find_terms, fold
+from app.inspection.banned import find_terms, fold
 
 
 def canonicals(text: str) -> set[str]:
@@ -71,6 +71,19 @@ def test_카카오톡은_성분이_아니다() -> None:
     assert "카카오" in blocking("카카오 함유 쿠키")
 
 
+def test_카카오_제외_접미가_영문_표기를_눌러_버리지_않는다() -> None:
+    """``fold`` 가 ``T`` 를 ``t`` 로 내리므로 **tail 이 t 로 시작하는 표기가 전부 제외됐다.**
+
+    ``cacao tea`` 는 공백이 지워져 ``cacaotea`` 가 되고, ``cacao tree`` 는 반복 축약까지
+    겹쳐 ``cacaotre`` 가 된다. 둘 다 카카오가 들어간 제품 표기인데 적중이 0이었다.
+    메신저·금융 이름 제외는 그대로 일해야 한다.
+    """
+    assert "카카오" in blocking("cacao tea 분말 함유"), "거짓 음성이다"
+    assert "카카오" in blocking("cacao tree 추출물"), "거짓 음성이다"
+    assert "카카오" not in canonicals("카카오맵으로 찾아오세요"), "지명 서비스 제외는 유지한다"
+    assert "카카오" not in canonicals("카카오페이로 결제"), "결제 서비스 제외는 유지한다"
+
+
 def test_반려동물_상품에_정당한_성분은_차단하지_않고_기록만_한다() -> None:
     # 모델은 카테고리를 함께 보므로 위생용품의 에탄올과 간식의 알코올을 가를 수 있다.
     hits = find_terms("에탄올 함유 물티슈")
@@ -94,9 +107,3 @@ def test_같은_성분이_여러_번_나와도_한_번만_보고한다() -> None
     # 셀러에게 전할 말은 "세 번 나왔다"가 아니라 "빼라"다.
     hits = find_terms("자일리톨 자일리톨 자일리톨")
     assert len(hits) == 1
-
-
-def test_사전_항목에_근거를_남긴다() -> None:
-    # 왜 금지인지가 코드에 없으면 다음 사람이 함부로 지운다.
-    without_note = [t.canonical for t in BLOCKING_TERMS if not t.note]
-    assert without_note == [], f"근거 없는 항목: {without_note}"

@@ -23,7 +23,7 @@ import math
 import statistics
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,7 +38,7 @@ from app.inspection.policy import POLICY_PREFIX
 from app.llm.client import LlmClient
 from app.schemas.inspection import CallOutcome, Perspective, PerspectiveOutcome, TargetType
 from app.settings import Settings
-from harness.cases import CASES, OVERBLOCK_SUSPECT, VIOLATING, Case, promotable
+from harness.cases import CASES, VIOLATING, Case, promotable
 
 OUT_ROOT = Path(__file__).parent / "out"
 
@@ -317,7 +317,7 @@ def cache_prefix_targets(settings: Settings) -> list[CachePrefixTarget]:
             required=False,
         )
     ]
-    for spec in specs_for(TargetType.PRODUCT, fanout=settings.perspective_fanout):
+    for spec in specs_for(fanout=settings.perspective_fanout):
         targets.append(
             CachePrefixTarget(
                 name=f"perspective_{spec.perspective.value.lower()}_on_sonnet",
@@ -473,13 +473,7 @@ def _summarize(records: list[Record], baseline: dict[tuple[str, int], str]) -> l
         rows.append(("지연 p50", f"{_percentile(latencies, 0.50):,.0f} ms"))
         rows.append(("지연 p95", f"{_percentile(latencies, 0.95):,.0f} ms"))
 
-    # (5) 캐시 적중. Haiku 호출에서 0임을 숫자로 남긴다.
-    haiku = [r for r in scored if r.triage_cost_micro_usd]
-    if haiku:
-        hit = sum(1 for r in haiku if r.haiku_cache_read > 0)
-        rows.append(("선별 캐시 적중", f"{hit}/{len(haiku)}건 — 0이면 최소 접두부 미달이 확인된 것이다"))
-
-    # (5.5) 묻지 않고 승급한 건. 선별이 아끼지 못한 몫을 분모 안에서 따로 보여 준다.
+    # (5) 묻지 않고 승급한 건. 선별이 아끼지 못한 몫을 분모 안에서 따로 보여 준다.
     triaged = [r for r in scored if r.triage_outcome != TRIAGE_OFF]
     if triaged:
         skipped = sum(1 for r in triaged if r.triage_outcome == TRIAGE_SKIPPED_RULE_HIT)
@@ -513,21 +507,29 @@ def _summarize(records: list[Record], baseline: dict[tuple[str, int], str]) -> l
     rows.append(
         ("반복 불일치", f"{len(unstable)}/{len(by_case)}건 — {', '.join(sorted(unstable)[:5]) or '없음'}")
     )
-
-    # (8) 과탐 의심 건의 처리 결과
-    suspects = [r for r in records if r.label == OVERBLOCK_SUSPECT]
-    if suspects:
-        tally = Counter(f"{r.verdict}/{r.triage_outcome}" for r in suspects)
-        rows.append(("과탐 의심", ", ".join(f"{k}={v}" for k, v in sorted(tally.items()))))
     return rows
 
 
 def _write_out(records: list[Record], rows: list[tuple[str, str]]) -> Path:
+    """산출물을 쓴다. **덮지 않는다.**
+
+    형제 둘(``run_summary``·``run_draft``)이 독스트링에 적어 둔 결함 둘이 여기만 남아
+    있었다. ① 스탬프가 초 단위이고 ``mkdir(exist_ok=True)`` 라 같은 초에 두 번 돌면
+    조용히 덮었다 -- 측정 결과를 잃는 자리라서 겹치면 다른 이름을 쓴다.
+    ② ``encoding=`` 이 없어 UTF-8 이 아닌 로케일에서 한국어 ``summary.tsv`` 가 깨졌다.
+
+    디렉터리 이름은 ``<stamp>`` 그대로 둔다. 형제가 접두를 붙이는 비대칭을 초안 감사가
+    검수 실행 건수를 세는 데 쓴다.
+    """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     out = OUT_ROOT / stamp
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "raw.jsonl").write_text("\n".join(r.as_json() for r in records) + "\n")
-    (out / "summary.tsv").write_text("\n".join(f"{k}\t{v}" for k, v in rows) + "\n")
+    serial = 2
+    while out.exists():
+        out = OUT_ROOT / f"{stamp}-{serial}"
+        serial += 1
+    out.mkdir(parents=True)
+    (out / "raw.jsonl").write_text("\n".join(r.as_json() for r in records) + "\n", encoding="utf-8")
+    (out / "summary.tsv").write_text("\n".join(f"{k}\t{v}" for k, v in rows) + "\n", encoding="utf-8")
     return out
 
 

@@ -19,7 +19,7 @@ from typing import Any
 
 from app.inspection.perspectives import specs_for
 from app.llm.client import LlmResult, cost_micro_usd
-from app.schemas.inspection import CallOutcome, Perspective, TargetType, ViolationCategory
+from app.schemas.inspection import CallOutcome, Perspective, ViolationCategory
 from demo.replay import cassette_key
 
 # (키워드, 분류, 사유, 제안). 위에서부터 보고 먼저 걸린 것을 쓴다.
@@ -210,10 +210,9 @@ def _sentence_with(body: str, keyword: str) -> str:
 
 def _categories_for(perspective: Perspective | None) -> frozenset[ViolationCategory]:
     for fanout in (True, False):
-        for target in TargetType:
-            for spec in specs_for(target, fanout=fanout):
-                if spec.perspective is perspective:
-                    return frozenset(spec.categories)
+        for spec in specs_for(fanout=fanout):
+            if spec.perspective is perspective:
+                return frozenset(spec.categories)
     return frozenset()
 
 

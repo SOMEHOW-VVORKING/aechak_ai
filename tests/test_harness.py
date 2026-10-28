@@ -294,3 +294,23 @@ def test_손익분기가_비용표에서_파생된다() -> None:
     finally:
         run._ESTIMATE_MICRO_USD.clear()
         run._ESTIMATE_MICRO_USD.update(original)
+
+
+def test_같은_초에_두_번_돌아도_산출물이_덮이지_않는다(tmp_path: object, monkeypatch: object) -> None:
+    """스탬프가 초 단위이고 ``mkdir(exist_ok=True)`` 라 **조용히 덮었다.**
+
+    형제 둘(``run_summary``·``run_draft``)이 독스트링에 적어 둔 결함이 검수 하네스에만
+    남아 있었다. 측정 결과를 조용히 잃는 자리라서 스탬프가 겹치면 다른 이름을 쓴다.
+    """
+    from pathlib import Path
+
+    from harness import run
+
+    root = Path(str(tmp_path))
+    monkeypatch.setattr(run, "OUT_ROOT", root)  # type: ignore[attr-defined]
+    first = run._write_out([], [("키", "1")])
+    second = run._write_out([], [("키", "2")])
+
+    assert first != second
+    assert sorted(p.name for p in root.iterdir()) == sorted([first.name, second.name])
+    assert (first / "summary.tsv").read_text(encoding="utf-8").startswith("키\t1")
