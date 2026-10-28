@@ -1032,6 +1032,112 @@ async def test_모델이_쓴_단점_부재_사유가_코드가_센_숫자를_이
     assert message.dropped.narrationMissing == 1
 
 
+async def test_중복_모델_행의_빈_행이_검증된_단점을_없애지_않는다() -> None:
+    """모델이 리뷰마다 정상 행 뒤에 빈 행을 붙이면 단점 10건이 전부 사라졌다.
+
+    ``verify_batch`` 가 같은 ``reviewId`` 행을 그대로 여러 개 돌려주고, 호출부가
+    ``{entry.review_id: entry}`` 로 접으면서 **마지막 행만** 남겼다. 서로 다른 본문이므로
+    입력 중복 접기와 무관하고, 추출 툴의 ``strict`` 스키마도 ``reviewId`` 유일성을
+    정의하지 않으므로 스키마가 막지 못한다.
+    """
+    rows: list[dict[str, Any]] = []
+    for review in _TEN_NEGATIVE:
+        rows.append(
+            {
+                "reviewId": review.reviewId,
+                "aspects": [_aspect(AspectCode.SMELL, Polarity.CON, "냄새가 너무 심해서", label="비린 냄새")],
+                "petMention": _pet(),
+            }
+        )
+        rows.append({"reviewId": review.reviewId, "aspects": [], "petMention": _pet()})
+    client = _client(
+        extract0=ScriptedCall(tool_input={"reviews": rows}),
+        narrate0=ScriptedCall(tool_input={"pros": [], "cons": []}),
+    )
+
+    message = await SummaryService(llm=client, settings=_settings()).run(_request(_TEN_NEGATIVE, basis=20))
+
+    assert [row.extracted for row in message.extracted] == [ExtractStatus.EXTRACTED] * 10
+    assert [len(row.aspects) for row in message.extracted] == [1] * 10
+    summary = message.summaries[0]
+    assert summary.consAbsenceReason is not ConsAbsenceReason.NO_NEGATIVE_MENTIONS_FOUND, (
+        "검증된 단점 10건이 마지막 빈 행에 지워지고 '분석했고 단점이 없었다'가 나갔다"
+    )
+    # 집계는 CON 10건을 셌다. 모델이 한 줄을 안 썼으니 사유는 그쪽이다.
+    assert summary.consAbsenceReason is ConsAbsenceReason.NARRATION_MISSING
+    assert [row.aspectCode for row in summary.unnarratedAspects] == [AspectCode.SMELL]
+
+
+async def test_잘못된_aspects_타입이_분석_완료로_읽히지_않는다() -> None:
+    """**이 레포의 1번 불변식이다.** 목록이 아닌 ``aspects`` 를 빈 유효 결과로 구제했다.
+
+    ``reported_anything=False`` 가 되어 미검사 분기에 들어가지 않고 ``EXTRACTED`` 로 적힌 뒤
+    분모에 그대로 남아 "분석한 10건에 단점 언급이 없었다"가 나갔다. ``dropped`` 전 필드가 0 이라
+    결과 어디에도 비정상 구조를 받은 사실이 없었다. 필드 누락도 같은 변환을 지난다.
+    """
+    rows: list[dict[str, Any]] = [
+        {"reviewId": review.reviewId, "aspects": "broken", "petMention": _pet()} for review in _TEN_NEGATIVE
+    ]
+    client = _client(
+        extract0=ScriptedCall(tool_input={"reviews": rows}),
+        narrate0=ScriptedCall(
+            tool_input={
+                "pros": [
+                    {
+                        "aspectCode": AspectCode.PALATABILITY.value,
+                        "headline": "잘 먹는다는 후기가 반복됩니다",
+                        "quotes": [{"reviewId": 1, "text": "잘 먹어요"}],
+                    }
+                ],
+                "cons": [],
+            }
+        ),
+    )
+
+    message = await SummaryService(llm=client, settings=_settings()).run(
+        _request(_TEN_NEGATIVE, basis=20, tally=_NINE_PRO_TALLY)
+    )
+
+    assert [row.extracted for row in message.extracted] == [ExtractStatus.UNEXTRACTED] * 10
+    assert "ASPECTS_NOT_LIST" in (message.extracted[0].note or "")
+    summary = message.summaries[0]
+    assert summary.unextractedReviewCount == 10, "비정상 구조를 받은 리뷰가 분석한 것으로 세어졌다"
+    assert summary.analyzedReviewCount == 10
+    # 못 읽은 리뷰가 있으면 "단점 언급이 없었다"를 적을 수 없다.
+    assert summary.consAbsenceReason is ConsAbsenceReason.PARTIALLY_UNEXTRACTED
+
+
+async def test_펫_품종_라벨이_인용_검증을_업어타지_않는다() -> None:
+    """인용이 본문에 있다는 사실이 같은 dict 의 자유 텍스트를 보증하지 않는다.
+
+    ``quote`` 만 대조하고 ``breedLabel`` 은 검사가 없어, 본문에 없는 연락처가 추출 결과의
+    ``petContext`` 에 실려 나갔다. 바로 위 ``aspectLabel`` 은 게이트 넷을 지난다.
+    """
+    client = _client(
+        extract0=ScriptedCall(
+            tool_input={
+                "reviews": [
+                    {
+                        "reviewId": 1,
+                        "aspects": [_aspect(AspectCode.PALATABILITY, Polarity.PRO, "잘 먹어요")],
+                        "petMention": _pet(
+                            present=True, quote="잘 먹어요", species="DOG", breedLabel="010-1234-5678"
+                        ),
+                    }
+                ]
+            }
+        ),
+        narrate0=ScriptedCall(tool_input={"pros": [], "cons": []}),
+    )
+
+    message = await SummaryService(llm=client, settings=_settings()).run(_request(_THREE))
+
+    pet = message.extracted[0].petContext
+    assert pet is not None
+    assert pet.breedLabel is None, "본문에 없는 연락처가 품종 라벨로 응답에 실렸다"
+    assert message.dropped.labelRejected == 1
+
+
 async def test_단점_부재_사유가_툴_스키마에_없다() -> None:
     """적을 수 있으면 판정이 모델에게 넘어간다. ``mentionCount`` 를 뺀 것과 같은 이유다."""
     from app.review_summary.narrate_tool import NARRATE_TOOL
