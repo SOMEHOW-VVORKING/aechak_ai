@@ -222,12 +222,15 @@ def _category_for(case: DraftCase, mode: str) -> int | None:
 def model_called_cases(mode: str = "a") -> list[DraftCase]:
     """모델이 **불리는** 케이스. 0원 분기를 전부 뺀다.
 
-    셋이 0원이다. 상품명 0단 룰 차단, 상품명 효능 단정 차단(``claims``), 품목 미식별.
-    셋째는 모드에 따라 달라진다 -- ``a-blind`` 는 카테고리를 숨기므로 미식별이 늘어난다.
+    셋이 0원이다. 상품명 0단 룰 차단, 상품명 효능 단정 차단(``claims.screen_name``), 품목
+    미식별. 셋째는 모드에 따라 달라진다 -- ``a-blind`` 는 카테고리를 숨기므로 미식별이 늘어난다.
+
+    **서비스와 같은 함수를 부른다.** 출력 가드의 ``claims.screen`` 은 더 느슨해서(정상
+    상품명 16건 중 6건을 잡는다) 이 분모를 서비스보다 작게 만든다.
     """
     out: list[DraftCase] = []
     for case in CASES:
-        if case.expect_rule_block or claims.screen(case.product_name):
+        if case.expect_rule_block or claims.screen_name(case.product_name):
             continue
         given = _category_for(case, mode)
         if catalog.resolve(case.product_name, given).grade is ItemGrade.OPAQUE and given is None:

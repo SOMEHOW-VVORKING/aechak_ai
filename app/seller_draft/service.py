@@ -458,7 +458,19 @@ class DraftService:
 
         # 품목을 끝까지 확정하지 못했으면 **설명과 옵션도 비운다.** 일반론 회피의 두 번째
         # 관문이다 -- 어느 품목인지 모르는 채로 쓴 설명은 어느 상품에도 맞지 않는다.
-        item_unknown = leaf_status is FieldStatus.EMPTY_MODEL_DECLINED and signal.pinned_leaf_id is None
+        #
+        # **분류 충돌도 미확정이다.** 앞 판은 모델이 고르기를 거절한 모양만 보고 있었고,
+        # ``_resolve_leaf`` 가 충돌로 비우는 두 경로(잠근 값 불일치 / 게이트 후보 밖)에서는
+        # 조립이 계속됐다 -- '강아지 목줄 M' 요청에 모델이 211 을 지목하면 분류는 비는데
+        # '고양이용 건식 사료입니다.' 가 ``FILLED`` 로 나갔다. 셀러가 **전혀 다른 상품의
+        # 설명**을 받는다.
+        #
+        # 충돌에는 ``pinned_leaf_id`` 조건을 붙이지 않는다. 어휘 게이트가 리프를 집었더라도
+        # 모델은 다른 품목을 보고 문구를 썼으므로 그 문구를 믿을 근거가 없다. 셀러가 잠근
+        # 값은 아래 ``locked`` 분기가 **앞에** 있어 그대로 보존된다.
+        item_unknown = leaf_status is FieldStatus.EMPTY_CATEGORY_CONFLICT or (
+            leaf_status is FieldStatus.EMPTY_MODEL_DECLINED and signal.pinned_leaf_id is None
+        )
 
         # (ㄷ) 설명 슬롯.
         if locked is not None and locked.description:

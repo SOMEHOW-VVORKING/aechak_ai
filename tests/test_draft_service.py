@@ -409,6 +409,57 @@ async def test_게이트_후보_밖의_리프는_불일치로_비운다() -> Non
     response = await DraftService(llm=llm, settings=_settings()).run(_request("건식사료 2kg"))
 
     assert response.fieldStatus["categoryId"] is FieldStatus.EMPTY_CATEGORY_CONFLICT
+    # 충돌의 두 번째 생산 경로다. 품목이 미확정이면 설명도 비운다.
+    assert response.fieldStatus["description"] is FieldStatus.EMPTY_ITEM_UNIDENTIFIED
+
+
+async def test_분류_충돌이면_설명과_옵션도_비운다() -> None:
+    """**셀러가 전혀 다른 품목의 설명을 받던 자리다.**
+
+    품목 미확정에는 모양이 셋 있다 -- 모델이 고르기를 거절(``EMPTY_MODEL_DECLINED``),
+    어휘 게이트가 잠근 값과 모델이 불일치, 모델이 게이트 후보 밖을 지목. 뒤의 둘은
+    ``EMPTY_CATEGORY_CONFLICT`` 인데 일반론 관문이 첫째만 보고 있었고, 그래서 '강아지 목줄
+    M' 요청에 '고양이용 건식 사료입니다.' 가 ``FILLED`` 로 나갔다.
+
+    충돌에는 ``pinned_leaf_id`` 조건을 붙이지 않는다 -- 어휘가 리프를 집었더라도 모델은
+    다른 품목을 보고 문구를 썼으므로 그 문구를 믿을 근거가 없다.
+    """
+    llm = FakeLlmClient(
+        [
+            ok(
+                _tool_input(
+                    leaf=211,
+                    slots=_slots(item="고양이용 건식 사료입니다."),
+                    groups=[{"name": "중량", "values": ["1kg", "2kg"]}],
+                ),
+                model="claude-haiku-4-5",
+            )
+        ]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(_request("강아지 목줄 M"))
+
+    assert response.fieldStatus["categoryId"] is FieldStatus.EMPTY_CATEGORY_CONFLICT
+    assert response.fieldStatus["description"] is FieldStatus.EMPTY_ITEM_UNIDENTIFIED
+    assert response.fieldStatus["optionGroups"] is FieldStatus.EMPTY_ITEM_UNIDENTIFIED
+    assert response.fieldStatus["optionCombinations"] is FieldStatus.EMPTY_ITEM_UNIDENTIFIED
+    assert response.draft.description is None
+    assert response.draft.optionGroups is None
+
+
+async def test_분류_충돌이어도_잠근_값은_보존한다() -> None:
+    """**셀러가 직접 쓴 것을 품목 미확정 사유로 지우지 않는다.**
+
+    위 관문이 잠근 분기보다 앞에 서면 셀러의 입력이 응답에서 사라진다. 고치려던 것보다
+    나쁜 결함이라 순서를 테스트가 고정한다.
+    """
+    llm = FakeLlmClient([ok(_tool_input(leaf=211), model="claude-haiku-4-5")])
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request("강아지 목줄 M", lockedFields=LockedFields(description="셀러가 직접 쓴 설명입니다."))
+    )
+
+    assert response.fieldStatus["categoryId"] is FieldStatus.EMPTY_CATEGORY_CONFLICT
+    assert response.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+    assert response.draft.description == "셀러가 직접 쓴 설명입니다."
 
 
 async def test_열거_밖_리프는_스키마_사유로_떨어진다() -> None:

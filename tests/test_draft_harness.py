@@ -15,7 +15,7 @@ import pytest
 
 from app.inspection import rules
 from app.schemas.draft import ImageMode
-from app.seller_draft import catalog
+from app.seller_draft import catalog, claims
 from app.seller_draft.catalog import ItemGrade
 from app.seller_draft.tool import DRAFT_TOOL, LEAF_DECLINED
 from app.settings import Settings
@@ -167,6 +167,27 @@ def test_기계적_중단_규칙이_성립한다() -> None:
     assert run_draft.model_earns_its_keep(0.7, 0.5) is True
     assert run_draft.model_earns_its_keep(0.5, 0.5) is False
     assert run_draft.model_earns_its_keep(0.3, 0.5) is False
+
+
+def test_호출_건수가_서비스와_같은_이름_가드를_쓴다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """하네스가 ``claims.screen`` 을, 서비스는 ``claims.screen_name`` 을 쓰고 있었다.
+
+    두 함수의 비대칭은 의도된 것이고 테스트가 고정한다(``test_이름_0단이_출력_가드보다_좁다``).
+    하네스만 오래된 판정을 들고 있으면 정상 상품명이 0원 분기로 세어져 **예상 호출·비용·
+    이미지 도달 분모가 서비스보다 작게** 찍힌다. 현재 ``CASES`` 에는 그런 이름이 없어
+    오늘의 리포트 숫자는 바뀌지 않는다 -- 그런 케이스를 한 건 더하는 날을 막는다.
+    """
+    ordinary = draft_cases.DraftCase(
+        "name-gate-ordinary",
+        "보장된 내구성 하네스",
+        152,
+        NameReveals.EXPLICIT,
+    )
+    assert claims.screen(ordinary.product_name), "출력 가드 사전이 이 이름을 잡는 것이 전제다"
+    assert not claims.screen_name(ordinary.product_name), "이름 0단은 이 이름을 통과시킨다"
+    monkeypatch.setattr(run_draft, "CASES", (ordinary,))
+
+    assert run_draft.model_called_cases("a") == [ordinary]
 
 
 def test_모드별_추정_비용이_순서를_지킨다() -> None:
