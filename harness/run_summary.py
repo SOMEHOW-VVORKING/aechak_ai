@@ -518,7 +518,7 @@ def worst_case_request_bytes(settings: Settings) -> int:
         requestedScopes=[
             RequestedScope(
                 scope=SummaryScope.SEGMENT,
-                segmentKey="DOG_10_25",
+                segmentKey=max(selection.all_segment_keys(), key=len),
                 basisReviewCount=10_000,
                 unextractedReviewCount=10,
                 tally=[

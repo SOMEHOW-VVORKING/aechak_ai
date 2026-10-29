@@ -40,6 +40,7 @@ def _assembled_bytes(scopes: int, new_reviews: int) -> int:
     from app.review_summary.evidence import HEADLINE_MAX_CHARS, LABEL_MAX_CHARS
     from app.review_summary.extract_prompt import EXTRACT_VERSION
     from app.review_summary.narrate_prompt import NARRATE_VERSION
+    from app.review_summary.selection import all_segment_keys
     from app.review_summary.tally import LABEL_SAMPLES_MAX, NARRATE_ROWS_MAX, QUOTE_SAMPLES_MAX
     from app.schemas.envelope import Envelope
     from app.schemas.summary import (
@@ -62,6 +63,11 @@ def _assembled_bytes(scopes: int, new_reviews: int) -> int:
     quote = "가" * env.QUOTE_MAX_CHARS
     label = "가" * LABEL_MAX_CHARS
     headline = "가" * HEADLINE_MAX_CHARS
+    # 가장 긴 세그먼트 키를 **생성기에서 받는다.** 글자로 박아 두면 상한이 상한이 아니게
+    # 된다 -- ``"DOG_10_25"``(9자)가 박혀 있었고 실제 최장은 ``"DOG:DOG_UNDER_5"``(15자)라
+    # 스코프마다 6바이트를 덜 셌다. 체급을 하나 더하는 날 같은 자리가 다시 어긋나므로
+    # 숫자를 고치지 않고 ``all_segment_keys()`` 를 보게 한다.
+    segment_key = max(all_segment_keys(), key=len)
     pairs = [(code, polarity) for code in AspectCode for polarity in Polarity]
 
     def samples(review_id: int) -> list[QuoteSample]:
@@ -100,7 +106,7 @@ def _assembled_bytes(scopes: int, new_reviews: int) -> int:
     summaries = [
         ScopeSummary(
             scope=SummaryScope.SEGMENT,
-            segmentKey="DOG_10_25",
+            segmentKey=segment_key,
             basisReviewCount=10_000,
             unextractedReviewCount=10,
             analyzedReviewCount=max(1, new_reviews),

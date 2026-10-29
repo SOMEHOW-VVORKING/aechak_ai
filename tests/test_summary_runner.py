@@ -631,6 +631,36 @@ async def test_계약_상한을_꽉_채운_결과가_발행_상한_안에_든다
     )
 
 
+async def test_발행_상한이_가장_긴_세그먼트_키를_센다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**상한이 상한이려면 세그먼트 키를 생성기에서 받아야 한다.**
+
+    ``"DOG_10_25"``(9자)가 글자로 박혀 있었고 실제 최장은 ``"DOG:DOG_UNDER_5"``(15자)라
+    스코프마다 6바이트를 덜 셌다. 체급을 하나 더하면 같은 자리가 다시 어긋나는데, 이 함수는
+    유료 호출 **전에** 발행 상한을 가르는 문이라서 덜 센 값은 "다 과금한 뒤 커밋되지 않는"
+    경로를 다시 연다(모듈 머리글의 그 결함이다).
+
+    키를 늘렸을 때 바이트가 따라 늘어나는지를 본다 -- 늘지 않으면 누군가 다시 박은 것이다.
+    """
+    from app.review_summary import budget, selection
+
+    settings = Settings()
+    budget._assembled_bytes.cache_clear()
+    base = budget.worst_case_result_bytes(settings)
+
+    longest = max(selection.all_segment_keys(), key=len)
+    monkeypatch.setattr(selection, "all_segment_keys", lambda: [longest + "_XL"])
+    budget._assembled_bytes.cache_clear()
+    try:
+        grown = budget.worst_case_result_bytes(settings)
+    finally:
+        budget._assembled_bytes.cache_clear()
+
+    assert grown > base, (
+        f"세그먼트 키를 3자 늘렸는데 발행 상한이 {base}B 에서 움직이지 않았다. "
+        "``budget._assembled_bytes`` 가 키를 글자로 박아 두면 상한이 상한이 아니다"
+    )
+
+
 async def test_요약이_켜졌는데_러너가_죽으면_헬스가_내려간다(monkeypatch: pytest.MonkeyPatch) -> None:
     """**감시 공백이 코드에 적혀 있었다.** 이 필드를 보는 주체가 없다고.
 
