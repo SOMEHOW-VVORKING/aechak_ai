@@ -7,6 +7,28 @@
 여기 복사본은 스냅샷이고 드리프트 탐지기가 아니다. 백엔드 계약이 바뀌면 이 파일도 같은
 변경 묶음에서 갱신해야 하고, 그 동기화를 자동으로 잡는 CI 잡은 백엔드 레포가 소유한다.
 
+## 리뷰 요약 표본 — `review-summary-requested.json` / `review-summary-result.json`
+
+출처는 팀원 브랜치 `feature/SCRUM-327-review-summary-result-api` 의 같은 폴더이고 바이트가
+같다. 앞은 **백엔드가 보내는 모양**이고, 뒤는 백엔드가 "AI 서버가 직렬화한 모양"으로 들고
+테스트를 박아 둔 표본이다. `tests/test_contract.py` 가 앞을 `ReviewSummaryRequest` 로 읽어
+우리가 요구하는 키가 빠짐없이 오는지 보고, 뒤는 경로마다 키 집합을 우리 출력과 맞춘다.
+
+요청 표본에는 **요청 계약에서 뺀 키 넷이 아직 들어 있다** —
+`totalVisibleReviews`·`ratingBuckets` 와 `newReviews` 의 `hasPhoto`·`createdAt`. 모든 요약
+모델이 `extra="ignore"` 라서 조용히 버려지고 런타임은 깨지지 않는다(그 사실 자체를
+`tests/test_summary_runner.py` 가 따로 묶어 뒀다). 백엔드가 그 넷을 빼는 날 이 사본만
+갱신하면 되고, 그때까지 어느 키를 왜 버리는지는 테스트의 `_SUMMARY_REQUEST_IGNORED` 가
+들고 있다 — 집합에 없는 새 키가 오면 테스트가 터져 읽을지 말지를 사람이 정하게 한다.
+
+## 알려진 값 어긋남 — `review-summary-result.json` 의 `calls[0].stage`
+
+표본은 `"extract"` 소문자이고 우리는 `"EXTRACT"` 를 보낸다
+(`app/review_summary/service.py`). 백엔드 `ReviewSummaryMessage` 에 `calls` 필드가 없어 그
+값을 읽는 자리가 아직 없으므로 무해하다. 정본이 백엔드이므로 여기서 바이트를 고치지 않고,
+백엔드가 원장을 받기로 하는 날 같은 묶음에서 대문자로 맞춘다. 키 집합을 보는 테스트는
+값을 보지 않으므로 이 어긋남으로는 터지지 않는다.
+
 ## 알려진 어긋남 — `content-verdict-triage.json`
 
 이 표본은 **선별이 건너뛴 통과 경로를 생산자보다 뒤처진 모양으로 적고 있다.** 관점을
