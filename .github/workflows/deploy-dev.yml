@@ -1,5 +1,8 @@
 # dev 배포: main 푸시 → 이미지 빌드·push → 태스크 정의 리비전 등록 → ECS 롤링 갱신
 #
+# 서비스가 둘인 이유: 같은 이미지를 커맨드만 바꿔 띄운다. 검수 컨슈머는 카프카를 듣고
+# 초안 API는 HTTP를 듣는다. 빌드는 한 번이고 갱신만 두 갈래로 돈다.
+#
 # uv 셋업이 없는 이유: 빌드는 Dockerfile 안(멀티스테이지)에서 돈다.
 # 테스트는 ci.yml이 PR에서 이미 통과시킨다.
 
@@ -26,16 +29,16 @@ concurrency:
 
 env:
   AWS_REGION: ap-northeast-2
-  # 아래 넷은 백엔드 레포 terraform이 소유하는 이름이다. 그쪽을 바꾸면 여기도 바꿔야 한다.
+  # 아래 둘은 백엔드 레포 terraform이 소유하는 이름이다. 그쪽을 바꾸면 여기도 바꿔야 한다.
   ECR_REPO: aechak-ai
   ECS_CLUSTER: aechak-dev
-  ECS_SERVICE: aechak-ai-dev
-  TASK_FAMILY: aechak-ai-dev
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30 # 롤아웃 폴링(최대 25분) 보다 크게
+    timeout-minutes: 20
+    outputs:
+      image: ${{ steps.image.outputs.uri }}
     steps:
       - uses: actions/checkout@v4
 
@@ -61,15 +64,39 @@ jobs:
           docker push "$IMAGE"
           echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # 롤아웃 폴링(최대 25분) 보다 크게
+    strategy:
+      # 한쪽이 헬스체크를 넘지 못해도 다른 쪽 로그를 끝까지 남긴다. 두 서비스는 서로를
+      # 호출하지 않으므로 순서 의존이 없고, 부분 성공이 부분 롤백보다 낫다.
+      fail-fast: false
+      matrix:
+        target:
+          - name: aechak-ai-dev
+            label: 검수 컨슈머
+          - name: aechak-ai-draft-dev
+            label: 초안 API
+    name: deploy (${{ matrix.target.label }})
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Register new task definition revision
         id: taskdef
+        env:
+          TASK_FAMILY: ${{ matrix.target.name }} # 서비스 이름과 패밀리 이름이 같게 terraform이 짰다
         run: |
           # 현재 taskdef를 복제해 image만 교체한다. environment·secrets 명세는 terraform 소관이라
-          # 여기서 건드리면 두 곳이 서로를 덮어쓴다.
+          # 여기서 건드리면 두 곳이 서로를 덮어쓴다. 커맨드도 그쪽이 들고 있어서 복제로 보존된다.
           aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
             --query taskDefinition > td.json
           # del(...) — 조회 응답에만 붙는 읽기전용 필드. 남기면 등록 API가 거부한다.
-          jq --arg IMG "${{ steps.image.outputs.uri }}" \
+          jq --arg IMG "${{ needs.build.outputs.image }}" \
             '.containerDefinitions[0].image = $IMG
              | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
                    .compatibilities, .registeredAt, .registeredBy)' td.json > td-new.json
@@ -78,21 +105,23 @@ jobs:
           echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
 
       - name: Deploy (rolling update)
+        env:
+          ECS_SERVICE: ${{ matrix.target.name }}
         run: |
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
             --task-definition "${{ steps.taskdef.outputs.arn }}"
 
-          # 이 서비스는 희망 태스크 수가 0으로 시작한다. taskdef의 초기 태그가 ECR에 없어서
+          # 두 서비스 모두 희망 태스크 수가 0으로 시작한다. taskdef의 초기 태그가 ECR에 없어서
           # 1로 두면 존재하지 않는 이미지를 받으려는 태스크가 실패 루프에 빠지기 때문이다.
           # 0인 동안에는 띄울 태스크가 없어 폴링할 것도 없는데, 그대로 성공으로 끝내면
           # "아무 일도 일어나지 않음"과 "배포 성공"이 로그에서 구분되지 않는다. 그래서 명시한다.
           DESIRED=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
             --query 'services[0].desiredCount' --output text)
           if [ "$DESIRED" = "0" ]; then
-            echo "::notice::희망 태스크 수가 0이라 이미지만 교체했고 태스크는 띄우지 않았다." \
-                 "백엔드 레포 terraform의 ai_desired_count를 1로 올려야 실제로 뜬다."
+            echo "::notice::$ECS_SERVICE 의 희망 태스크 수가 0이라 이미지만 교체했고 태스크는 띄우지 않았다." \
+                 "백엔드 레포 terraform의 희망 태스크 수 변수를 1로 올려야 실제로 뜬다."
             exit 0
           fi
 
@@ -105,15 +134,15 @@ jobs:
             echo "rollout: $STATE ($i/50)"
             case "$STATE" in
               COMPLETED) break ;;
-              FAILED) echo "::error::배포 실패 — 서킷브레이커가 롤백함"; exit 1 ;;
+              FAILED) echo "::error::$ECS_SERVICE 배포 실패 — 서킷브레이커가 롤백함"; exit 1 ;;
             esac
             sleep 30
           done
-          [ "$STATE" = "COMPLETED" ] || { echo "::error::25분 내 안정화 실패"; exit 1; }
+          [ "$STATE" = "COMPLETED" ] || { echo "::error::$ECS_SERVICE 25분 내 안정화 실패"; exit 1; }
 
           # COMPLETED여도 롤백으로 옛 리비전이 안정화된 것일 수 있다 — 새 리비전이 맞는지 대조한다.
           DEPLOYED=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
             --query 'services[0].deployments[?status==`PRIMARY`].taskDefinition | [0]' --output text)
           echo "PRIMARY taskdef: $DEPLOYED"
           [ "$DEPLOYED" = "${{ steps.taskdef.outputs.arn }}" ] \
-            || { echo "::error::롤백됨 — 새 리비전이 헬스체크(/health)를 통과하지 못함"; exit 1; }
+            || { echo "::error::$ECS_SERVICE 롤백됨 — 새 리비전이 헬스체크를 통과하지 못함"; exit 1; }
