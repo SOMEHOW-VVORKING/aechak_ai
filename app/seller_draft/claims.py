@@ -47,6 +47,7 @@ import unicodedata
 from dataclasses import dataclass
 
 from app.inspection.banned import fold
+from app.inspection.rules import strip_invisible
 
 # ``POLICY_PREFIX`` 가 위반 예시로 든 문구 전건. **여기 적어 두고 테스트가 드리프트를 잡는다.**
 #
@@ -489,8 +490,14 @@ def screen(text: str) -> list[ClaimHit]:
 
     두 계층이다. 어휘 층(``CLAIM_TERMS``)은 ``fold()`` 로 띄어쓰기·기호·전각 우회를
     무력화하고, 패턴 층은 ``_loose()`` 로 숫자를 살려 기간 단정과 후기 인용을 본다.
+
+    **불가시 문자는 두 계층보다 먼저 지운다.** 둘 다 문자열 비교라 글자 사이에 폭 0 문자를
+    끼운 표기가 **한 번에 둘을 지나갔다**(실측: ``'관절염 치료 목줄'`` 에 폭 0 공백 한 개
+    -> 이름 0단 적중 0, 출력 가드 적중 2 -> 1). 이 모듈이 "하나밖에 없는 결정론 층"이라
+    (머리글) 그 통과가 곧 완성 초안이고, 글자 모양이 같으므로 셀러도 구매자도 원문을 읽는다.
     """
-    folded = fold(text or "")
+    text = strip_invisible(text or "")
+    folded = fold(text)
     if not folded:
         return []
     hits: list[ClaimHit] = []
@@ -534,8 +541,11 @@ def screen_name(text: str) -> list[ClaimHit]:
     걸 수 없다. 두 가지만 본다 -- 모호하지 않은 어휘(``_NAME_STRICT``), 그리고 질병명과
     결과 동사가 **함께** 있는 경우. 이름이 이 둘을 지나면 모델을 부른다. 지나간 이름에
     들어 있을 수도 있는 느슨한 효능 표현은 **생성 결과의 출력 가드**가 ``screen()`` 으로 본다.
+
+    불가시 문자를 먼저 지우는 것은 ``screen()`` 과 같은 이유다.
     """
-    folded = fold(text or "")
+    text = strip_invisible(text or "")
+    folded = fold(text)
     if not folded:
         return []
     hits: list[ClaimHit] = []

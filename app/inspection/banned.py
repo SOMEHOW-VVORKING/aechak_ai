@@ -48,6 +48,12 @@ def fold(text: str) -> str:
     호환 분해로 전각·동형문자를 모으고, 소문자로 내리고, 구분 기호를 지우고,
     같은 글자 반복을 한 번으로 줄인다. 반복 축약을 사전에도 적용하므로
     ``coffee``가 ``cofe``가 되어도 양쪽이 같이 변해 매칭이 유지된다.
+
+    **불가시 문자는 지우지 않는다.** 지우는 함수(``rules.strip_invisible``)가 이 모듈을
+    import 하는 쪽에 있어 여기서 부르면 순환 import 다(양방향 모두 ``ImportError``).
+    그래서 **사람이 쓴 텍스트를 판정에 넘기는 호출자가 먼저 지운다** -- ``rules.screen``과
+    ``seller_draft.claims`` 의 두 입구다. 품목 신호(``seller_draft.catalog``)는 지우지
+    않는다. 거기서 적중이 줄면 품목 미확정이 되어 초안을 **건너뛰므로** 안전한 방향이다.
     """
     folded = unicodedata.normalize("NFKC", text).lower().translate(_HOMOGLYPHS)
     return _REPEATS.sub(r"\1", _SEPARATORS.sub("", folded))

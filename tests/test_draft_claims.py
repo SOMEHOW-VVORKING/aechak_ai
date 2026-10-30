@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from app.inspection import rules
 from app.inspection.policy import POLICY_PREFIX
 from app.schemas.inspection import ViolationCategory
@@ -402,3 +404,34 @@ def test_안내문이_층_이름_대신_고칠_글자를_보여_준다() -> None
     # 어휘 층은 그대로 표준형을 보여 준다 -- 그쪽은 글자가 곧 표준형이다.
     lexical = claims.screen_name("만병통치 반려동물 영양제")
     assert [hit.display for hit in lexical] == ["특효"]
+
+
+# --- 불가시 문자: 결정론 층이 하나뿐이라 한 글자로 둘이 같이 뚫렸다 -------------------------
+
+# 폭 0 공백 / 한글 필러 / 이형자 선택자. 전 범위 단언은 ``test_summary_envelope`` 에 있다.
+_INVISIBLE = ("​", "ㅤ", "️")
+
+
+@pytest.mark.parametrize("char", _INVISIBLE)
+def test_불가시_문자를_끼운_효능_단정이_이름_0단을_통과하지_못한다(char: str) -> None:
+    """**초안은 모델 backstop 이 없다**(머리글: "하나밖에 없는 결정론 층").
+
+    그래서 한 글자로 0단과 출력 가드가 **둘 다** 같은 구멍을 지났다. 실측:
+    ``'관절염 치료 목줄'`` 에 폭 0 공백을 끼우면 0단 ``[]`` / 가드 ``['관절염']`` 이고
+    **완성 초안이 그대로 셀러에게 나갔다.**
+    """
+    missed = [name for name in _CLAIMING_NAMES if not claims.screen_name(char.join(name))]
+
+    assert not missed, f"U+{ord(char):04X} 한 글자로 이름 0단이 뚫린다: {missed}"
+
+
+@pytest.mark.parametrize("char", _INVISIBLE)
+def test_불가시_문자를_끼운_효능_문구가_출력_가드를_통과하지_못한다(char: str) -> None:
+    """출력 가드는 어휘 층(``fold``)과 패턴 층(``_loose``) 둘이고 **둘 다** 뚫렸다."""
+    missed = [name for name in _CLAIMING_NAMES if not claims.screen(char.join(name))]
+    loose_missed = [
+        text for text in ("3일이면 달라집니다", "후기가 아주 많습니다") if not claims.screen(char.join(text))
+    ]
+
+    assert not missed, f"U+{ord(char):04X} 한 글자로 어휘 층이 뚫린다: {missed}"
+    assert not loose_missed, f"U+{ord(char):04X} 한 글자로 패턴 층이 뚫린다: {loose_missed}"

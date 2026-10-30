@@ -239,7 +239,12 @@ def screen(text: str) -> RuleResult:
 
     # 금지 성분은 전용 사전이 본다. 정규화로 띄어쓰기·기호·반복·전각 우회를 무력화하고,
     # 부정 표현과 제외 접미("포도당", "카카오톡")를 거른 뒤 적중을 돌려준다.
-    for found in find_terms(text):
+    #
+    # **불가시 문자는 넘기기 전에 지운다.** 정규식 층은 ``probe``로 이미 지운 글자를 보는데
+    # 사전만 원문을 받아, 글자 모양이 같은 표기가 **사전 한 겹만** 빠져나갔다(실측: 자일리톨
+    # 사이에 폭 0 공백 한 개 -> 적중 0). ``banned.fold`` 안에 넣을 수는 없다 -- 그 모듈은
+    # 이 모듈을 import 할 수 없다(순환 import. 양방향 모두 ``ImportError`` 로 확인했다).
+    for found in find_terms(strip_invisible(text)):
         result.hits.append(
             RuleHit(
                 ViolationCategory.BANNED_INGREDIENT,

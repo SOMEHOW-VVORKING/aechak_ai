@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.inspection import rules
 from app.inspection.banned import find_terms, fold
 
 
@@ -107,3 +108,34 @@ def test_같은_성분이_여러_번_나와도_한_번만_보고한다() -> None
     # 셀러에게 전할 말은 "세 번 나왔다"가 아니라 "빼라"다.
     hits = find_terms("자일리톨 자일리톨 자일리톨")
     assert len(hits) == 1
+
+
+# --- 불가시 문자: 사전은 지우지 않고, 사전을 부르는 쪽이 지운다 -----------------------------
+
+# 폭 0 공백 / 한글 필러 / 이형자 선택자. 전 범위를 훑는 단언은 ``test_summary_envelope`` 에
+# 있고(``strip_invisible`` 이 분류로 긋는 것을 거기서 고정한다), 여기서는 **이 호출 경로가
+# 그 함수를 지나는가**만 본다.
+_INVISIBLE = ("​", "ㅤ", "️")
+
+
+@pytest.mark.parametrize("char", _INVISIBLE)
+def test_불가시_문자를_끼운_성분_표기가_0단_검사에서_잡힌다(char: str) -> None:
+    """**``fold()`` 는 불가시 문자를 지우지 않는다.** 지우는 함수가 ``rules`` 에 있고 그
+    모듈이 이 모듈을 import 하므로, 여기서 부르면 순환 import 다(실행해 확인했다 --
+    양방향 모두 ``ImportError``). 그래서 **사전을 부르는 쪽**이 먼저 지운다.
+
+    머리글이 "우회 표기는 정규화로 잡는다"고 선언하는데 글자 사이에 폭 0 문자를 끼운
+    표기는 적중이 0이었다. 글자 모양이 같으므로 구매자는 ``자일리톨``을 그대로 읽는다.
+    """
+    text = f"자일리{char}톨 함유 수제 간식"
+
+    assert "자일리톨" in {h.quote for h in rules.screen(text).blocking}, (
+        f"U+{ord(char):04X} 한 글자로 금지 성분 차단이 뚫린다: fold -> {fold(text)!r}"
+    )
+
+
+def test_불가시_문자를_끼운_비차단_성분도_권고로_남는다() -> None:
+    """차단이 아니라 **기록**이 사라지는 쪽도 손실이다 -- 모델이 볼 성분 신호가 조용히 빈다."""
+    hits = {h.quote for h in rules.screen("코코​넛오일 샴푸").hits}
+
+    assert "코코넛오일" in hits, "비차단 성분 권고가 한 글자로 사라진다"

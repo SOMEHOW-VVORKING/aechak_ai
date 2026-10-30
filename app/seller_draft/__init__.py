@@ -10,7 +10,7 @@
 (``app/schemas/inspection.py``)과 뜻이 겹치고 혼동이 난다. 초안이 하는 일은 **그 필드를
 채우지 않는 것**까지이고, 판정은 등록 시점의 기존 파이프라인이 한다.
 
-``app/inspection/`` 에서 가져다 쓰는 것은 순수 함수 둘뿐이다 -- ``rules.screen``/
-``rules.neutralize_envelope`` 와 ``banned.fold``. 둘 다 ``Settings`` 도 ``LlmClient`` 도
-받지 않아 그대로 호출되고, 그 파일들을 한 줄도 고치지 않는다.
+``app/inspection/`` 에서 가져다 쓰는 것은 순수 함수뿐이다 -- ``rules.screen``/
+``rules.neutralize_envelope``/``rules.strip_invisible`` 와 ``banned.fold``. 전부 ``Settings``
+도 ``LlmClient`` 도 받지 않아 그대로 호출되고, 초안 때문에 그 파일을 고치지 않는다.
 """

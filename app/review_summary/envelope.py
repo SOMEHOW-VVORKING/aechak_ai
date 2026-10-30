@@ -116,8 +116,12 @@ def dedupe_key(text: str) -> str:
     중복 접기가 막으려는 것은 **같은 문구를 여러 계정이 붙인 복붙**이고 그것은 성질상
     글자 그대로다. 그래서 공백 차이와 전각 표기만 흡수하고 나머지는 건드리지 않는다 --
     거짓 중복이 0 인 쪽을 고른다.
+
+    불가시 문자는 그 셋에 **더한다.** 글자 모양이 같은 복붙이 서로 다른 키를 받아 N건이
+    분모와 ``mentionCount`` 에 N번 들어갔다. 지우는 것은 "모양이 같은 것만 모으는" 일이라
+    위에서 ``fold()`` 를 거부한 선(숫자가 내용을 가른다)을 넘지 않는다.
     """
-    return " ".join(unicodedata.normalize("NFKC", text).split())
+    return " ".join(unicodedata.normalize("NFKC", rules.strip_invisible(text)).split())
 
 
 @dataclass(frozen=True, slots=True)
