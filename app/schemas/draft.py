@@ -149,6 +149,17 @@ class SkipReason(StrEnum):
 
 
 class DraftState(StrEnum):
+    """``OK`` 는 **"호출이 정상 종료했다"이고 "초안이 찼다"가 아니다.**
+
+    건너뛴 건(``skipReason``)도 ``OK`` 로 나간다. 키가 없는 배포에서는 정상 상품명도
+    ``skipReason=LLM_UNAVAILABLE`` + 12필드 전부 ``None`` + ``basis`` 전부 ``NONE`` 인
+    응답이 ``OK`` 다(실측). ``FAILED`` 는 모델을 불러 놓고 결과를 쓸 수 없었던 경우뿐이다.
+
+    **그래서 소비자가 ``state`` 만 보고 분기하면 빈 초안을 성공으로 읽는다.**
+    ``skipReason``/``fieldStatus`` 를 함께 읽어야 "제안할 것이 없었다"와 "부를 수 없었다"가
+    갈린다 -- 그 둘은 셀러 화면에서 뜻이 정반대다.
+    """
+
     OK = "OK"
     FAILED = "FAILED"
 
