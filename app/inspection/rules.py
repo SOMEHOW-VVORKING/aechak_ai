@@ -18,6 +18,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
+from app.inspection.banned import find_terms
 from app.schemas.inspection import ViolationCategory
 
 # 전화번호. 한글 숫자 표기와 구분자 삽입을 함께 본다.
@@ -55,26 +56,6 @@ _INJECTION_WEAK = re.compile(
     re.I,
 )
 
-# 반려동물에게 위험한 성분. 부정 맥락("무자일리톨")은 뒤에서 걸러낸다.
-_BANNED_INGREDIENTS: tuple[str, ...] = (
-    "자일리톨",
-    "xylitol",
-    "초콜릿",
-    "초콜렛",
-    "카카오",
-    "코코아",
-    "건포도",
-    "포도씨",
-    "마카다미아",
-    "양파",
-    "마늘",
-    "부추",
-    "알룰로스자일리톨",
-)
-# 성분 앞뒤에 이 말이 붙으면 "쓰지 않았다"는 뜻이다.
-_NEGATION = re.compile(r"(무|non[- ]?|없는|없이|불포함|미포함|제외|프리|free)\s*$", re.I)
-_NEGATION_AFTER = re.compile(r"^\s*(없|불포함|미포함|제외|프리|free|무첨가)", re.I)
-
 _REDACTION = "[가림]"
 
 
@@ -82,8 +63,10 @@ _REDACTION = "[가림]"
 class RuleHit:
     category: ViolationCategory
     quote: str
-    start: int
-    end: int
+    # 금지 성분 적중은 위치를 담지 않는다. 정규화가 공백과 기호를 지워 원문과 길이가
+    # 달라지므로, 되찾은 위치를 넘기면 엉뚱한 구간을 가리킨다.
+    start: int | None
+    end: int | None
     reason: str
     # 차단 여부를 분류가 아니라 적중마다 둔다. 같은 분류 안에서 강도가 갈리는 경우가 있다
     # (지시형 문장이 그렇다). 분류로 끌어내면 그 구분을 표현할 수 없다.
@@ -149,22 +132,19 @@ def screen(text: str) -> RuleResult:
                 )
             )
 
-    for word in _BANNED_INGREDIENTS:
-        for m in re.finditer(re.escape(word), probe, re.I):
-            before = probe[max(0, m.start() - 8) : m.start()]
-            after = probe[m.end() : m.end() + 8]
-            if _NEGATION.search(before) or _NEGATION_AFTER.search(after):
-                continue
-            result.hits.append(
-                RuleHit(
-                    ViolationCategory.BANNED_INGREDIENT,
-                    m.group(0),
-                    m.start(),
-                    m.end(),
-                    "반려동물에게 위험한 성분",
-                    True,
-                )
+    # 금지 성분은 전용 사전이 본다. 정규화로 띄어쓰기·기호·반복·전각 우회를 무력화하고,
+    # 부정 표현과 제외 접미("포도당", "카카오톡")를 거른 뒤 적중을 돌려준다.
+    for found in find_terms(text):
+        result.hits.append(
+            RuleHit(
+                ViolationCategory.BANNED_INGREDIENT,
+                found.term.canonical,
+                None,
+                None,
+                found.term.note or "반려동물에게 위험한 성분",
+                found.term.blocking,
             )
+        )
 
     # 적중 구간은 정규화한 텍스트 기준이라 원문과 어긋날 수 있다(호환 분해와 반복 축약이
     # 길이를 바꾼다). 백엔드에 넘기는 구간은 원문 기준이어야 하므로 되찾는다.
@@ -176,6 +156,8 @@ def screen(text: str) -> RuleResult:
 def _realign(hits: list[RuleHit], original: str) -> None:
     """적중 문자열을 원문에서 다시 찾아 구간을 맞춘다. 못 찾으면 그대로 둔다."""
     for hit in hits:
+        if hit.start is None:
+            continue
         found = original.find(hit.quote)
         if found >= 0:
             hit.start = found
