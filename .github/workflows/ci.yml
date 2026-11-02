@@ -6,6 +6,17 @@ on:
     branches: [main]
 
 jobs:
+  # 배포 워크플로가 생긴 뒤로는 워크플로 파일의 오류가 배포 시점에야 드러난다. PR에서 먼저 거른다.
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # SC2016은 JMESPath 질의를 홑따옴표로 감싼 자리를 셸 확장 누락으로 오인한다
+      - uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color -ignore SC2016
+
   check:
     runs-on: ubuntu-latest
     steps:
