@@ -8,6 +8,8 @@
 2. 구조화 출력은 ``strict: true`` 툴을 강제 호출해 받는다. 본문 텍스트 파싱을 하지 않는다.
 3. 오류를 세 갈래로 가른다. 레이트 429 / 티어 상한 429 / **워크스페이스 사용자 지정
    상한은 400 invalid_request_error**. 세 번째를 빼면 예산 소진이 스키마 오류로 숨는다.
+4. ``max_tokens``로 끊긴 200 응답을 성공으로 적지 않는다. 끊긴 호출이 성공으로 섞이면
+   승급률 같은 지표가 조용히 오염된다.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,13 +28,31 @@ from app.schemas.inspection import CallOutcome
 log = logging.getLogger(__name__)
 
 # 100만 토큰당 USD. 설정이 아니라 상수로 두되 모델 확정 시 공식 단가로 재확인한다.
+# Haiku 4.5는 정식 ID와 날짜 접미 별칭이 둘 다 실재한다. 어느 쪽을 설정에 적어도
+# 비용이 0으로 기록되지 않게 둘 다 올려 둔다.
 _PRICING: dict[str, tuple[float, float]] = {
     "claude-sonnet-5": (2.0, 10.0),
     "claude-opus-5": (5.0, 25.0),
+    "claude-haiku-4-5": (1.0, 5.0),
     "claude-haiku-4-5-20251001": (1.0, 5.0),
 }
 _CACHE_WRITE_MULTIPLIER = 1.25
 _CACHE_READ_MULTIPLIER = 0.1
+
+# 미지 모델에 쓰는 단가. 표 최고값으로 두면 그보다 비싼 등급이 여전히 과소 계상되므로,
+# 표와 무관하게 넉넉히 잡는다. 과대 계상은 경보를 당기고 과소 계상은 경보를 침묵시킨다.
+_FALLBACK_PRICING: tuple[float, float] = (15.0, 75.0)
+
+
+class UnknownModelPricing(RuntimeError):
+    """가격표에 없는 모델 ID. 부팅에서 기동을 거부하는 데 쓴다."""
+
+
+def validate_pricing(model_ids: Iterable[str]) -> None:
+    """설정된 모델 ID 전부가 가격표에 있는지 본다. 모르면 예외를 던진다."""
+    unknown = sorted({model_id for model_id in model_ids if model_id not in _PRICING})
+    if unknown:
+        raise UnknownModelPricing(f"가격표에 없는 모델이 설정됐다: {', '.join(unknown)}")
 
 
 @dataclass(slots=True)
@@ -67,8 +88,15 @@ def cost_micro_usd(
 
     전체 입력이 세 값의 합이라서 나누지 않으면 비용을 되살릴 수 없다.
     캐시 쓰기는 1.25배, 캐시 읽기는 0.1배로 과금된다.
+
+    가격표에 없는 모델은 0이 아니라 최고 단가로 과대 계상한다. 0으로 적으면 비용 경보가
+    영원히 침묵한다.
     """
-    in_price, out_price = _PRICING.get(model_id, (0.0, 0.0))
+    pricing = _PRICING.get(model_id)
+    if pricing is None:
+        log.error("가격표에 없는 모델이다. 최고 단가로 과대 계상한다. model=%s", model_id)
+        pricing = _FALLBACK_PRICING
+    in_price, out_price = pricing
     usd = (
         input_tokens * in_price
         + cache_creation * in_price * _CACHE_WRITE_MULTIPLIER
@@ -113,31 +141,54 @@ def _error_code(error: anthropic.APIStatusError) -> str | None:
 
 class LlmClient:
     def __init__(self, *, api_key: str, timeout_seconds: float) -> None:
-        self._client = anthropic.AsyncAnthropic(api_key=api_key, timeout=timeout_seconds)
+        # max_retries를 0으로 못박는다. SDK 기본값이 2라서 두지 않으면 429 한 건이 HTTP 3회가
+        # 되고, 레이트 리밋 상황에서 리밋을 3배로 민다. 재시도가 필요한 자리는 파이프라인이
+        # 관점 호출 하나당 한 번만 직접 돌린다 — 그래야 재시도 예산이 한곳에서 보인다.
+        self._client = anthropic.AsyncAnthropic(api_key=api_key, timeout=timeout_seconds, max_retries=0)
 
     async def call_tool(
         self,
         *,
         model: str,
-        effort: str,
+        effort: str | None,
         max_tokens: int,
         system_blocks: list[dict[str, Any]],
         user_content: list[dict[str, Any]],
         tool: dict[str, Any],
         request_id: str,
+        timeout_seconds: float | None = None,
     ) -> LlmResult:
+        """``effort``에 기본값을 두지 않는다. 호출부가 반드시 등급을 명시하거나 None을 준다.
+
+        ``thinking``을 보내지 않는다. Sonnet 5와 Opus 5는 생략이 곧 adaptive이고,
+        Haiku 4.5는 생략하면 사고하지 않는다 -- 그 세대는 budget_tokens를 받아 adaptive가 400이다.
+        """
         call_id = f"{request_id}-{uuid.uuid4().hex[:8]}"
         started = time.monotonic()
+        # output_config를 조건부로 조립한다. effort=None을 그냥 넘기면 SDK가 키를 생략하지 않고
+        # {"effort": null}을 본문에 실어 400이 된다.
+        #
+        # 빈 문자열도 미지정으로 접는다. 설정 계층이 이미 접지만, 400은 전건에 걸리고 조용해서
+        # 전송 계층에도 둔다. Settings를 거치지 않는 하네스와 스크립트가 같은 보호를 받는다.
+        grade = effort.strip() if effort is not None else None
+        options: dict[str, Any] = {}
+        if grade:
+            # temperature를 넣지 않는다. 결정성은 effort로만 조절한다.
+            options["output_config"] = {"effort": grade}
+
+        client = self._client
+        if timeout_seconds is not None:
+            client = client.with_options(timeout=timeout_seconds)
+
         try:
-            response = await self._client.messages.create(
+            response = await client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
-                # temperature를 넣지 않는다. 결정성은 effort로만 조절한다.
-                output_config={"effort": effort},
                 system=system_blocks,
                 messages=[{"role": "user", "content": user_content}],
                 tools=[tool],
                 tool_choice={"type": "tool", "name": tool["name"]},
+                **options,
             )
         except Exception as error:
             outcome, detail = _classify(error)
@@ -168,6 +219,11 @@ class LlmClient:
         detail = None
         if response.stop_reason == "refusal":
             outcome, detail = CallOutcome.REFUSED, "model refused"
+        elif response.stop_reason == "max_tokens":
+            # 상한에 걸려 끊긴 응답이다. tool_use.input이 dict로 보여도 중간까지만 채워져 있다.
+            # SUCCESS로 적으면 끊긴 호출이 승급률 분자에서 "모델이 더 보라고 했다"와 같아지고,
+            # 스키마 오류로 적으면 상한을 올려야 하는 것을 알 수 없다.
+            outcome, detail = CallOutcome.TRUNCATED, f"max_tokens={max_tokens}"
         elif tool_input is None:
             outcome, detail = CallOutcome.SCHEMA_INVALID, f"stop_reason={response.stop_reason}"
 

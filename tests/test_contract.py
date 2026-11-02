@@ -9,6 +9,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from conftest import backend_model_verified
+
+from app.inspection import triage
 from app.schemas.envelope import Envelope
 from app.schemas.inspection import (
     SCHEMA_VERSION,
@@ -116,3 +119,54 @@ def test_우리가_감싼_엔벨로프도_페이로드가_문자열이다(contra
     )
     assert set(emitted) == set(contract("verdict-envelope.json")), "엔벨로프 필드는 여덟 개다"
     assert emitted["traceId"] == "trace-1", "상관키는 새로 만들지 않고 승계한다"
+
+
+def test_뒤집힘_신호를_백엔드_표본에서_읽고_같은_키로_되돌린다(contract: Any) -> None:
+    raw = contract("content-verdict-triage-promoted.json")
+
+    verdict = ContentVerdict.model_validate(raw)
+
+    assert verdict.criticOverturned is True, (
+        "이 필드가 없으면 백엔드의 어드민 '비평 뒤집음' 경로가 처음부터 발화하지 않는다"
+    )
+    emitted = json.loads(verdict.model_dump_json())
+    assert set(emitted) == set(raw), "키 집합이 다르면 백엔드가 에러 없이 일부를 떨어뜨린다"
+
+
+def test_뒤집히지_않은_표본은_신호가_꺼져_있다(contract: Any) -> None:
+    for name in ("content-verdict.json", "content-verdict-triage.json"):
+        verdict = ContentVerdict.model_validate(contract(name))
+
+        assert verdict.criticOverturned is False, f"{name}"
+
+
+def test_승급_표본은_선별_관점을_미검사로_남긴다(contract: Any) -> None:
+    """승급 경로의 TRIAGE 행이 백엔드 계약의 일부다.
+
+    승급은 판정을 내린 것이 아니라 더 보라고 넘긴 것이라 CLEAR로 적으면 거짓이 된다.
+    """
+    verdict = ContentVerdict.model_validate(contract("content-verdict-triage-promoted.json"))
+
+    rows = {p.perspective: p for p in verdict.perspectives}
+
+    assert rows[Perspective.TRIAGE].outcome is PerspectiveOutcome.UNCHECKED
+    assert rows[Perspective.TRIAGE].skipReason == "PROMOTED"
+
+
+def test_건너뛴_표본은_선별_관점이_통과이고_게이트를_넘는다(contract: Any) -> None:
+    """선별이 건너뛴 통과가 사람 손을 거치지 않고 받아들여지는 모양을 고정한다.
+
+    건너뛴 관점에 행을 남기는 것은 호출을 쏜 증거가 아니라 왜 안 쐈는지를 적는 자리이고,
+    백엔드 게이트가 통과를 받아들이는 조건이 바로 그 행의 존재다. 그 행이 빠지면 백엔드는
+    선별이 건너뛴 건을 전건 관리자 검토 큐로 보내고, 그러면 선별은 Sonnet 호출만 아끼고
+    사람 손은 그만큼 더 쓰는 장치가 된다.
+    """
+    verdict = ContentVerdict.model_validate(contract("content-verdict-triage.json"))
+
+    rows = {p.perspective: p for p in verdict.perspectives}
+
+    assert rows[Perspective.TRIAGE].outcome is PerspectiveOutcome.CLEAR
+    for perspective in (Perspective.DISPLAY_ADS, Perspective.CONDUCT_TRADE):
+        assert rows[perspective].outcome is PerspectiveOutcome.UNCHECKED
+        assert rows[perspective].skipReason == triage.TRIAGE_SKIP_REASON
+    assert backend_model_verified(verdict)

@@ -12,7 +12,7 @@ dependencies = [
     "anthropic>=1.15",
 ]
 
-# LangChain·LangGraph를 쓰지 않는다. 측정 근거는 docs/adr-001-no-langgraph.md 에 적었다.
+# LangChain·LangGraph를 쓰지 않는다. 측정 근거는 docs/adr-001-no-orchestration-framework.md 에 적었다.
 # 요약하면 langgraph는 langchain-core와 langsmith를 하드 의존으로 끌고 와 의존성이 16개에서 42개로 늘고,
 # 이 파이프라인에서 쓸 기능(병렬 팬아웃·조건부 분기·재시도)은 asyncio로 더 적은 코드로 된다.
 # 유일한 우위인 interrupt 기반 중단·재개는 어드민 심사 재개 흐름이 범위에 없어서 쓸 자리가 없다.

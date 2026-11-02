@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from app.inspection.pipeline import InspectionPipeline
 from app.kafka.runner import InspectionRunner
-from app.llm.client import LlmClient
+from app.llm.client import LlmClient, validate_pricing
 from app.settings import settings
 
 log = logging.getLogger(__name__)
@@ -40,6 +40,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
     _silence_external_tracing()
+
+    # 설정 오타를 돈 쓰기 전에 잡는다. 가격표에 없는 모델은 비용이 과대 계상되고,
+    # 그 전에 설정 오타가 더 흔한 원인이므로 기동을 거부한다.
+    validate_pricing(settings.model_ids())
 
     llm = (
         LlmClient(

@@ -144,3 +144,54 @@ async def test_리뷰_요청도_같은_토픽으로_들어온다(settings: Setti
     verdict = ContentVerdict.model_validate(out.payload_obj())
     assert verdict.targetRef == 77
     assert verdict.sellerNotice is None
+
+
+async def test_폴_간격이_한_건의_최악_처리시간보다_넓다(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """상한을 올릴 때 폴 간격을 같이 올리지 않으면 리밸런스가 같은 상품을 재검수한다.
+
+    한 건의 재시도 폭풍이 ``max_poll_interval_ms``를 넘기면 리밸런스가 일어나고, 커밋되지
+    않은 오프셋이 재배달돼 전액 재검수가 된다. 기본값은 300,000ms라서 넉넉하지 않다.
+    """
+    captured: dict[str, Any] = {}
+
+    class FakeConsumer:
+        def __init__(self, *topics: str, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    class FakeProducerClass:
+        def __init__(self, **kwargs: Any) -> None:
+            return None
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr("app.kafka.runner.AIOKafkaConsumer", FakeConsumer)
+    monkeypatch.setattr("app.kafka.runner.AIOKafkaProducer", FakeProducerClass)
+    runner = InspectionRunner(settings=settings, pipeline=runner_with(settings, FakeProducer(), [])._pipeline)
+
+    await runner.start()
+    await runner.stop()
+
+    assert captured["enable_auto_commit"] is False
+    budget = settings.worst_case_handle_seconds()
+    assert captured["max_poll_interval_ms"] / 1000 >= budget, (
+        f"폴 간격 {captured['max_poll_interval_ms']}ms가 최악 처리시간 {budget}초보다 좁다"
+    )
+
+
+def test_최악_처리시간이_타임아웃과_재시도_예산을_모두_센다(settings: Settings) -> None:
+    """예산 계산이 한 자리에 있어야 상한을 올릴 때 폴 간격 조정을 빠뜨리지 않는다."""
+    wide = settings.model_copy(update={"request_timeout_seconds": 120.0})
+
+    assert wide.worst_case_handle_seconds() > settings.worst_case_handle_seconds()

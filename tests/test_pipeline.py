@@ -293,7 +293,9 @@ async def test_샘플링_파라미터를_절대_보내지_않는다(settings: Se
     for call in llm.calls:
         for banned in ("temperature", "top_p", "top_k"):
             assert banned not in call, f"{banned}는 현세대 모델에서 400이다"
-        assert call["effort"] in ("low", "medium", "high", "xhigh", "max")
+        # None은 output_config를 아예 보내지 않는 경로다. 본문에 실제로 안 실리는지는
+        # tests/test_client_params.py가 전송 계층에서 단언한다.
+        assert call["effort"] is None or call["effort"] in ("low", "medium", "high", "xhigh", "max")
 
 
 @pytest.mark.parametrize("fanout", [True, False])
@@ -305,3 +307,88 @@ async def test_팬아웃_스위치가_호출_수를_바꾼다(settings: Settings
     await pipeline.run(product("글루코사민 함유"))
 
     assert len(llm.calls) == (2 if fanout else 1)
+
+
+async def test_비평이_뒤집으면_그_사실을_판정에_싣는다(settings: Settings) -> None:
+    """뒤집었다는 사실이 메시지에 없으면 백엔드가 깨끗한 통과와 구분할 수 없다.
+
+    백엔드는 이 신호로 어드민 큐 등재와 보류를 정한다. 비지 않으면 조용히 통과한다.
+    """
+    quote = "관절 건강에 도움을 줄 수 있습니다"
+    llm = FakeLlmClient(
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "OVERTURN", "reason": "정상적인 표현"}),
+        ]
+    )
+    pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+    verdict = await pipeline.run(product(quote))
+
+    assert verdict.verdict is Verdict.PASS
+    assert verdict.criticOverturned is True
+
+
+async def test_비평이_유지하면_뒤집힘_신호가_꺼진다(settings: Settings) -> None:
+    quote = "관절염 치료에 효과가 있습니다"
+    llm = FakeLlmClient(
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "UPHOLD", "reason": "타당하다"}),
+            ok({"sellerNotice": "수정이 필요합니다.", "rewrites": []}),
+        ]
+    )
+    pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+    verdict = await pipeline.run(product(quote))
+
+    assert verdict.verdict is Verdict.FLAG
+    assert verdict.criticOverturned is False
+
+
+async def test_비평을_타지_않은_판정은_뒤집힘_신호가_꺼진다(settings: Settings) -> None:
+    """통과·규칙 확정·판정 실패는 비평을 타지 않는다. 그 셋에 신호가 켜지면 어드민 큐가 잡음으로 찬다."""
+    cases = [
+        (FakeLlmClient([ok(NO_FINDING), ok(NO_FINDING)]), product("글루코사민 함유 영양제입니다")),
+        (FakeLlmClient([]), product("문의는 010-1234-5678로 주세요")),
+        (FakeLlmClient([failed(), failed(), failed(), failed()]), product("글루코사민 함유")),
+    ]
+    for llm, request in cases:
+        pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+        verdict = await pipeline.run(request)
+
+        assert verdict.criticOverturned is False, verdict.verdict
+
+
+async def test_뒤집힘_신호는_통과_판정에만_붙는다(settings: Settings) -> None:
+    """FLAG 와 뒤집힘이 함께 나가면 백엔드에서 완화가 사라진다.
+
+    백엔드 ``adminReviewReasonOf`` 의 when 순서가 ``criticOverturned`` 를 과탐 의심보다
+    먼저 보기 때문에, 그 조합이 가면 전건 금지 성분이어도 보류가 아니라 확정 반려가 된다.
+    여기서 그 조합을 만들지 않는 것이 그 결함을 잠복 상태로 묶어 둔다.
+    """
+    quote = "관절염 치료에 효과가 있습니다"
+    scripts = [
+        [ok(finding(quote)), ok(NO_FINDING), ok({"decision": "OVERTURN", "reason": "오탐"})],
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "UPHOLD", "reason": "타당"}),
+            ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
+        ],
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "INSUFFICIENT", "reason": "근거 부족"}),
+            ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
+        ],
+    ]
+    for scripted in scripts:
+        pipeline = InspectionPipeline(llm=FakeLlmClient(scripted), settings=settings)
+
+        verdict = await pipeline.run(product(quote))
+
+        assert not (verdict.criticOverturned and verdict.verdict is Verdict.FLAG), verdict.verdict
