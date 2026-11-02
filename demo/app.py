@@ -32,17 +32,22 @@ from pydantic import BaseModel, Field
 from app.inspection.pipeline import InspectionPipeline
 from app.inspection.trace import TraceRecorder
 from app.llm.client import LlmClient
+from app.review_summary.service import SummaryService
+from app.review_summary.trace import SummaryTraceRecorder
 from app.schemas.inspection import (
     ContentVerdict,
     ProductInspectionRequest,
     ReviewInspectionRequest,
     TargetType,
 )
+from app.schemas.summary import RequestedScope, ReviewInput, ReviewSummaryRequest, SummaryScope
 from app.settings import Settings
-from demo import view
+from demo import summary_view, view
 from demo.cassettes import BY_ID, SCENARIOS, Scenario
 from demo.mock import MockLlmClient
-from demo.replay import CassetteMiss, ReplayLlmClient
+from demo.replay import CassetteMiss, ReplayLlmClient, SequencedReplayClient
+from demo.summary_cassettes import SUMMARY_BY_ID, SUMMARY_SCENARIOS
+from demo.summary_mock import MockSummaryLlmClient
 
 CONSOLE_HTML = Path(__file__).parent / "console.html"
 
@@ -199,6 +204,194 @@ async def replay_verdict(body: VerdictBody) -> JSONResponse:
 
     built = view.build(verdict, mode="verdict", source=source)
     return JSONResponse({"view": built.as_dict(), "verdict": json.loads(verdict.model_dump_json())})
+
+
+class SummaryBody(BaseModel):
+    """요약 콘솔이 보내는 입력.
+
+    ``mode`` 의 기본값이 재생인 것이 안전장치다 -- 검수 콘솔과 같은 논리이고, 사람이
+    발표 중에 실수로 유료 경로를 밟지 않는 쪽이 기본이어야 한다.
+
+    **``mock`` 이 검수 탭에만 있고 여기 없던 것이 비대칭이었다.** 키가 없으면 라이브가
+    내려가므로 요약은 적어 둔 시나리오 9개밖에 돌 수 없었고, 사람이 자기 리뷰를 타이핑해
+    결과를 보는 일이 이 기능에서만 불가능했다.
+    """
+
+    mode: Literal["replay", "mock", "live"] = "replay"
+    scenario: str | None = None
+    # 모의·라이브 모드에서 사람이 직접 넣는 리뷰. "5|본문" 한 줄에 한 건이다.
+    reviews: list[str] = Field(default_factory=list)
+    categoryPath: list[str] = Field(default_factory=lambda: ["강아지", "사료", "건식사료"])
+    basisReviewCount: int = 20
+
+
+@app.get("/api/summary/scenarios")
+async def summary_scenarios() -> JSONResponse:
+    settings = Settings()
+    return JSONResponse(
+        {
+            "scenarios": [
+                {
+                    "id": scenario.id,
+                    "title": scenario.title,
+                    "note": scenario.note,
+                    "expectedExit": scenario.expected_exit,
+                    "reviews": len(scenario.reviews),
+                    "llmDisabled": scenario.llm_disabled,
+                }
+                for scenario in SUMMARY_SCENARIOS
+            ],
+            "liveAvailable": bool(settings.anthropic_api_key),
+            "defaults": {
+                "extractModel": settings.summary_extract_model,
+                "narrateModel": settings.summary_narrate_model,
+                "minReviews": settings.summary_min_reviews,
+                "minSegmentReviews": settings.summary_min_segment_reviews,
+                "minAspectMentions": settings.summary_min_aspect_mentions,
+                "minAspectShare": settings.summary_min_aspect_share,
+                "contentChars": settings.summary_content_chars,
+                "enabled": settings.enable_review_summary,
+                # 환율을 다시 적지 않는다. demo/view 의 것을 그대로 내려보낸다.
+                "krwPerUsd": view.KRW_PER_USD,
+            },
+        }
+    )
+
+
+@app.post("/api/summary")
+async def summarize(body: SummaryBody) -> JSONResponse:
+    if body.mode == "replay":
+        scenario = SUMMARY_BY_ID.get(body.scenario or "")
+        if scenario is None:
+            return _error(f"모르는 요약 시나리오다. scenario={body.scenario}")
+        return await _run_summary(
+            request=scenario.to_request(),
+            llm=(None if scenario.llm_disabled else SequencedReplayClient(entries=dict(scenario.entries))),
+            # 시나리오가 임계와 모델 전부를 든다. 앰비언트 환경을 한 칸도 읽지 않는다.
+            settings=scenario.settings(),
+            mode="replay",
+            source=scenario.id,
+            expected_exit=scenario.expected_exit,
+        )
+
+    reviews = _parse_reviews(body.reviews)
+    if not reviews:
+        return _error('리뷰를 한 줄에 한 건씩 "별점|본문" 모양으로 넣어라. 예: 5|잘 먹어요')
+
+    # **분모를 사람 입력에서 그대로 믿지 않는다.** 이 자리가 레포 1순위 불변식을 깼다.
+    #
+    # 앞 판은 ``totalVisibleReviews`` 와 ``basisReviewCount`` 양쪽에 사람이 자유 입력하는
+    # 수(기본 20)를 박고 ``unextractedReviewCount=0`` 을 하드코딩했다. 실제 투입 리뷰는
+    # textarea 줄 수(기본 5)다. 그래서 **콘솔 출고 기본 상태에서** 분석 20건 / 못 읽은
+    # 리뷰 0건이 나왔고, ``summary_min_reviews`` 임계도 그 조작된 분모가 통과시켜 서술
+    # 호출까지 났다. 긍정 리뷰 3건이면 ``NO_NEGATIVE_MENTIONS_FOUND`` -- 17건을 한 글자도
+    # 읽지 않고 "단점 언급을 찾지 못했다"로 내보내는 것이고, 서비스에서 없앤 바로 그 결함이
+    # 입력 계층에서 되살아난 모양이다.
+    #
+    # 분모를 입력으로 남겨 두는 것 자체는 쓸모가 있다 -- "전체 리뷰 1,000건 가운데 신규
+    # 12건만 추출됐다"는 상황을 사람이 재현해 볼 수 있어야 한다. 그래서 받되 **못 읽은
+    # 리뷰 수를 그 차이로 채우고**, 분모가 투입 리뷰보다 작으면 거부한다(음수가 된다).
+    basis = max(body.basisReviewCount, 0)
+    if basis < len(reviews):
+        return _error(
+            f"분모({basis})가 투입 리뷰({len(reviews)}건)보다 작다. "
+            "분모는 '이 상품의 전체 리뷰 수'이고 투입 리뷰는 그 가운데 지금 추출할 신규 건이다"
+        )
+    request = ReviewSummaryRequest(
+        requestId=f"demo-{body.mode}",
+        productId=42,
+        categoryPath=body.categoryPath,
+        totalVisibleReviews=basis,
+        newReviews=reviews,
+        requestedScopes=[
+            RequestedScope(
+                scope=SummaryScope.PRODUCT,
+                basisReviewCount=basis,
+                # 분모에서 지금 투입한 것을 뺀 나머지는 **한 글자도 읽지 않았다.**
+                unextractedReviewCount=basis - len(reviews),
+                tally=[],
+            )
+        ],
+    )
+
+    if body.mode == "mock":
+        # 대역은 **모델이 아니다.** 키워드 표로 답하고 비용이 0이다. 임계와 모델 ID 는
+        # 운영 기본값을 그대로 쓴다 -- 콘솔이 보여 주는 임계와 돌아가는 임계가 같아야 한다.
+        return await _run_summary(
+            request=request,
+            llm=MockSummaryLlmClient(),
+            settings=Settings(),
+            mode="mock",
+            source="custom",
+        )
+
+    settings = Settings()
+    if not settings.anthropic_api_key:
+        return _error("AECHAK_AI_ANTHROPIC_API_KEY 가 없어 라이브 모드를 쓸 수 없다. 재생이나 모의로 돌려라")
+    llm = LlmClient(api_key=settings.anthropic_api_key, timeout_seconds=settings.summary_timeout_seconds)
+    try:
+        return await _run_summary(
+            request=request,
+            llm=llm,
+            settings=settings,
+            mode="live",
+            source="custom",
+        )
+    finally:
+        await llm.aclose()
+
+
+def _parse_reviews(lines: list[str]) -> list[ReviewInput]:
+    """``"5|잘 먹어요"`` 한 줄을 리뷰 한 건으로 접는다. 별점을 빼면 5점으로 둔다."""
+    reviews: list[ReviewInput] = []
+    for index, line in enumerate(lines, start=1):
+        text = line.strip()
+        if not text:
+            continue
+        rating = 5
+        if "|" in text:
+            head, _, rest = text.partition("|")
+            if head.strip().isdigit():
+                rating = max(1, min(5, int(head.strip())))
+                text = rest.strip()
+        if text:
+            reviews.append(ReviewInput(reviewId=index, rating=rating, content=text))
+    return reviews
+
+
+async def _run_summary(
+    *,
+    request: ReviewSummaryRequest,
+    llm: Any,
+    settings: Settings,
+    mode: str,
+    source: str,
+    expected_exit: str | None = None,
+) -> JSONResponse:
+    recorder = SummaryTraceRecorder()
+    service = SummaryService(llm=llm, settings=settings, recorder=recorder)
+    try:
+        message = await service.run(request)
+    except CassetteMiss as miss:
+        # 조용히 실패로 접지 않는다. 추출 실패는 UNEXTRACTED 이고 서술 실패는
+        # narrateFailure 라서, 빠진 카세트를 실패로 돌리면 콘솔이 거짓 단계를 그린다.
+        return _error(str(miss))
+
+    built = summary_view.build(
+        message,
+        mode=mode,
+        source=source,
+        reviews_in=len(request.newReviews),
+        trace=recorder.trace,
+    )
+    if expected_exit is not None and built.exit_point != expected_exit:
+        # 틀린 그림을 정상 응답으로 내보내지 않는다. 사이드바에 시나리오 설명과
+        # expected_exit 가 떠 있으므로 다른 경로를 그리면 화면이 자기를 부정한다.
+        return _error(
+            f"시나리오가 적어 둔 경로와 다르게 돌았다. 적어 둔 곳={expected_exit} "
+            f"실제={built.exit_point}. 카세트가 시나리오와 어긋났을 수 있다"
+        )
+    return JSONResponse({"view": built.as_dict(), "message": json.loads(message.model_dump_json())})
 
 
 async def _run(

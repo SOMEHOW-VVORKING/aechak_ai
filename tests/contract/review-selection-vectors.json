@@ -1,0 +1,213 @@
+{
+  "today": "2026-10-27",
+  "note": "펫 유사도 티어의 골든 벡터다. 정본은 app/review_summary/selection.py 이고 백엔드 Kotlin 미러가 이 파일을 읽어 같은 답을 내는지 단언한다. NO_PET_INFO 와 OTHER 를 섞으면 미검사가 조건 불일치로 적힌다.",
+  "ageBuckets": {
+    "PUPPY": "연 차이 0",
+    "YOUNG": "연 차이 1~2",
+    "ADULT": "연 차이 3~6",
+    "SENIOR": "연 차이 7 이상",
+    "UNKNOWN": "생년월이 없거나 모양이 틀렸다"
+  },
+  "weightBands": {
+    "DOG": {
+      "DOG_UNDER_5": "<5",
+      "DOG_5_10": "5~10",
+      "DOG_10_25": "10~25",
+      "DOG_25_PLUS": "25+"
+    },
+    "CAT": {
+      "CAT_UNDER_4": "<4",
+      "CAT_4_6": "4~6",
+      "CAT_6_PLUS": "6+"
+    }
+  },
+  "tierRank": {
+    "BREED_EXACT": 0,
+    "BREED": 1,
+    "SIZE_AGE": 2,
+    "SPECIES": 3,
+    "NO_PET_INFO": 4,
+    "OTHER": 5
+  },
+  "segmentKeys": [
+    "DOG:DOG_UNDER_5",
+    "DOG:DOG_5_10",
+    "DOG:DOG_10_25",
+    "DOG:DOG_25_PLUS",
+    "CAT:CAT_UNDER_4",
+    "CAT:CAT_4_6",
+    "CAT:CAT_6_PLUS"
+  ],
+  "vectors": [
+    {
+      "name": "같은 품종 같은 체급",
+      "viewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": "2022-03",
+        "weightKg": 4.2
+      },
+      "reviewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": "2021-07",
+        "weightKg": 4.8
+      },
+      "tier": "BREED_EXACT",
+      "viewerSegment": "DOG:DOG_UNDER_5",
+      "reviewerSegment": "DOG:DOG_UNDER_5"
+    },
+    {
+      "name": "같은 품종 다른 체급",
+      "viewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": null,
+        "weightKg": 4.2
+      },
+      "reviewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": null,
+        "weightKg": 12.0
+      },
+      "tier": "BREED",
+      "viewerSegment": "DOG:DOG_UNDER_5",
+      "reviewerSegment": "DOG:DOG_10_25"
+    },
+    {
+      "name": "같은 품종이지만 리뷰어 체중 미기재",
+      "viewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": null,
+        "weightKg": 4.2
+      },
+      "reviewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": null,
+        "weightKg": null
+      },
+      "tier": "BREED",
+      "viewerSegment": "DOG:DOG_UNDER_5",
+      "reviewerSegment": null
+    },
+    {
+      "name": "다른 품종 같은 체급 같은 나이대",
+      "viewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": "2022-01",
+        "weightKg": 4.2
+      },
+      "reviewer": {
+        "species": "DOG",
+        "breedId": 99,
+        "birthYearMonth": "2022-11",
+        "weightKg": 4.9
+      },
+      "tier": "SIZE_AGE",
+      "viewerSegment": "DOG:DOG_UNDER_5",
+      "reviewerSegment": "DOG:DOG_UNDER_5"
+    },
+    {
+      "name": "다른 품종 같은 체급 나이 미기재",
+      "viewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": null,
+        "weightKg": 4.2
+      },
+      "reviewer": {
+        "species": "DOG",
+        "breedId": 99,
+        "birthYearMonth": null,
+        "weightKg": 4.9
+      },
+      "tier": "SPECIES",
+      "viewerSegment": "DOG:DOG_UNDER_5",
+      "reviewerSegment": "DOG:DOG_UNDER_5"
+    },
+    {
+      "name": "양쪽 체중 미기재는 체급 일치가 아니다",
+      "viewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": "2022-01",
+        "weightKg": null
+      },
+      "reviewer": {
+        "species": "DOG",
+        "breedId": 99,
+        "birthYearMonth": "2022-05",
+        "weightKg": null
+      },
+      "tier": "SPECIES",
+      "viewerSegment": null,
+      "reviewerSegment": null
+    },
+    {
+      "name": "종이 다르다",
+      "viewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": null,
+        "weightKg": 4.2
+      },
+      "reviewer": {
+        "species": "CAT",
+        "breedId": 301,
+        "birthYearMonth": null,
+        "weightKg": 4.2
+      },
+      "tier": "OTHER",
+      "viewerSegment": "DOG:DOG_UNDER_5",
+      "reviewerSegment": "CAT:CAT_4_6"
+    },
+    {
+      "name": "리뷰어 펫 정보 없음",
+      "viewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": null,
+        "weightKg": 4.2
+      },
+      "reviewer": null,
+      "tier": "NO_PET_INFO",
+      "viewerSegment": "DOG:DOG_UNDER_5",
+      "reviewerSegment": null
+    },
+    {
+      "name": "조회자 펫 정보 없음",
+      "viewer": null,
+      "reviewer": {
+        "species": "DOG",
+        "breedId": 12,
+        "birthYearMonth": null,
+        "weightKg": 4.2
+      },
+      "tier": "NO_PET_INFO",
+      "viewerSegment": null,
+      "reviewerSegment": "DOG:DOG_UNDER_5"
+    },
+    {
+      "name": "고양이 같은 체급 같은 나이대",
+      "viewer": {
+        "species": "CAT",
+        "breedId": 301,
+        "birthYearMonth": "2019-02",
+        "weightKg": 4.5
+      },
+      "reviewer": {
+        "species": "CAT",
+        "breedId": 350,
+        "birthYearMonth": "2019-09",
+        "weightKg": 5.5
+      },
+      "tier": "SIZE_AGE",
+      "viewerSegment": "CAT:CAT_4_6",
+      "reviewerSegment": "CAT:CAT_4_6"
+    }
+  ]
+}

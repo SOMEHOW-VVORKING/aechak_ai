@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from app.inspection.banned import find_terms
 from app.schemas.inspection import ViolationCategory
@@ -72,6 +73,60 @@ _REDACTION = "[가림]"
 ENVELOPE_TOKENS: tuple[str, ...] = ("</본문>", "<본문>", "</대상>", "<대상")
 _NEUTRALIZED = "[태그]"
 
+# 폭이 0이거나 방향만 바꾸는 서식 문자. **글자 모양에 나타나지 않으면서 문자열 비교만 깬다.**
+#
+# 전각 부호로 쓴 닫는 태그는 NFKC가 모아 주므로 차단으로 잡혔는데, 글자 사이에 폭 0 문자를
+# 끼운 표기는 적중이 0건이었다. 소비자가 파서가 아니라 모델이라는 점이 그 비대칭을 위험하게
+# 만든다 -- 모델은 폭 0 문자를 사이에 둔 토큰을 닫는 태그로 읽을 수 있고, 그러면 본문이
+# 봉투를 닫는다.
+#
+# **코드포인트를 손으로 적지 않는다. 그것이 이 자리의 세 번째 결함이었다.** 앞 판은
+# ``[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]`` 를 적어 두었고,
+# 그래서 **적어 둔 것의 바로 옆 글자가 전부 열려 있었다** -- ``U+2060-2064`` 를 넣고
+# ``U+206A-206F`` 를 빠뜨렸고, ``U+202A-202E`` 를 넣고 그 짝인 ``U+2066-2069``(bidi
+# isolate)를 빠뜨렸다. 실측으로 28종이 차단과 중성화를 **둘 다** 통과했고, 한국어 본문에서
+# 가장 쓰기 쉬운 한글 필러(``U+3164``·``U+115F``·``U+1160``·``U+FFA0``)와 이형자
+# 선택자(``U+FE00-FE0F``)가 그 안에 있었다.
+#
+# 그래서 근거를 **유니코드 분류**로 옮긴다. ``Cf``(format) 전부 + 분류가 ``Cf`` 가 아니면서
+# 폭이 0인 글자 집합이고, 후자만 열거한다. 테스트가 유니코드 전 범위를 훑어 이 둘의 합집합이
+# 전건 차단되는 것을 단언하므로 열거를 늘려도 측정이 함께 따라온다.
+#
+# 대가를 적어 둔다. ``U+200D``(ZWJ)와 이형자 선택자를 지우므로 이모지 결합 문자열이
+# 낱글자로 풀린다. 모델이 보는 문자열과 인용 검증 기준이 같은 함수를 지나므로 검증이
+# 어긋나지는 않고, 화면에 나가는 인용의 이모지 모양만 달라진다. 봉투가 닫히는 쪽이 훨씬
+# 비싼 실패다. **한글 자모와 결합 악센트는 지우지 않는다** -- ``Mn`` 전체를 지우면
+# 베트남어·태국어 본문이 망가지므로 분류로 긋지 않고 폭 0 인 것만 열거한다.
+ZERO_WIDTH_MARKS: frozenset[str] = frozenset(
+    "\u034f"  # COMBINING GRAPHEME JOINER
+    "\u115f\u1160"  # 한글 초성·중성 필러
+    "\u17b4\u17b5"  # 크메르 고유 모음 (폭 0)
+    "\u180b\u180c\u180d\u180f"  # 몽골 자유 이형자 선택자
+    "\u3164"  # 한글 필러
+    "\uffa0"  # 반각 한글 필러
+    + "".join(chr(cp) for cp in range(0xFE00, 0xFE10))  # 이형자 선택자 1-16
+    + "".join(chr(cp) for cp in range(0xE0100, 0xE01F0))  # 이형자 선택자 보충
+)
+
+
+@lru_cache(maxsize=8192)
+def _is_invisible(char: str) -> bool:
+    """그 한 글자가 불가시인가. **글자마다 보고 외운다.**
+
+    유니코드 전 범위를 미리 훑어 표를 만들면 import 가 느려지고(``Cf`` 는 ``U+E0001`` 까지
+    흩어져 있다) 범위를 하드코딩하면 파이썬의 유니코드 판이 올라갈 때 조용히 어긋난다.
+    입력에 실제로 나타난 글자만 분류를 묻고 그 답을 외우면 둘 다 피한다.
+    """
+    return unicodedata.category(char) == "Cf" or char in ZERO_WIDTH_MARKS
+
+
+def strip_invisible(text: str) -> str:
+    """불가시 문자를 지운다. 판정과 중성화가 같은 글자 집합을 보게 만드는 함수다."""
+    if text.isascii():
+        # ASCII 에는 ``Cf`` 가 없다. 리뷰 본문 대부분이 아니지만 상품명·옵션명에서 흔하다.
+        return text
+    return "".join(char for char in text if not _is_invisible(char))
+
 
 def neutralize_envelope(text: str) -> str:
     """본문에 들어 있는 봉투 구분자를 중성화한다. 프롬프트에 끼우기 **전에** 부른다.
@@ -79,8 +134,12 @@ def neutralize_envelope(text: str) -> str:
     정규식 계층이 이 토큰을 강한 신호로 이미 차단하지만, 방어를 그 한 줄에 걸지 않는다 --
     정규식을 좁히거나 차단을 비차단으로 내리는 변경이 조용히 봉투를 다시 열기 때문이다.
     긴 토큰부터 치환해야 ``</본문>``이 ``<본문>`` 규칙에 먼저 쪼개지지 않는다.
+
+    **폭 0 문자를 먼저 지운다.** 지우지 않으면 글자 사이에 그 문자를 끼운 토큰이 치환을
+    통째로 빠져나가고, 조립된 봉투의 토큰 수 검사(``envelope_wellformed``)는 정확한 토큰만
+    세므로 그 탈출이 검사에 보이지 않는다 -- 통과로 찍히면서 모델 입장에서는 봉투가 닫혀 있었다.
     """
-    out = text
+    out = strip_invisible(text)
     for token in ENVELOPE_TOKENS:
         out = out.replace(token, _NEUTRALIZED)
     return out
@@ -134,8 +193,13 @@ class RuleResult:
 
 
 def normalize(text: str) -> str:
-    """판정 전용 정규화. 호환 분해로 동형문자를 모으고 반복을 줄인다."""
-    folded = unicodedata.normalize("NFKC", text)
+    """판정 전용 정규화. 호환 분해로 동형문자를 모으고 반복을 줄인다.
+
+    폭 0 문자를 먼저 지운다. NFKC 는 그것들을 지우지 않으므로, 지우지 않으면 전화번호나
+    봉투 토큰의 글자 사이에 그 문자를 끼운 표기가 **글자 모양이 같은데 전 규칙을
+    빠져나간다.** 전각 표기는 모으면서 폭 0 표기는 못 모으는 비대칭을 닫는다.
+    """
+    folded = unicodedata.normalize("NFKC", strip_invisible(text))
     # 같은 글자를 세 번 이상 늘린 우회 표기를 둘로 줄인다
     return re.sub(r"(.)\1{2,}", r"\1\1", folded)
 

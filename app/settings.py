@@ -7,9 +7,10 @@ Spring Cloud AWS의 파라미터스토어 로딩은 자바 전용이라 파이�
 
 from __future__ import annotations
 
+import math
 from typing import Annotated, Literal
 
-from pydantic import BeforeValidator, Field
+from pydantic import BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # output_config.effort가 받는 등급. 기본값은 high라서 안 보내면 조용히 올라간다.
@@ -80,6 +81,45 @@ class Settings(BaseSettings):
     # 기본 꺼짐. 백엔드 열거에 TRIAGE가 없는 동안 켜면 판정 전건이 격리 토픽으로 간다.
     enable_triage: bool = False
 
+    # --- 리뷰 요약(SCRUM-310). 검수와 모델·토픽·폴 간격을 공유하지 않는다 ------------
+    #
+    # 기본 모델이 Haiku 4.5 인 이유가 둘이다. 같은 토큰에서 Sonnet 5 의 절반이고, 더
+    # 중요하게 Sonnet 5 는 ``thinking`` 을 생략하면 adaptive 가 켜져 **사고 토큰이 출력
+    # 단가로 과금되는데 산출물 글자 수에는 나타나지 않는다.** 억제 레버는 effort 하나이고
+    # thinking 을 끄려면 손대지 않기로 한 client.py 를 고쳐야 한다.
+    summary_extract_model: str = "claude-haiku-4-5"
+    # Haiku 4.5 는 effort 를 받으면 400 이고 그 400 이 SCHEMA_INVALID 로 숨는다.
+    # 미지정이면 client 가 output_config 를 아예 보내지 않는다.
+    summary_extract_effort: OptionalEffort = None
+    summary_narrate_model: str = "claude-haiku-4-5"
+    summary_narrate_effort: OptionalEffort = None
+    # 배치 10건 x 항목 2~4개 + 펫 맥락. 좁으면 TRUNCATED 로 떨어져 비용을 쓰고도 못 쓴다.
+    max_tokens_summary_extract: int = 4096
+    max_tokens_summary_narrate: int = 2048
+    summary_timeout_seconds: float = 60.0
+    # 메시지당 상한 둘. **폴 간격 예산이 이 두 수를 정한다**(아래 산수 참조).
+    summary_extract_batch_max: int = 10
+    # **메시지당 신규 리뷰 상한.** 이 수가 최악 처리시간의 배치 항을 정하고, 그것이 폴
+    # 간격과 묶여 있다. 계약에서 ``ReviewSummaryRequest.newReviews`` 의 ``max_length``
+    # 가 이 값을 쓴다 -- 상한이 없으면 인기 상품의 디바운스 배치 60건이 최악 976초가 되어
+    # 폴 간격 900초를 넘기고, 넘기면 브로커가 멤버를 빼고 컨슈머 태스크가 죽는다.
+    summary_max_new_reviews: int = 40
+    summary_scopes_per_message: int = 2
+    # 리뷰 본문 절단. 올리면 추출 입력 토큰이 그만큼 오른다.
+    # 리뷰 최대 길이는 백엔드 ReviewConstraints.CONTENT_MAX = 1000 이다.
+    summary_content_chars: int = 400
+    # 임계 넷. 비용으로는 차이가 없고(미달이면 모델을 안 부른다) **거짓 일반화 위험으로만**
+    # 정해야 한다. 리뷰 2건으로 "반복되는 장점"을 적는 것이 이 값들이 막는 것이다.
+    summary_min_reviews: int = 10
+    summary_min_segment_reviews: int = 8
+    summary_min_aspect_mentions: int = 3
+    summary_min_aspect_share: float = 0.10
+    # 요약 몫의 일 예산. daily_cost_alert_usd 안의 몫이고 경보는 어느 기능이 태웠는지
+    # 말해 주지 않는다 -- 기능별 경보 분리는 아직 없다.
+    summary_daily_budget_usd: float = 2.0
+    # 기본 꺼짐. enable_triage 선례 -- 구현하고 측정하고 기본은 끈다.
+    enable_review_summary: bool = False
+
     # 예산 경보. 프로세스 로컬이라 강제력이 없다.
     # 실제 상한은 워크스페이스 spend limit이 걸고, 이 값은 경보용이다.
     daily_cost_alert_usd: float = 5.0
@@ -93,6 +133,39 @@ class Settings(BaseSettings):
     # 커밋 안 된 오프셋이 재배달되고 같은 상품을 전액 재검수한다.
     # worst_case_handle_seconds()보다 넓게 두고, 테스트가 그 관계를 지킨다.
     kafka_max_poll_interval_ms: int = 600_000
+
+    # 요약은 **전용 토픽과 전용 컨슈머 그룹**이다. 기존 검수 토픽에 새 eventType 을 흘리면
+    # runner._REQUEST_TYPES 가 모르는 종류를 경고 후 그대로 커밋해 **영구히 버린다** --
+    # 구버전 AI 가 배포돼 있으면 배포 순서가 데이터 손실을 만든다. 신규 토픽은 컨슈머가
+    # 없으면 메시지가 기다린다.
+    kafka_summary_request_topic: str = "aechak.summary.requests"
+    kafka_summary_result_topic: str = "aechak.summary.results"
+    kafka_summary_group_id: str = "aechak-ai-summarizer"
+    # 검수 폴 간격과 **따로** 둔다. 섞으면 요약 쪽 상한을 올릴 때 검수 리밸런스가 흔들린다.
+    kafka_summary_max_poll_interval_ms: int = 900_000
+
+    # 발행 본문 상한. aiokafka 기본값과 같은 수를 **설정으로 올려 둔다** -- 기본값에 기대면
+    # 발행 전 크기 검사가 보는 상한과 프로듀서가 거부하는 상한이 갈라진다.
+    #
+    # 계약 상한을 꽉 채운 요약 결과가 이 안에 드는지를 테스트가 단언한다. 결과 쪽을 넘기는
+    # 레버는 둘이고(``summary_scopes_per_message``·``summary_max_new_reviews``) 운영에서
+    # 설정 한 줄을 올리면 발행이 터진다 -- 그 실패는 재배달로 풀리지 않는다.
+    kafka_max_request_size: int = 1_048_576
+    # 브로커의 ``max.message.bytes``. **이 값을 넘는 발행 상한을 기동에서 거부한다.**
+    #
+    # 앞 판은 ``SummaryBlocked`` 안내문이 사람에게 "상한도 같이 올려야 한다"고 **권했다.**
+    # 권한 대로 5MiB 로 올리면 우리 쪽 사전 검사는 영구히 안 걸리고 브로커가 1MiB 에서
+    # 거부한다. 그 실패는 ``MessageSizeTooLargeError`` 가 아니라 브로커 응답이라 **전건이**
+    # 재시도 경로로 갔고, 요약 쪽 결함 하나가 같은 프로세스의 검수까지 교체로 멈췄다.
+    # 두 수의 관계를 설정에 적어 두고 어긋나면 기동하지 않는다 -- 운영에서 브로커 쪽을
+    # 먼저 올렸으면 이 값을 함께 올려야 한다.
+    kafka_broker_max_message_bytes: int = 1_048_576
+    # 수신 본문 상한. 요청을 발행하는 쪽은 백엔드이므로 **요청 크기는 이쪽 상한에 걸린다.**
+    # ``summary_content_chars`` 가 그 레버다(리뷰 본문이 메시지에 그대로 실린다).
+    kafka_max_partition_fetch_bytes: int = 1_048_576
+    # 결과 발행을 몇 번까지 다시 쏘는가. **모델 호출을 다시 태우지 않고 발행만 다시 쏜다.**
+    kafka_publish_attempts: int = 3
+    kafka_publish_retry_seconds: float = 2.0
 
     prompt_version: str = "inspection-v1"
 
@@ -116,13 +189,74 @@ class Settings(BaseSettings):
         triage = self.triage_timeout_seconds if self.enable_triage else 0.0
         return triage + judge + tail
 
+    def summary_worst_case_handle_seconds(self) -> float:
+        """요약 메시지 한 건의 최악 wall clock. **검수 예산과 섞지 않는다.**
+
+        검수의 ``worst_case_handle_seconds()`` 는 ``tests/test_runner.py`` 가 검수 폴
+        간격과의 관계를 단언한다. 요약을 거기 더하면 요약 상한을 올릴 때 검수 컨슈머의
+        리밸런스 여유가 조용히 줄어든다. 그래서 식도 폴 간격도 따로 둔다.
+
+        **상한만 올리고 폴 간격을 빠뜨리는 것이 이 레포가 실제로 밟은 함정이다.**
+        추출 배치 수와 스코프 수를 올리면 이 값이 커지고, 폴 간격이 좁으면 테스트가 떨어진다.
+
+        **배치를 1회로 가정했던 것이 틀렸다.** ``service`` 는 리뷰 수에 비례해 배치를
+        만들고(``env.batches``) ``newReviews`` 에는 상한이 없었다. 실제 최악은
+        ``한 호출 x (배치 수 + 스코프 수)`` 이고 리뷰 60건이면 976초로 폴 간격 900초를
+        넘긴다. 인기 상품의 디바운스 배치가 60건이 되는 것은 평범하다. 그래서 식을
+        실제 배치 수로 바꾸고 리뷰 수에 상한을 걸었다 -- 둘 다 해야 관계가 닫힌다.
+        """
+        one_call = 2 * self.summary_timeout_seconds + JUDGE_RETRY_DELAY_SECONDS
+        batches = math.ceil(self.summary_max_new_reviews / max(1, self.summary_extract_batch_max))
+        # 발행 재시도도 wall clock 이다. 빠뜨리면 발행 재시도를 늘리는 변경이 폴 간격을
+        # 조용히 먹는다 -- 이 함수가 존재하는 이유가 바로 그 종류의 누락이다.
+        publish = max(0, self.kafka_publish_attempts - 1) * self.kafka_publish_retry_seconds
+        return one_call * (batches + self.summary_scopes_per_message) + publish
+
+    @model_validator(mode="after")
+    def _new_review_limit_matches_contract(self) -> Settings:
+        """계약의 ``newReviews`` 상한과 같아야 한다. **어긋나면 기동하지 않는다.**
+
+        계약은 ``app.settings`` 를 import 하지 않는다(스키마가 설정에 의존하면 백엔드와
+        공유하는 모양이 환경에 흔들린다). 그래서 사본을 두고 테스트가 표류를 막았는데, 그
+        단언이 **기본값에서만** 성립했다 -- 환경 변수로 이 레버를 올리면 CI 는 통과하고
+        운영에서는 요청마다 ``ValidationError`` 가 나 그 파티션이 영구히 막힌다. 토픽이
+        1파티션이면 전 상품 요약 정지이고, 막힌 파티션으로는 설계상 헬스를 내리지 않으므로
+        아무도 깨지 않는다. 사본을 지우는 쪽이 아니라 **어긋남을 기동에서 잡는 쪽**으로 닫는다.
+        """
+        from app.schemas.summary import _MAX_NEW_REVIEWS
+
+        if self.summary_max_new_reviews != _MAX_NEW_REVIEWS:
+            raise ValueError(
+                f"summary_max_new_reviews={self.summary_max_new_reviews} 가 계약 상한 "
+                f"{_MAX_NEW_REVIEWS} 와 다르다. 계약(app/schemas/summary.py)의 max_length 를 "
+                "함께 올려야 하고, 그것은 백엔드와 맞출 변경이다"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _publish_limit_fits_broker(self) -> Settings:
+        if self.kafka_max_request_size > self.kafka_broker_max_message_bytes:
+            raise ValueError(
+                f"kafka_max_request_size={self.kafka_max_request_size} 가 브로커 상한 "
+                f"kafka_broker_max_message_bytes={self.kafka_broker_max_message_bytes} 보다 크다. "
+                "우리 쪽 사전 검사가 통과하고 브로커가 거부하면 그 실패는 재배달로 풀리지 않는다"
+            )
+        return self
+
     def model_ids(self) -> tuple[str, ...]:
-        """설정에 적힌 모델 ID 전부. 부팅에서 가격표와 맞춰 보는 데 쓴다."""
+        """설정에 적힌 모델 ID 전부. 부팅에서 가격표와 맞춰 보는 데 쓴다.
+
+        요약 모델을 **반드시** 넣는다. 안 넣으면 ``validate_pricing`` 의 부팅 검증을 받지
+        못하고, 모델 ID 를 오타 내도 ``_FALLBACK_PRICING (15.0, 75.0)`` 으로 조용히 15배
+        비싸게 계상된다.
+        """
         return (
             self.screening_model,
             self.escalation_model,
             self.notice_model,
             self.triage_model,
+            self.summary_extract_model,
+            self.summary_narrate_model,
         )
 
 
