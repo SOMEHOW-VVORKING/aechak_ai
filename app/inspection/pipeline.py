@@ -112,7 +112,8 @@ class InspectionPipeline:
             )
 
         if self._llm is None:
-            # stub 모드. 레포 골격과 왕복을 검증할 때 쓴다
+            # stub 모드. 레포 골격과 왕복을 검증할 때 쓴다.
+            # 검사한 관점이 하나도 없으므로 통과로 답하지 않는다 — 아래 집계와 같은 규칙이다.
             perspectives.append(
                 PerspectiveResult(
                     perspective=Perspective.ALL,
@@ -122,7 +123,7 @@ class InspectionPipeline:
             )
             return self._finalize(
                 request,
-                verdict=Verdict.PASS if not rule_result.hits else Verdict.FLAG,
+                verdict=Verdict.FAILED,
                 perspectives=perspectives,
                 violations=violations,
                 calls=calls,
@@ -140,8 +141,18 @@ class InspectionPipeline:
             violations.extend(found)
 
         # N2 — 집계. 3상태 OR이고 코드가 판정한다.
+        #
+        # 모델 관점이 하나도 응답하지 못했으면 통과가 아니라 판정 실패다. 통과로 적으면
+        # 아무도 보지 않은 상품이 검수를 통과한 것으로 기록되고, 백엔드는 통과를 받으면
+        # 숨겨 둔 상품의 노출을 되돌린다. 레이트 리밋이나 예산 소진이 곧 무검수 노출이 된다.
+        # 관점 하나만 실패한 경우는 다른 관점이 실제로 봤으므로 통과로 둔다.
         model_violations = [v for v in violations if v.perspective is not Perspective.RULE]
-        verdict = Verdict.FLAG if model_violations else Verdict.PASS
+        checked = [
+            p
+            for p in perspectives
+            if p.perspective is not Perspective.RULE and p.outcome is not PerspectiveOutcome.UNCHECKED
+        ]
+        verdict = Verdict.FLAG if model_violations else (Verdict.PASS if checked else Verdict.FAILED)
         seller_notice: str | None = None
 
         if verdict is Verdict.FLAG:
