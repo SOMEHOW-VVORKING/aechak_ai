@@ -1,0 +1,606 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>애착 검수 데모 콘솔</title>
+<!-- 빈 파비콘. 두지 않으면 브라우저가 /favicon.ico 를 찾아 404 를 콘솔에 남긴다 -->
+<link rel="icon" href="data:," />
+<!--
+  자체완결 한 장이다. 외부 스크립트도 폰트도 CDN도 쓰지 않는다.
+  이 파일은 demo/ 안에 있고 Dockerfile 이 app 과 prompts 만 COPY 하므로 운영 이미지에 없다.
+-->
+<style>
+  :root {
+    --bg: #11131a; --panel: #181b24; --panel-2: #1f2330; --line: #2c3141;
+    --text: #e6e8ef; --muted: #99a0b3; --accent: #6ea8fe;
+    --ran: #6ea8fe; --skipped: #e8b339; --failed: #f2655c; --idle: #5c6478;
+    --clear: #45c08a; --unchecked: #8d93a6; --violation: #f2655c;
+    /* 캐시 축과 모의 경고 전용. 통과·미검사 색과 겹치지 않게 따로 둔다. */
+    --cache: #6ea8fe; --warn: #e0a243;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 ui-sans-serif, system-ui, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  }
+  header { padding: 18px 22px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0 0 4px; font-size: 17px; letter-spacing: -0.2px; }
+  header p { margin: 0; color: var(--muted); font-size: 12.5px; }
+  main { display: grid; grid-template-columns: 340px 1fr; gap: 0; align-items: start; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  #controls { padding: 18px; border-right: 1px solid var(--line); position: sticky; top: 0; }
+  #results { padding: 18px 22px 60px; min-width: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 22px 0 8px; }
+  h2:first-child { margin-top: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input[type=text], textarea, select {
+    width: 100%; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; font: inherit; font-size: 13px;
+  }
+  textarea { min-height: 86px; resize: vertical; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 7px 11px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0d1017; font-weight: 600; }
+  button.scenario { display: block; width: 100%; text-align: left; margin-bottom: 6px; }
+  button.scenario.on { border-color: var(--accent); background: #1b2434; }
+  button.scenario small { display: block; color: var(--muted); font-size: 11.5px; }
+  .modes { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px; border-radius: 999px;
+    padding: 1px 9px; font-size: 11.5px; border: 1px solid var(--line); white-space: nowrap;
+  }
+  .pill.ran { color: var(--ran); border-color: var(--ran); }
+  .pill.skipped { color: var(--skipped); border-color: var(--skipped); border-style: dashed; }
+  .pill.failed { color: var(--failed); border-color: var(--failed); }
+  .pill.not_reached { color: var(--idle); border-color: var(--idle); }
+  .pill.CLEAR { color: var(--clear); border-color: var(--clear); }
+  .pill.UNCHECKED { color: var(--unchecked); border-color: var(--unchecked); border-style: dashed; }
+  .pill.VIOLATION { color: var(--violation); border-color: var(--violation); }
+  /* 캐시 축 전용. 결과 축과 색 어휘가 겹치지 않게 정보성 파랑과 중립 테두리로 둔다. */
+  .pill.cache-hit { color: var(--cache); border-color: var(--cache); }
+  .pill.cache-miss { color: var(--muted); border-color: var(--line); }
+  .pill.simulated { color: var(--warn); border-color: var(--warn); }
+  /* 이름을 .warn 으로 두면 아래 .warn(단계 상세용, --skipped 색)과 겹쳐 뒤가 이긴다. */
+  .simulated-note { margin: 6px 0 0; font-size: 12.5px; color: var(--warn); }
+  .exit { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .exit .badge {
+    font-size: 15px; font-weight: 700; padding: 5px 12px; border-radius: 8px;
+    background: #22283a; border: 1px solid var(--accent); color: var(--text);
+  }
+  .exit .verdict { font-size: 13px; color: var(--muted); }
+  .gate.ok { color: var(--clear); }
+  .gate.bad { color: var(--failed); }
+  .stage { border-top: 1px solid var(--line); padding: 10px 0; display: grid; grid-template-columns: 150px 1fr; gap: 12px; }
+  .stage:first-child { border-top: 0; }
+  .stage .name { font-weight: 600; font-size: 13px; }
+  .stage .name span { display: block; color: var(--muted); font-weight: 400; font-size: 11.5px; }
+  .stage .pills { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+  .stage .why { color: var(--muted); font-size: 12.5px; }
+  .stage .why b { color: var(--text); font-weight: 600; }
+  .stage.not_reached { opacity: 0.55; }
+  .finding { border-left: 2px solid var(--line); padding: 4px 0 4px 9px; margin-top: 6px; font-size: 12.5px; }
+  .finding.dropped { border-left-color: var(--skipped); }
+  .finding q { color: var(--text); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: right; padding: 5px 7px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  tfoot td { font-weight: 700; border-bottom: 0; }
+  .wrap { overflow-x: auto; }
+  pre {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 11px; overflow-x: auto; font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-all;
+  }
+  .body-text { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 11px; white-space: pre-wrap; font-size: 13px; }
+  mark { background: #4a2a2a; color: #ffd9d4; border-bottom: 1px solid var(--violation); border-radius: 2px; padding: 0 1px; }
+  .redaction { color: var(--skipped); }
+  .note { color: var(--muted); font-size: 12.5px; }
+  .warn { color: var(--skipped); font-size: 12.5px; }
+  ul.compact { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 12.5px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>애착 검수 데모 콘솔 <span class="note">SCRUM-290</span></h1>
+  <p>
+    상품 정보나 리뷰가 N0 규칙부터 N5 확정까지 어디를 지나는지 단계별로 본다.
+    기본 모드는 모델을 부르지 않는 재생이다. 어드민 검수 화면은 이쪽 범위가 아니다(SCRUM-283).
+  </p>
+</header>
+
+<main>
+  <section id="controls">
+    <h2>모드</h2>
+    <div class="panel">
+      <div class="modes">
+        <button id="mode-replay" class="primary" data-mode="replay">재생 (카세트)</button>
+        <button id="mode-mock" data-mode="mock">모의 (내 문장)</button>
+        <button id="mode-live" data-mode="live">라이브</button>
+        <button id="mode-verdict" data-mode="verdict">저장된 판정</button>
+      </div>
+      <p class="note" id="mode-note"></p>
+    </div>
+
+    <div id="panel-replay">
+      <h2>시나리오</h2>
+      <div class="panel" id="scenario-list"></div>
+    </div>
+
+    <div id="panel-custom" class="hidden">
+      <h2>입력</h2>
+      <div class="panel">
+        <label for="target">대상</label>
+        <select id="target">
+          <option value="PRODUCT">상품</option>
+          <option value="REVIEW">리뷰</option>
+        </select>
+        <div id="product-fields">
+          <label for="productName">상품명</label>
+          <input id="productName" type="text" value="관절 영양제" />
+          <label for="description">상품 설명</label>
+          <textarea id="description">관절염 치료에 효과가 있습니다. 2주 만에 완치됩니다.</textarea>
+          <label for="optionNames">옵션 (쉼표로 구분)</label>
+          <input id="optionNames" type="text" value="소형견 / 60정" />
+        </div>
+        <div id="review-fields" class="hidden">
+          <label for="content">리뷰 내용</label>
+          <textarea id="content">이거 먹고 우리 아이 관절염이 나았어요.</textarea>
+          <label for="rating">별점</label>
+          <input id="rating" type="text" value="5" />
+        </div>
+        <label for="categoryPath">카테고리 (&gt; 로 구분)</label>
+        <input id="categoryPath" type="text" value="강아지 > 건강관리 > 영양제" />
+        <label><input type="checkbox" id="enableTriage" /> 선별(N0.5) 켜기
+          <small id="triage-default">운영 기본값: 꺼짐</small></label>
+      </div>
+    </div>
+
+    <div id="panel-verdict" class="hidden">
+      <h2>기록된 판정</h2>
+      <div class="panel">
+        <label for="sample">표본</label>
+        <select id="sample"></select>
+        <p class="note">
+          판정 메시지 하나만으로 다시 그린다. 모양은 되살아나지만 이유는 상당 부분 남지 않는다.
+        </p>
+      </div>
+    </div>
+
+    <button id="run" class="primary" style="width:100%; padding:9px;">돌린다</button>
+    <p class="note" id="status"></p>
+  </section>
+
+  <section id="results">
+    <p class="note" id="empty">왼쪽에서 시나리오를 고르고 돌려라.</p>
+    <div id="out" class="hidden"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const state = { mode: "replay", scenario: null, meta: null };
+
+const $ = (id) => document.getElementById(id);
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+}
+
+function pill(cls, text) {
+  return el("span", "pill " + cls, text);
+}
+
+function money(micro, krw) {
+  return micro.toLocaleString() + " uUSD (" + krw.toFixed(2) + "원)";
+}
+
+async function boot() {
+  const meta = await (await fetch("/api/scenarios")).json();
+  state.meta = meta;
+  const list = $("scenario-list");
+  meta.scenarios.forEach((s) => {
+    const button = el("button", "scenario");
+    button.appendChild(el("strong", null, s.title));
+    button.appendChild(el("small", null, s.note));
+    button.onclick = () => {
+      state.scenario = s.id;
+      [...list.children].forEach((c) => c.classList.remove("on"));
+      button.classList.add("on");
+    };
+    list.appendChild(button);
+  });
+  if (meta.scenarios.length) list.children[0].click();
+
+  // 선별 체크박스를 **운영 기본값**으로 맞춘다. 하드코딩으로 켜 두면 발표를 보는 사람이
+  // 선별 통과를 현재 배포된 동작으로 이해한다 -- 실제 배포는 꺼져 있어 전건이 Sonnet 두
+  // 관점을 탄다. 켜서 보여 주려면 사람이 직접 켜는 것이 사실에 맞다.
+  $("enableTriage").checked = Boolean(meta.defaults.enableTriage);
+  $("triage-default").textContent =
+    "운영 기본값: " + (meta.defaults.enableTriage ? "켜짐" : "꺼짐");
+
+  const sample = $("sample");
+  meta.samples.forEach((name) => sample.appendChild(el("option", null, name)));
+  if (!meta.liveAvailable) {
+    $("mode-live").disabled = true;
+    $("mode-live").title = "AECHAK_AI_ANTHROPIC_API_KEY 가 없다";
+  }
+  setMode("replay");
+}
+
+function setMode(mode) {
+  state.mode = mode;
+  ["replay", "mock", "live", "verdict"].forEach((m) => {
+    $("mode-" + m).classList.toggle("primary", m === mode);
+  });
+  $("panel-replay").classList.toggle("hidden", mode !== "replay");
+  $("panel-custom").classList.toggle("hidden", mode !== "mock" && mode !== "live");
+  $("panel-verdict").classList.toggle("hidden", mode !== "verdict");
+  const notes = {
+    replay: "기록된 호출 응답으로 파이프라인을 그대로 돌린다. 모델을 부르지 않고 비용이 0이다.",
+    mock: "키워드 표로 답하는 모의 판정기다. 모델이 아니고, 비용과 토큰은 글자 수에서 뽑은 추정값이다.",
+    live: "실제 모델을 부른다. 돈이 든다. 키가 있을 때만 켜진다.",
+    verdict: "저장된 판정 JSON 한 건을 추적 없이 다시 그린다.",
+  };
+  $("mode-note").textContent = notes[mode];
+}
+
+["replay", "mock", "live", "verdict"].forEach((m) => {
+  $("mode-" + m).onclick = () => setMode(m);
+});
+
+$("target").onchange = () => {
+  const product = $("target").value === "PRODUCT";
+  $("product-fields").classList.toggle("hidden", !product);
+  $("review-fields").classList.toggle("hidden", product);
+};
+
+$("run").onclick = async () => {
+  $("status").textContent = "돌리는 중...";
+  try {
+    const response = state.mode === "verdict" ? await postVerdict() : await postInspect();
+    const data = await response.json();
+    if (!response.ok || data.error) {
+      $("status").textContent = "오류: " + (data.error || response.status);
+      return;
+    }
+    $("status").textContent = "";
+    render(data.view, data.verdict);
+  } catch (error) {
+    $("status").textContent = "오류: " + error;
+  }
+};
+
+function postVerdict() {
+  return fetch("/api/verdict", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sample: $("sample").value }),
+  });
+}
+
+function postInspect() {
+  const body = {
+    mode: state.mode,
+    scenario: state.scenario,
+    target: $("target").value,
+    productName: $("productName").value,
+    description: $("description").value,
+    optionNames: $("optionNames").value.split(",").map((s) => s.trim()).filter(Boolean),
+    categoryPath: $("categoryPath").value.split(">").map((s) => s.trim()).filter(Boolean),
+    content: $("content").value,
+    rating: Number($("rating").value) || 5,
+    enableTriage: $("enableTriage").checked,
+  };
+  return fetch("/api/inspect", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+function section(title) {
+  const wrap = el("div");
+  wrap.appendChild(el("h2", null, title));
+  const panel = el("div", "panel");
+  wrap.appendChild(panel);
+  return [wrap, panel];
+}
+
+function render(view, verdict) {
+  $("empty").classList.add("hidden");
+  const out = $("out");
+  out.classList.remove("hidden");
+  out.textContent = "";
+
+  out.appendChild(renderHead(view));
+  out.appendChild(renderStages(view));
+  if (view.rule_hits.length || view.redacted !== null) out.appendChild(renderRules(view));
+  if (view.violations.length || view.seller_notice) out.appendChild(renderViolations(view));
+  out.appendChild(renderLedger(view));
+  if (!view.trace_available) out.appendChild(renderMissing(view));
+  out.appendChild(renderRaw(verdict));
+}
+
+function renderHead(view) {
+  const [wrap, panel] = section("탈출 지점");
+  const row = el("div", "exit");
+  row.appendChild(el("span", "badge", view.exit_label));
+  row.appendChild(el("span", "verdict", "판정 " + view.verdict_label + " (" + view.verdict + ")"));
+  row.appendChild(pill(view.critic_overturned ? "VIOLATION" : "not_reached",
+    "criticOverturned " + view.critic_overturned));
+  panel.appendChild(row);
+  panel.appendChild(el("p", "note", view.exit_note));
+
+  // 모의 모드에서는 판정 자체가 추정이다. 그 경고가 머리줄에 없으면 사람이 자기 문장을
+  // 넣어 본 결과가 "이 시스템은 이것을 이렇게 판정한다"로 읽힌다.
+  if (view.judgment_simulated) {
+    row.appendChild(pill("simulated", "모의 판정"));
+    panel.appendChild(el("p", "simulated-note", view.simulated_note));
+  }
+
+  const applies = view.backend_gate_applies;
+  // 모의 모드에서는 게이트 배지를 중립색으로 내린다. 키워드 표가 낸 판정에 초록 "관리자
+  // 확인 없이 상태가 바뀐다"를 띄우면 그 문장이 실제 동작으로 읽힌다.
+  const tone = !applies || view.judgment_simulated ? "" : view.backend_accepts ? "ok" : "bad";
+  const gate = el("p", "gate " + tone);
+  gate.textContent = (!applies
+    ? "백엔드 게이트 해당 없음"
+    : view.backend_accepts ? "백엔드 게이트 통과" : "백엔드 게이트 불통과")
+    + (view.judgment_simulated ? " (모의 판정 기준)" : "")
+    + " - " + view.backend_note;
+  panel.appendChild(gate);
+
+  const meta = el("p", "note");
+  meta.textContent = [
+    "모드 " + view.mode + " / 입력 " + view.source,
+    "대상 " + view.target + " #" + view.target_ref,
+    "promptVersion " + view.prompt_version,
+    view.trace_available ? "추적 있음" : "추적 없음(얕은 재생)",
+  ].join("  |  ");
+  panel.appendChild(meta);
+  return wrap;
+}
+
+function renderStages(view) {
+  const [wrap, panel] = section("단계");
+  const legend = el("div", "legend");
+  legend.appendChild(el("span", null, "상태:"));
+  [["ran", "돌았다"], ["skipped", "건너뜀"], ["failed", "걸림"], ["not_reached", "도달하지 않음"]]
+    .forEach(([c, t]) => legend.appendChild(pill(c, t)));
+  legend.appendChild(el("span", null, "  결과:"));
+  [["CLEAR", "통과"], ["UNCHECKED", "미검사"], ["VIOLATION", "위반"]]
+    .forEach(([c, t]) => legend.appendChild(pill(c, t)));
+  panel.appendChild(legend);
+  panel.appendChild(el("p", "note", "통과와 미검사는 색과 라벨 양쪽으로 가른다. 미검사는 아무도 보지 않았다는 뜻이다."));
+
+  view.stages.forEach((stage) => {
+    const row = el("div", "stage " + stage.status.toLowerCase());
+    const name = el("div", "name", stage.label);
+    name.appendChild(el("span", null, stage.stage));
+    row.appendChild(name);
+
+    const body = el("div");
+    const pills = el("div", "pills");
+    pills.appendChild(pill(stage.status.toLowerCase(), stage.status_label));
+    if (stage.outcome) pills.appendChild(pill(stage.outcome, stage.outcome_label + " (" + stage.outcome + ")"));
+    if (stage.decision) pills.appendChild(pill("ran", stage.decision));
+    if (stage.cost_micro_usd !== null && stage.cost_micro_usd !== undefined) {
+      pills.appendChild(pill("not_reached", stage.latency_ms + "ms / " + stage.cost_micro_usd + "uUSD"));
+    }
+    if (stage.model_id) pills.appendChild(pill("not_reached", stage.model_id));
+    body.appendChild(pills);
+
+    if (stage.skip_reason) {
+      const why = el("div", "why");
+      why.appendChild(el("b", null, "사유 " + stage.skip_reason + " "));
+      why.appendChild(document.createTextNode(stage.skip_reason_label || ""));
+      body.appendChild(why);
+    }
+    if (stage.reason) body.appendChild(el("div", "why", stage.reason));
+    if (stage.detail) body.appendChild(el("div", "warn", "상세: " + stage.detail));
+    if (stage.checked !== null && stage.checked !== undefined) {
+      body.appendChild(el("div", "why", "쏜 관점 " + stage.dispatched + "건 중 판정 " + stage.checked + "건"));
+    }
+    if (stage.evidence_dropped) {
+      body.appendChild(el("div", "warn", "인용 검증으로 버린 판정 " + stage.evidence_dropped + "건"));
+    }
+    (stage.findings || []).forEach((f) => {
+      const item = el("div", "finding" + (f.verified ? "" : " dropped"));
+      item.appendChild(el("b", null, f.category + " "));
+      const quote = el("q", null, f.quote);
+      item.appendChild(quote);
+      item.appendChild(el("div", "note", (f.reason || "") + " / " + f.verified_label));
+      if (f.suggestion) item.appendChild(el("div", "note", "제안: " + f.suggestion));
+      body.appendChild(item);
+    });
+    (stage.rewrites || []).forEach((r) => {
+      const item = el("div", "finding");
+      item.appendChild(el("div", "note", "원문: " + r.original));
+      item.appendChild(el("div", null, "제안: " + r.suggestion));
+      body.appendChild(item);
+    });
+    if (stage.note) body.appendChild(el("div", "note", stage.note));
+    row.appendChild(body);
+    panel.appendChild(row);
+  });
+  return wrap;
+}
+
+function renderRules(view) {
+  const [wrap, panel] = section("규칙 단계와 가린 본문");
+  if (view.rule_hits.length) {
+    const table = el("table");
+    const head = el("tr");
+    ["분류", "적중 문자열", "사유", "강도", "구간"].forEach((h) => head.appendChild(el("th", null, h)));
+    const thead = el("thead");
+    thead.appendChild(head);
+    table.appendChild(thead);
+    const tbody = el("tbody");
+    view.rule_hits.forEach((hit) => {
+      const tr = el("tr");
+      tr.appendChild(el("td", null, hit.category));
+      tr.appendChild(el("td", null, hit.quote));
+      tr.appendChild(el("td", null, hit.reason));
+      const strength = el("td");
+      strength.appendChild(pill(hit.blocking ? "failed" : "skipped", hit.blocking_label));
+      tr.appendChild(strength);
+      tr.appendChild(el("td", null, hit.span_start === null ? "-" : hit.span_start + ".." + hit.span_end));
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    const scroll = el("div", "wrap");
+    scroll.appendChild(table);
+    panel.appendChild(scroll);
+  } else {
+    panel.appendChild(el("p", "note", "규칙 적중 없음."));
+  }
+
+  if (view.redacted !== null) {
+    panel.appendChild(el("h2", null, "모델에 보낸 본문 (가림 적용)"));
+    panel.appendChild(highlighted(view));
+    panel.appendChild(el("p", "note",
+      "위반 구간은 이 가린 본문 기준 오프셋이다. 원문에 찍으면 엉뚱한 구간을 가리킨다."));
+  }
+  return wrap;
+}
+
+function highlighted(view) {
+  const box = el("div", "body-text");
+  const spans = view.violations
+    .filter((v) => v.span_start !== null && v.span_end !== null && !v.from_rule)
+    .sort((a, b) => a.span_start - b.span_start);
+  let cursor = 0;
+  const text = view.redacted || "";
+  spans.forEach((span) => {
+    if (span.span_start < cursor) return;
+    box.appendChild(document.createTextNode(text.slice(cursor, span.span_start)));
+    const mark = el("mark", null, text.slice(span.span_start, span.span_end));
+    mark.title = span.category + " / " + span.perspective;
+    box.appendChild(mark);
+    cursor = span.span_end;
+  });
+  box.appendChild(document.createTextNode(text.slice(cursor)));
+  return box;
+}
+
+function renderViolations(view) {
+  const [wrap, panel] = section("걸린 구절과 수정 문구");
+  view.violations.forEach((v) => {
+    const item = el("div", "finding");
+    item.appendChild(pill(v.from_rule ? "failed" : "VIOLATION", v.category + " / " + v.perspective));
+    item.appendChild(el("div", null, v.quote || "(인용 없음)"));
+    if (v.suggestion) item.appendChild(el("div", "note", "제안: " + v.suggestion));
+    panel.appendChild(item);
+  });
+  if (view.seller_notice) {
+    panel.appendChild(el("h2", null, "셀러 안내 (sellerNotice)"));
+    panel.appendChild(el("div", "body-text", view.seller_notice));
+  } else {
+    panel.appendChild(el("p", "note", "셀러 안내 없음. 리뷰이거나 보류가 아니면 만들지 않는다."));
+  }
+  return wrap;
+}
+
+function renderLedger(view) {
+  const [wrap, panel] = section("호출 원장");
+  const ledger = view.ledger;
+  if (!ledger.calls.length) {
+    panel.appendChild(el("p", "note", "모델 호출 0회. 비용도 지연도 0이다."));
+    return wrap;
+  }
+  const table = el("table");
+  const thead = el("thead");
+  const head = el("tr");
+  ["관점", "모델", "입력", "캐시읽기", "캐시쓰기", "출력", "비용(uUSD)", "원", "지연(ms)", "결과", "캐시"]
+    .forEach((h) => head.appendChild(el("th", null, h)));
+  thead.appendChild(head);
+  table.appendChild(thead);
+  const tbody = el("tbody");
+  ledger.calls.forEach((call) => {
+    const tr = el("tr");
+    tr.appendChild(el("td", null, call.perspective));
+    tr.appendChild(el("td", null, call.model_id));
+    tr.appendChild(el("td", null, call.input_tokens.toLocaleString()));
+    tr.appendChild(el("td", null, call.cache_read_input_tokens.toLocaleString()));
+    tr.appendChild(el("td", null, call.cache_creation_input_tokens.toLocaleString()));
+    tr.appendChild(el("td", null, call.output_tokens.toLocaleString()));
+    tr.appendChild(el("td", null, call.cost_micro_usd.toLocaleString()));
+    tr.appendChild(el("td", null, call.cost_krw.toFixed(2)));
+    tr.appendChild(el("td", null, call.latency_ms.toLocaleString()));
+    const outcome = el("td");
+    outcome.appendChild(pill(call.outcome === "SUCCESS" ? "ran" : "failed", call.outcome_label));
+    tr.appendChild(outcome);
+    const cache = el("td");
+    // 결과 축(CLEAR/UNCHECKED)의 색 클래스를 돌려 쓰지 않는다. 선별 캐시는 Haiku 최소
+    // 접두부 미달로 **항상** 미적중이라, 같은 색을 쓰면 선별 시나리오마다 한 화면에
+    // "미검사(회색 점선)"와 "미적중(회색 점선)"이 같이 선다.
+    cache.appendChild(pill(call.cache_hit ? "cache-hit" : "cache-miss", call.cache_hit ? "적중" : "미적중"));
+    tr.appendChild(cache);
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  const tfoot = el("tfoot");
+  const foot = el("tr");
+  foot.appendChild(el("td", null, "합계"));
+  foot.appendChild(el("td", null, ledger.calls.length + "회"));
+  foot.appendChild(el("td", null, ledger.total_input_tokens.toLocaleString()));
+  foot.appendChild(el("td", null, ledger.total_cache_read_tokens.toLocaleString()));
+  foot.appendChild(el("td", null, ""));
+  foot.appendChild(el("td", null, ledger.total_output_tokens.toLocaleString()));
+  foot.appendChild(el("td", null, ledger.total_cost_micro_usd.toLocaleString()));
+  foot.appendChild(el("td", null, ledger.total_cost_krw.toFixed(2)));
+  foot.appendChild(el("td", null, ledger.total_latency_ms.toLocaleString()));
+  foot.appendChild(el("td", null, ""));
+  foot.appendChild(el("td", null, ledger.cache_hits + "/" + ledger.calls.length));
+  tfoot.appendChild(foot);
+  table.appendChild(tfoot);
+  const scroll = el("div", "wrap");
+  scroll.appendChild(table);
+  panel.appendChild(scroll);
+
+  const triage = el("p", "note");
+  triage.textContent = "선별만 비용 " + money(ledger.triage_cost_micro_usd, ledger.triage_cost_krw)
+    + " / 건당 합계 " + money(ledger.total_cost_micro_usd, ledger.total_cost_krw)
+    + "  |  선별 캐시는 Haiku 최소 접두부(4,096토큰) 미달로 적중하지 않는다.";
+  panel.appendChild(triage);
+  if (view.mode === "mock") {
+    panel.appendChild(el("p", "warn",
+      "모의 모드의 토큰과 비용은 글자 수에서 뽑은 추정값이다. 실측은 harness --count-tokens 가 한다."));
+  }
+  return wrap;
+}
+
+function renderMissing(view) {
+  const [wrap, panel] = section("판정만으로는 알 수 없는 것");
+  panel.appendChild(el("p", "note",
+    "추적 없이 다시 그렸다. 아래는 판정 계약에 자리가 없어 되살릴 수 없는 것들이다."));
+  const list = el("ul", "compact");
+  view.missing_without_trace.forEach((item) => list.appendChild(el("li", null, item)));
+  panel.appendChild(list);
+  return wrap;
+}
+
+function renderRaw(verdict) {
+  const wrap = el("div");
+  const details = el("details");
+  details.appendChild(el("summary", null, "백엔드로 나가는 판정 메시지 (ContentVerdict)"));
+  details.appendChild(el("pre", null, JSON.stringify(verdict, null, 2)));
+  wrap.appendChild(details);
+  return wrap;
+}
+
+boot();
+</script>
+</body>
+</html>
