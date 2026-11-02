@@ -37,6 +37,10 @@
 4번의 한계를 적어 둔다: ``*`` 구간이 본문 맨 앞이나 맨 끝이면 앞뒤 맥락 한쪽이 없어
 판정하지 않는다. **제거가 아니라 완화다.**
 
+같은 게이트가 ``petMention.breedLabel`` 에도 걸린다. 그 dict 는 ``quote`` 하나만 본문과
+대조하는데, **인용이 검증됐다는 사실은 같은 dict 의 다른 자유 텍스트를 보증하지 않는다** --
+본문에 없는 연락처를 품종으로 적어 보내면 그것이 구조화된 결과에 그대로 실렸다.
+
 ## 극성 교차검사 — 코드가 할 수 있는 유일한 극성 방어
 
 극성 오분류(단점 언급을 장점으로 적음)가 "부정 리뷰 누락"을 **직접** 만든다. 코드가 의미를
@@ -182,6 +186,10 @@ def verify_batch(
     모델이 보고하지 않은 리뷰는 **결과에 빠진다.** 호출부가 그것을 ``UNEXTRACTED``로
     적는다 -- 여기서 빈 ``VerifiedReview``를 만들어 돌려주면 "모델이 봤고 항목이 없었다"와
     "모델이 그 리뷰를 아예 언급하지 않았다"가 같은 모양이 된다.
+
+    **리뷰당 엔트리 하나다.** 추출 툴의 ``strict`` 스키마는 ``reviewId`` 유일성을 정의하지
+    않으므로 모델이 같은 리뷰를 여러 행으로 돌려줄 수 있다. 호출부가 리뷰 ID 로 접기 때문에
+    여기서 합치지 않으면 마지막 행이 앞의 모든 검증 결과를 덮는다.
     """
     counts = VerifyCounts()
     by_id = {item.review_id: item for item in prepared}
@@ -190,6 +198,7 @@ def verify_batch(
         return [], counts
 
     verified: list[VerifiedReview] = []
+    index: dict[int, VerifiedReview] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -202,18 +211,34 @@ def verify_batch(
             counts.evidence_unverified += 1
             continue
 
-        entry = VerifiedReview(review_id=review_id)
+        # **같은 리뷰의 두 번째 행은 앞 엔트리에 이어 붙인다.** 새 엔트리로 돌려주면
+        # 호출부의 ``{entry.review_id: entry}`` 가 마지막 행만 남겨, 정상 행 뒤에 붙은
+        # 빈 행 하나가 그 리뷰의 검증된 항목 전부를 지운다.
+        entry = index.get(review_id)
+        if entry is None:
+            entry = VerifiedReview(review_id=review_id)
+            index[review_id] = entry
+            verified.append(entry)
+
         raw_aspects = row.get("aspects")
-        raw_aspects = raw_aspects if isinstance(raw_aspects, list) else []
-        entry.reported_anything = bool(raw_aspects)
+        if isinstance(raw_aspects, list):
+            entry.reported_anything = entry.reported_anything or bool(raw_aspects)
+        else:
+            # **빈 유효 결과로 구제하지 않는다.** 구제하면 ``reported_anything`` 이 거짓이
+            # 되어 호출부의 미검사 분기를 비켜 가고, 비정상 구조가 "분석했고 항목이
+            # 없었다"로 적힌다 -- 통과와 미검사를 섞지 않는다는 1번 불변식 위반이다.
+            entry.reported_anything = True
+            entry.drop_reasons.append("ASPECTS_NOT_LIST")
+            raw_aspects = []
 
         for item in raw_aspects:
             aspect = _verify_aspect(item, source, counts, entry.drop_reasons)
             if aspect is not None:
                 entry.aspects.append(aspect)
 
-        entry.pet_context = _verify_pet(row.get("petMention"), source, counts)
-        verified.append(entry)
+        # 먼저 검증된 펫 맥락을 유지한다. 뒤 행의 빈 ``petMention`` 이 덮지 않는다.
+        if entry.pet_context is None:
+            entry.pet_context = _verify_pet(row.get("petMention"), source, counts)
 
     return verified, counts
 
@@ -338,13 +363,26 @@ def _verify_pet(raw: object, source: PreparedReview, counts: VerifyCounts) -> Pe
         return None
 
     species = raw.get("species")
-    breed = raw.get("breedLabel")
     weight = raw.get("weightKg")
     age = raw.get("ageYears")
+
+    # **인용이 검증됐다는 사실이 같은 dict 의 다른 자유 텍스트를 보증하지 않는다.**
+    # ``breedLabel`` 은 모델이 쓴 자유 텍스트이고 ``aspectLabel`` 과 같은 자리에 선다 --
+    # 같은 게이트를 건다. 떨어지면 라벨만 비우고 검증된 나머지(인용·체중·나이)는 남긴다.
+    raw_breed = raw.get("breedLabel")
+    breed = raw_breed.strip() if isinstance(raw_breed, str) and raw_breed.strip() else None
+    if breed is not None:
+        gate = _label_gate(breed, source.model_text)
+        if gate is not None:
+            counts.label_rejected += 1
+            if gate == "LABEL_RESTORES_MASK":
+                counts.mask_restored += 1
+            breed = None
+
     return PetContext(
         source=PetSource.BODY_INFERRED,
         species=species if species in ("DOG", "CAT") else None,
-        breedLabel=breed if isinstance(breed, str) and breed.strip() else None,
+        breedLabel=breed,
         # 0 을 "0kg"으로 받지 않는다. 툴이 nullable 을 못 받아 미기재를 0 으로 싣기 때문이다.
         weightKg=float(weight) if isinstance(weight, int | float) and weight > 0 else None,
         ageYears=int(age) if isinstance(age, int) and age > 0 else None,

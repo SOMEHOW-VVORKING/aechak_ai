@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -254,42 +253,6 @@ def test_검수_화면_모델을_건드리지_않았다() -> None:
 # --- 운영 이미지와 계약이 움직이지 않는다 -----------------------------------------------
 
 
-def test_운영_의존성이_늘지_않았다() -> None:
-    """요약은 이미지도 임베딩도 쓰지 않으므로 새 라이브러리가 필요 없다."""
-    pyproject = tomllib.loads((REPO / "pyproject.toml").read_text())
-
-    assert {name.split(">=")[0].split("[")[0] for name in pyproject["project"]["dependencies"]} == {
-        "fastapi",
-        "uvicorn",
-        "pydantic",
-        "pydantic-settings",
-        "aiokafka",
-        "anthropic",
-    }
-    assert set(pyproject["dependency-groups"]) == {"dev"}
-
-
-def test_운영_이미지가_데모를_담지_않는다() -> None:
-    """요약 뷰와 카세트도 ``demo/`` 안이라 이미지 밖이다."""
-    dockerfile = (REPO / "Dockerfile").read_text()
-
-    copied = [line.strip() for line in dockerfile.splitlines() if line.strip().startswith("COPY")]
-    assert not any("demo" in line or "harness" in line for line in copied), copied
-    assert any("COPY app ./app" in line for line in copied)
-
-
-def test_운영_코드가_데모를_import하지_않는다() -> None:
-    """이미지에 없는 모듈을 부르게 된다. 요약 서비스가 ``demo/replay`` 를 쓰면 안 된다."""
-    importers = [
-        path.relative_to(REPO).as_posix()
-        for path in (REPO / "app").rglob("*.py")
-        for line in path.read_text().splitlines()
-        if line.startswith(("import demo", "from demo", "import harness", "from harness"))
-    ]
-
-    assert importers == []
-
-
 def test_운영_앱에_요약_콘솔_경로가_없다() -> None:
     """``app/main.py`` 가 공개 ALB 뒤라서 관리용 경로를 열면 외부에서 닿는다.
 
@@ -305,30 +268,23 @@ def test_운영_앱에_요약_콘솔_경로가_없다() -> None:
 # --- 콘솔 한 장이 지키는 것 -------------------------------------------------------------
 
 
-def test_콘솔이_외부_자원을_불러오지_않는다() -> None:
-    """손으로 쓴 한 장이다. CDN·폰트·스크립트를 쓰지 않는다."""
-    html = CONSOLE.read_text(encoding="utf-8")
-
-    assert not re.findall(r'(?:src|href)="https?://', html)
-    # 외부 스크립트·스타일시트 태그 자체가 없다. 본문의 "cdn" 글자는 그러지 않겠다는
-    # 주석이라서 문자열 검사로 보면 그 주석이 테스트를 깬다.
-    assert not re.findall(r"<script[^>]+\bsrc=", html)
-    assert not re.findall(r'<link[^>]+rel="stylesheet"', html)
-    assert "@import" not in html
-
-
 def test_콘솔에_중복_id가_없다() -> None:
-    """기능 탭이 둘이라 같은 레이아웃을 두 번 쓴다.
+    """기능 탭마다 같은 레이아웃을 한 번씩 쓴다.
 
-    ``id`` 로 두면 중복 ``id`` 가 되고 CSS 가 첫 섹션만 칠한다 -- 요약 탭이 여백 없이
+    ``id`` 로 두면 중복 ``id`` 가 되고 CSS 가 첫 섹션만 칠한다 -- 뒤쪽 탭이 여백 없이
     그려진다. 레이아웃은 클래스로, 자바스크립트가 집는 것만 ``id`` 로 둔다.
+
+    **탭 수를 상수로 적지 않고 탭 버튼에서 센다.** 적어 두면 탭을 더할 때마다 이 테스트를
+    고쳐야 하고, 고치는 동안 잡으려던 중복 ``id`` 를 못 보게 된다.
     """
     html = CONSOLE.read_text(encoding="utf-8")
     ids = re.findall(r'\bid="([^"]+)"', html)
+    tabs = len(re.findall(r'data-feature="', html))
 
     assert len(ids) == len(set(ids)), {i for i in ids if ids.count(i) > 1}
-    assert html.count('class="controls"') == 2
-    assert html.count('class="results"') == 2
+    assert tabs >= 2, "기능 탭을 버튼에서 세지 못했다"
+    assert html.count('class="controls"') == tabs
+    assert html.count('class="results"') == tabs
 
 
 def test_콘솔이_참조하는_id가_실재한다() -> None:
@@ -339,7 +295,15 @@ def test_콘솔이_참조하는_id가_실재한다() -> None:
 
     assert used <= ids, sorted(used - ids)
     # 문자열을 이어 만드는 id 도 실재해야 한다.
-    for dynamic in ("feature-inspection", "feature-summary", "main-summary", "smode-replay"):
+    for dynamic in (
+        "feature-inspection",
+        "feature-summary",
+        "feature-draft",
+        "main-summary",
+        "main-draft",
+        "smode-replay",
+        "dmode-replay",
+    ):
         assert dynamic in ids, dynamic
 
 

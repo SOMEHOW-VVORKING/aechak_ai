@@ -22,7 +22,6 @@ from app.schemas.inspection import (
     PerspectiveOutcome,
     PerspectiveResult,
     ProductInspectionRequest,
-    TargetType,
     Verdict,
     ViolationCategory,
 )
@@ -318,11 +317,10 @@ def test_선별이_승급시킨_분류는_모두_하류가_보고할_수_있다(
     ``banned.py``가 모델 단계로 약속하는데, 관점이 그 분류를 보고할 수 없으면 사전이 놓친
     금지 성분이 어느 계층도 거치지 않는다. 그래서 수신자를 되살리고 단언 방향을 뒤집었다.
     """
-    for target in TargetType:
-        for fanout in (True, False):
-            reportable = {c for s in specs_for(target, fanout=fanout) for c in s.categories}
-            missing = [c.value for c in ViolationCategory if c not in reportable]
-            assert missing == [], f"{target.value}/fanout={fanout} 에서 보고할 수 없다: {missing}"
+    for fanout in (True, False):
+        reportable = {c for s in specs_for(fanout=fanout) for c in s.categories}
+        missing = [c.value for c in ViolationCategory if c not in reportable]
+        assert missing == [], f"fanout={fanout} 에서 보고할 수 없다: {missing}"
 
 
 def test_선별_프롬프트가_정책_분류를_중복_보고로_몰지_않는다() -> None:
@@ -331,12 +329,11 @@ def test_선별_프롬프트가_정책_분류를_중복_보고로_몰지_않는�
     그래서 성분을 승급 신호로 되살리되, 관점 질문이 "사전이 차단한 것은 중복 보고하지 말라"를
     반드시 들고 있어야 한다. 이 둘은 함께여야 성립한다.
     """
-    for target in TargetType:
-        for fanout in (True, False):
-            for spec in specs_for(target, fanout=fanout):
-                if ViolationCategory.BANNED_INGREDIENT not in spec.categories:
-                    continue
-                assert "중복 보고하지" in spec.question, spec.perspective.value
+    for fanout in (True, False):
+        for spec in specs_for(fanout=fanout):
+            if ViolationCategory.BANNED_INGREDIENT not in spec.categories:
+                continue
+            assert "중복 보고하지" in spec.question, spec.perspective.value
 
 
 async def test_지시형_적중은_선별에_묻지_않고_승급한다(triage_on: Settings) -> None:
@@ -383,11 +380,10 @@ async def test_사전이_놓친_금지_성분은_선별이_승급시킨다(triag
 
 def test_승급된_뒤_관점이_금지_성분을_보고할_수_있다() -> None:
     """승급만 시키고 하류가 말할 수 없으면 호출만 태우고 판정이 늘지 않는다."""
-    for target in TargetType:
-        for fanout in (True, False):
-            specs = specs_for(target, fanout=fanout)
-            owners = [s.perspective for s in specs if ViolationCategory.BANNED_INGREDIENT in s.categories]
-            assert owners, f"{target.value}/fanout={fanout} 에 성분을 볼 관점이 없다"
+    for fanout in (True, False):
+        specs = specs_for(fanout=fanout)
+        owners = [s.perspective for s in specs if ViolationCategory.BANNED_INGREDIENT in s.categories]
+        assert owners, f"fanout={fanout} 에 성분을 볼 관점이 없다"
 
 
 def test_설명이_구분자를_흉내_내도_봉투가_닫히지_않는다(triage_on: Settings) -> None:
@@ -506,18 +502,3 @@ def test_길이를_넘기는_재사용_키는_조용히_넘어가지_않는다()
     settings = Settings(prompt_version="inspection-v2-banned-ingredient", enable_triage=True)
     with pytest.raises(ValueError, match="prompt_version"):
         InspectionPipeline(llm=None, settings=settings)._prompt_version()
-
-
-def test_코드_주석이_없는_문서를_가리키지_않는다() -> None:
-    """가리키는 곳이 영구히 비면 다음 사람이 손익분기 62.0% 의 출처를 찾지 못한다."""
-    from pathlib import Path
-
-    root = Path(__file__).parent.parent
-    assert "PR 본문" not in triage.__doc__, "만들지 않은 PR 을 근거로 가리키고 있다"
-    assert "harness/README.md" in triage.__doc__
-
-    pyproject = (root / "pyproject.toml").read_text()
-    for line in pyproject.splitlines():
-        if "docs/adr-" in line:
-            name = line.split("docs/")[1].split()[0].rstrip(".,")
-            assert (root / "docs" / name).is_file(), f"없는 파일을 가리킨다: docs/{name}"

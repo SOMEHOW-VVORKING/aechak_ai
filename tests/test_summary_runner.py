@@ -69,13 +69,43 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "requestId": "rs-1",
         "productId": 42,
         "categoryPath": ["강아지", "사료", "건식사료"],
-        "totalVisibleReviews": 12,
         "newReviews": [],
         "requestedScopes": [{"scope": "PRODUCT", "segmentKey": None, "basisReviewCount": 12, "tally": []}],
         "schemaVersion": 1,
     }
     base.update(overrides)
     return base
+
+
+def test_읽지_않는_입력_키를_백엔드가_보내도_거부하지_않는다() -> None:
+    """요청 계약에서 필드 넷을 뺐다. **배포 순서가 메시지를 버리게 하면 안 된다.**
+
+    ``hasPhoto``·``createdAt``·``totalVisibleReviews``·``ratingBuckets`` 는 요약 판정·봉투·
+    서술이 한 번도 읽지 않았고(실제 분모는 ``RequestedScope.basisReviewCount`` 다) 그래서
+    지웠다. 백엔드가 아직 보내는 동안 ``extra="forbid"`` 였다면 전건 ``ValidationError`` 이고,
+    러너는 그것을 경고 후 커밋해 영구히 버린다.
+    """
+    from app.schemas.summary import ReviewSummaryRequest
+
+    request = ReviewSummaryRequest.model_validate(
+        _payload(
+            totalVisibleReviews=12,
+            ratingBuckets=[{"rating": 5, "count": 9}],
+            newReviews=[
+                {
+                    "reviewId": 1,
+                    "rating": 5,
+                    "content": "잘 먹어요",
+                    "hasPhoto": True,
+                    "createdAt": "2026-10-28T00:00:00Z",
+                }
+            ],
+        )
+    )
+
+    assert [review.reviewId for review in request.newReviews] == [1]
+    assert not hasattr(request, "totalVisibleReviews")
+    assert not hasattr(request.newReviews[0], "hasPhoto")
 
 
 async def test_결과를_전용_토픽에_발행한다(settings: Settings) -> None:
@@ -500,9 +530,10 @@ async def test_발행_실패가_그_파티션을_영구히_막지_않는다(sett
     """**머리글이 "커밋하지 않는 경우는 둘뿐"이라 적었지만 사실이 아니었다.**
 
     ``send_and_wait`` 이 ``handle()`` 안이라 발행 실패가 계약 불일치와 같은 분기로 떨어져
-    그 파티션을 **영구히** 막았다. 토픽이 1파티션이면 전 상품의 요약이 멈추고, ``/health``
-    는 검수만 보므로 아무도 깨지 않는다. 발행 실패는 코드를 고쳐야 풀리는 상태가 아니라
-    재배달로 풀리는 상태다 -- 루프를 세우고 커밋하지 않는 쪽이 사실에 맞다.
+    그 파티션을 **영구히** 막았다. 브로커가 안 되는 상황은 요청 토픽의 세 파티션에 똑같이
+    오므로 결과는 전 상품의 요약 정지이고, ``/health`` 는 검수만 보므로 아무도 깨지 않는다.
+    발행 실패는 코드를 고쳐야 풀리는 상태가 아니라 재배달로 풀리는 상태다 -- 루프를 세우고
+    커밋하지 않는 쪽이 사실에 맞다.
     """
     topic = settings.kafka_summary_request_topic
     consumer = _RecordingConsumer(
@@ -589,7 +620,7 @@ async def test_계약_상한을_꽉_채운_결과가_발행_상한_안에_든다
     상한을 넘긴다(실측). 그 관계가 테스트에 없으면 설정 한 줄을 올린 배포에서 요약이
     멈추고, 멈춘 것을 아무도 모른다.
     """
-    from harness.run_summary import worst_case_result_bytes
+    from app.review_summary.budget import worst_case_result_bytes
 
     settings = Settings()
     worst = worst_case_result_bytes(settings)
@@ -598,6 +629,36 @@ async def test_계약_상한을_꽉_채운_결과가_발행_상한_안에_든다
         f"계약 상한을 꽉 채운 결과가 {worst}B 로 발행 상한 "
         f"{settings.kafka_max_request_size}B 를 넘는다. 상한을 올렸으면 "
         "max_request_size 도 같이 올려야 한다"
+    )
+
+
+async def test_발행_상한이_가장_긴_세그먼트_키를_센다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**상한이 상한이려면 세그먼트 키를 생성기에서 받아야 한다.**
+
+    ``"DOG_10_25"``(9자)가 글자로 박혀 있었고 실제 최장은 ``"DOG:DOG_UNDER_5"``(15자)라
+    스코프마다 6바이트를 덜 셌다. 체급을 하나 더하면 같은 자리가 다시 어긋나는데, 이 함수는
+    유료 호출 **전에** 발행 상한을 가르는 문이라서 덜 센 값은 "다 과금한 뒤 커밋되지 않는"
+    경로를 다시 연다(모듈 머리글의 그 결함이다).
+
+    키를 늘렸을 때 바이트가 따라 늘어나는지를 본다 -- 늘지 않으면 누군가 다시 박은 것이다.
+    """
+    from app.review_summary import budget, selection
+
+    settings = Settings()
+    budget._assembled_bytes.cache_clear()
+    base = budget.worst_case_result_bytes(settings)
+
+    longest = max(selection.all_segment_keys(), key=len)
+    monkeypatch.setattr(selection, "all_segment_keys", lambda: [longest + "_XL"])
+    budget._assembled_bytes.cache_clear()
+    try:
+        grown = budget.worst_case_result_bytes(settings)
+    finally:
+        budget._assembled_bytes.cache_clear()
+
+    assert grown > base, (
+        f"세그먼트 키를 3자 늘렸는데 발행 상한이 {base}B 에서 움직이지 않았다. "
+        "``budget._assembled_bytes`` 가 키를 글자로 박아 두면 상한이 상한이 아니다"
     )
 
 
@@ -785,9 +846,10 @@ async def test_리뷰_상한을_계약_위로_올리면_기동이_거부된다()
 
     계약의 ``_MAX_NEW_REVIEWS`` 가 40 으로 하드코딩이고 ``newReviews`` 에 ``max_length`` 로
     박혀 있다. 설정만 100 으로 올리면 ``model_validate`` 가 요청마다 터지고, 그 예외는
-    ``_loop`` 의 일반 ``except`` 로 떨어져 **그 파티션을 영구히 막는다.** 토픽이 1파티션이라
-    전 상품 요약 정지이고 ``/health`` 는 설계상 UP 을 유지한다(막힌 파티션으로 상태를
-    내리지 않는다). 같음을 단언하는 테스트가 **기본값에서만** 성립했으므로 CI 는 통과했다.
+    ``_loop`` 의 일반 ``except`` 로 떨어져 **그 파티션을 영구히 막는다.** 요청마다 터지므로
+    세 파티션이 차례로 다 막혀 전 상품 요약 정지이고 ``/health`` 는 설계상 UP 을 유지한다
+    (막힌 파티션으로 상태를 내리지 않는다). 같음을 단언하는 테스트가 **기본값에서만**
+    성립했으므로 CI 는 통과했다.
     """
     import pydantic
 

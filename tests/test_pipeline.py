@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
 from conftest import FakeLlmClient, failed, ok
 
+from app.inspection import rules
 from app.inspection.pipeline import InspectionPipeline
 from app.schemas.inspection import (
     CallOutcome,
@@ -167,6 +169,37 @@ async def test_예산_소진은_재시도하지_않는다(settings: Settings) ->
     assert len(llm.calls) == 2, "예산이 없는데 다시 부르면 400을 한 번 더 받을 뿐이다"
     outcomes = {p.perspective: p for p in verdict.perspectives}
     assert outcomes[Perspective.DISPLAY_ADS].skipReason == CallOutcome.BUDGET_EXHAUSTED.value
+
+
+async def test_재시도_전_첫_호출도_원장에_남는다(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """재시도가 나면 **두 호출이 다 과금된다.** 둘째만 적으면 비용과 실패가 사라진다.
+
+    ``SCHEMA_INVALID`` 를 쓰는 이유: 토큰과 비용이 있는 응답도 그 분류로 떨어진다
+    (``llm/client.py`` 의 분류). 0원 사례에 한정된 결함이 아니다.
+    """
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    dropped = replace(
+        failed(CallOutcome.SCHEMA_INVALID),
+        call_id="call-first",
+        output_tokens=200,
+        cost_micro_usd=300,
+    )
+    llm = FakeLlmClient([dropped, ok(NO_FINDING), ok(NO_FINDING)])
+    pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+    verdict = await pipeline.run(product("글루코사민 함유"))
+
+    assert len(llm.calls) == 3
+    assert len(verdict.calls) == 3, "재시도 전 첫 호출이 원장에서 사라졌다"
+    first = next((c for c in verdict.calls if c.callId == "call-first"), None)
+    assert first is not None, "버려진 호출의 callId 가 원장에 없다"
+    assert first.outcome is CallOutcome.SCHEMA_INVALID
+    assert first.perspective is Perspective.DISPLAY_ADS, "재시도한 관점으로 적는다"
+    assert sum(c.costMicroUsd for c in verdict.calls) == 300 + 5000 + 5000
+
+
+async def _no_sleep(_seconds: float) -> None:
+    return None
 
 
 async def test_원문에_없는_인용은_판정으로_쓰지_않는다(settings: Settings) -> None:
@@ -392,3 +425,59 @@ async def test_뒤집힘_신호는_통과_판정에만_붙는다(settings: Setti
         verdict = await pipeline.run(product(quote))
 
         assert not (verdict.criticOverturned and verdict.verdict is Verdict.FLAG), verdict.verdict
+
+
+def test_자사_도메인을_접두로_단_외부_호스트는_차단된다() -> None:
+    """부정 전방탐색이 **호스트 경계를 보지 않으면** 자사 도메인이 접두사로 쓰인다.
+
+    ``aechak.co.kr.evil.example`` 의 실제 호스트는 ``evil.example`` 이고, 자사 도메인
+    예외는 그 문자열이 호스트의 **끝**일 때만 성립한다. 서브도메인 허용은 유지해야 한다.
+    """
+    outside = (
+        "자세한 건 https://aechak.co.kr.evil.example/buy 에서",
+        "자세한 건 https://aechak.co.kr-evil.example/buy 에서",
+    )
+    for text in outside:
+        categories = {h.category for h in rules.screen(text).blocking}
+        assert ViolationCategory.OFF_PLATFORM in categories, f"실제 호스트는 자사가 아니다: {text!r}"
+
+    inside = rules.screen("상세 정보는 https://shop.aechak.co.kr/p/1 참고")
+    assert inside.hits == [], "서브도메인과 경로는 그대로 통과해야 한다"
+
+
+def test_같은_규칙_적중_두_건이_서로_다른_구간을_가리킨다() -> None:
+    """구간을 원문에서 되찾을 때 **탐색 위치를 들고 가지 않으면** 둘째가 첫 구간을 가리킨다.
+
+    판정은 FLAG 로 같지만 계약에 실리는 ``spanStart``/``spanEnd`` 와 콘솔 하이라이트가
+    둘 다 첫 번째를 가리켜, 두 번째 연락처는 가려지지 않은 것처럼 보인다.
+    """
+    text = "문의 010-1234-5678 / 010-1234-5678"
+    spans = [(h.start, h.end) for h in rules.screen(text).hits if h.start is not None]
+
+    assert spans == [(3, 16), (19, 32)], "두 적중이 같은 구간을 가리킨다"
+    assert [text[s:e] for s, e in spans] == ["010-1234-5678"] * 2
+
+
+async def test_비평에_1차_판정_사유가_간다(settings: Settings) -> None:
+    """``Violation`` 은 모델이 적은 ``reason`` 을 버리고 ``suggestion`` 만 든다.
+
+    그 자리에 제안을 넣으면 라벨이 "사유"인데 값이 제안이고, 제안이 없는 건은
+    "사유: 제안 없음" 이 나간다 -- 비평이 1차 판정의 근거를 아예 못 본 채로
+    오탐 여부를 답하게 된다.
+    """
+    quote = "관절염 치료에 효과가 있습니다"
+    llm = FakeLlmClient(
+        [
+            ok(finding(quote)),
+            ok(NO_FINDING),
+            ok({"decision": "UPHOLD", "reason": "타당"}),
+            ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
+        ]
+    )
+    pipeline = InspectionPipeline(llm=llm, settings=settings)
+
+    await pipeline.run(product(quote))
+
+    sent = llm.calls[2]["user_content"][0]["text"]
+    assert "정책 위반" in sent, "비평이 1차 판정 사유를 못 본다"
+    assert "제안 없음" not in sent, "사유 자리에 제안을 넣어 거짓 라벨이 됐다"

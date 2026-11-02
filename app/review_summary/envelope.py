@@ -116,8 +116,12 @@ def dedupe_key(text: str) -> str:
     중복 접기가 막으려는 것은 **같은 문구를 여러 계정이 붙인 복붙**이고 그것은 성질상
     글자 그대로다. 그래서 공백 차이와 전각 표기만 흡수하고 나머지는 건드리지 않는다 --
     거짓 중복이 0 인 쪽을 고른다.
+
+    불가시 문자는 그 셋에 **더한다.** 글자 모양이 같은 복붙이 서로 다른 키를 받아 N건이
+    분모와 ``mentionCount`` 에 N번 들어갔다. 지우는 것은 "모양이 같은 것만 모으는" 일이라
+    위에서 ``fold()`` 를 거부한 선(숫자가 내용을 가른다)을 넘지 않는다.
     """
-    return " ".join(unicodedata.normalize("NFKC", text).split())
+    return " ".join(unicodedata.normalize("NFKC", rules.strip_invisible(text)).split())
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,15 +284,6 @@ def render_envelope(category_path: list[str], prepared: list[PreparedReview]) ->
     return "\n".join(lines)
 
 
-def envelope_escaped(text: str) -> bool:
-    """중성화되지 않은 봉투 토큰이 남아 있는가. **조각 하나**를 볼 때만 쓴다.
-
-    조립된 봉투 전문에는 정당한 토큰이 들어 있으므로 이 함수로 볼 수 없다. 전문은
-    ``envelope_wellformed()`` 로 본다.
-    """
-    return any(token in text for token in rules.ENVELOPE_TOKENS)
-
-
 def envelope_wellformed(text: str, *, review_count: int) -> bool:
     """조립된 봉투 전문에 **여분의** 봉투 토큰이 없는가.
 
@@ -336,7 +331,6 @@ __all__ = [
     "PreparedReview",
     "batches",
     "dedupe_key",
-    "envelope_escaped",
     "envelope_wellformed",
     "header_safe",
     "mask_heavy",

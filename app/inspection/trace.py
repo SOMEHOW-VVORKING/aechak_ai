@@ -103,7 +103,6 @@ class StageRecord:
     reason: str | None = None
     # 실패 상세. CallOutcome 열거만으로는 max_tokens 초과와 스키마 오류 본문이 사라진다
     detail: str | None = None
-    call_id: str | None = None
     model_id: str | None = None
     latency_ms: int | None = None
     cost_micro_usd: int | None = None
@@ -121,7 +120,6 @@ class StageRecord:
 class Trace:
     """한 건의 추적. 콘솔이 이것을 그린다."""
 
-    request_id: str = ""
     # 원문과 가린 본문을 함께 든다. ``Violation.spanStart/spanEnd`` 는 **가린 본문 기준**이라
     # 원문에 하이라이트를 찍으면 엉뚱한 구간을 가리킨다.
     text: str = ""
@@ -136,8 +134,7 @@ class TraceRecorder:
     def __init__(self) -> None:
         self.trace = Trace()
 
-    def set_input(self, *, request_id: str, text: str, redacted: str) -> None:
-        self.trace.request_id = request_id
+    def set_input(self, *, text: str, redacted: str) -> None:
         self.trace.text = text
         self.trace.redacted = redacted
 

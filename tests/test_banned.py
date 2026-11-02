@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from app.inspection.banned import BLOCKING_TERMS, find_terms, fold
+from app.inspection import rules
+from app.inspection.banned import find_terms, fold
 
 
 def canonicals(text: str) -> set[str]:
@@ -71,6 +72,19 @@ def test_카카오톡은_성분이_아니다() -> None:
     assert "카카오" in blocking("카카오 함유 쿠키")
 
 
+def test_카카오_제외_접미가_영문_표기를_눌러_버리지_않는다() -> None:
+    """``fold`` 가 ``T`` 를 ``t`` 로 내리므로 **tail 이 t 로 시작하는 표기가 전부 제외됐다.**
+
+    ``cacao tea`` 는 공백이 지워져 ``cacaotea`` 가 되고, ``cacao tree`` 는 반복 축약까지
+    겹쳐 ``cacaotre`` 가 된다. 둘 다 카카오가 들어간 제품 표기인데 적중이 0이었다.
+    메신저·금융 이름 제외는 그대로 일해야 한다.
+    """
+    assert "카카오" in blocking("cacao tea 분말 함유"), "거짓 음성이다"
+    assert "카카오" in blocking("cacao tree 추출물"), "거짓 음성이다"
+    assert "카카오" not in canonicals("카카오맵으로 찾아오세요"), "지명 서비스 제외는 유지한다"
+    assert "카카오" not in canonicals("카카오페이로 결제"), "결제 서비스 제외는 유지한다"
+
+
 def test_반려동물_상품에_정당한_성분은_차단하지_않고_기록만_한다() -> None:
     # 모델은 카테고리를 함께 보므로 위생용품의 에탄올과 간식의 알코올을 가를 수 있다.
     hits = find_terms("에탄올 함유 물티슈")
@@ -96,7 +110,32 @@ def test_같은_성분이_여러_번_나와도_한_번만_보고한다() -> None
     assert len(hits) == 1
 
 
-def test_사전_항목에_근거를_남긴다() -> None:
-    # 왜 금지인지가 코드에 없으면 다음 사람이 함부로 지운다.
-    without_note = [t.canonical for t in BLOCKING_TERMS if not t.note]
-    assert without_note == [], f"근거 없는 항목: {without_note}"
+# --- 불가시 문자: 사전은 지우지 않고, 사전을 부르는 쪽이 지운다 -----------------------------
+
+# 폭 0 공백 / 한글 필러 / 이형자 선택자. 전 범위를 훑는 단언은 ``test_summary_envelope`` 에
+# 있고(``strip_invisible`` 이 분류로 긋는 것을 거기서 고정한다), 여기서는 **이 호출 경로가
+# 그 함수를 지나는가**만 본다.
+_INVISIBLE = ("​", "ㅤ", "️")
+
+
+@pytest.mark.parametrize("char", _INVISIBLE)
+def test_불가시_문자를_끼운_성분_표기가_0단_검사에서_잡힌다(char: str) -> None:
+    """**``fold()`` 는 불가시 문자를 지우지 않는다.** 지우는 함수가 ``rules`` 에 있고 그
+    모듈이 이 모듈을 import 하므로, 여기서 부르면 순환 import 다(실행해 확인했다 --
+    양방향 모두 ``ImportError``). 그래서 **사전을 부르는 쪽**이 먼저 지운다.
+
+    머리글이 "우회 표기는 정규화로 잡는다"고 선언하는데 글자 사이에 폭 0 문자를 끼운
+    표기는 적중이 0이었다. 글자 모양이 같으므로 구매자는 ``자일리톨``을 그대로 읽는다.
+    """
+    text = f"자일리{char}톨 함유 수제 간식"
+
+    assert "자일리톨" in {h.quote for h in rules.screen(text).blocking}, (
+        f"U+{ord(char):04X} 한 글자로 금지 성분 차단이 뚫린다: fold -> {fold(text)!r}"
+    )
+
+
+def test_불가시_문자를_끼운_비차단_성분도_권고로_남는다() -> None:
+    """차단이 아니라 **기록**이 사라지는 쪽도 손실이다 -- 모델이 볼 성분 신호가 조용히 빈다."""
+    hits = {h.quote for h in rules.screen("코코​넛오일 샴푸").hits}
+
+    assert "코코넛오일" in hits, "비차단 성분 권고가 한 글자로 사라진다"

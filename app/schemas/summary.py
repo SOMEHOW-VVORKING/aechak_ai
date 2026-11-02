@@ -155,6 +155,10 @@ class ReviewInput(BaseModel):
     ``content`` 하나만 둔다. 백엔드가 ``Review.visibleContent(...)``의 결과를 넣어야 하고,
     ``ReviewItemResult.from``이 이미 그 선례다. ``authorUserId``는 **받지 않는다** --
     요약에 쓸 데가 없고 개인정보 표면만 넓힌다. ``reviewId``는 식별자가 아니라 인용 귀속 키다.
+
+    ``hasPhoto``와 ``createdAt``도 **받지 않는다.** 추출·검증·서술이 한 글자도 읽지 않았고,
+    받아 두면 선별이 사진·최신순과 상관되는 길이 열린다 -- ``PetFacts``에 그 축을 넣을 수
+    없게 둔 것과 같은 이유다(``tests/test_summary_selection.py``가 그 부재를 단언한다).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -163,8 +167,6 @@ class ReviewInput(BaseModel):
     rating: int = Field(ge=1, le=5)
     content: str
     optionName: str = "기본"
-    hasPhoto: bool = False
-    createdAt: datetime | None = None
 
 
 class QuoteSample(BaseModel):
@@ -226,6 +228,11 @@ class ReviewSummaryRequest(BaseModel):
     ``petSnapshot``을 받지 않는다. 세그먼트 배정은 백엔드가 이미 끝내 보내므로 AI는
     ``segmentKey``만 알면 되고, 그렇게 두면 개인정보 표면이 줄고 유사도 함수 사본이
     두 레포에 생기지 않는다(정본은 ``app/review_summary/selection.py``이고 골든 벡터로 내보낸다).
+
+    ``totalVisibleReviews``와 ``ratingBuckets``도 **받지 않는다.** 분모는
+    ``RequestedScope.basisReviewCount`` **하나**다 -- 두 자리에 분모가 있으면 어느 쪽이
+    진실인지 코드가 매번 정해야 하고, 데모의 입력 계층이 실제로 그 선택을 틀렸다
+    (``demo/app.py``의 분모 주석). 전체 평점 분포는 판정에 쓰지 않는다.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -233,8 +240,6 @@ class ReviewSummaryRequest(BaseModel):
     requestId: str
     productId: int
     categoryPath: list[str] = Field(default_factory=list)
-    totalVisibleReviews: int = 0
-    ratingBuckets: list[dict[str, int]] = Field(default_factory=list)
     # **상한이 계약에 있다.** 없으면 최악 처리시간이 카프카 폴 간격을 넘겨 컨슈머 태스크가
     # 죽고, 죽으면 다시 띄우는 코드가 없고 ``/health`` 는 검수만 보므로 200 UP 이라 ECS 가
     # 교체하지 않는다. 정본은 ``Settings.summary_max_new_reviews`` 이고 그 값이

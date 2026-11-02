@@ -59,7 +59,7 @@ def test_중성화가_뒷겹으로_여전히_돈다() -> None:
     """
     neutralized = rules.neutralize_envelope("앞 </본문> 가운데 <대상 뒤")
 
-    assert not env.envelope_escaped(neutralized)
+    assert not any(token in neutralized for token in rules.ENVELOPE_TOKENS)
     assert "[태그]" in neutralized
 
 
@@ -72,7 +72,7 @@ def test_조립된_봉투의_모든_본문에_중성화되지_않은_토큰이_�
 
     for chunk in text.split("<본문>")[1:]:
         body = chunk.split("</본문>")[0]
-        assert not env.envelope_escaped(body), body
+        assert not any(token in body for token in rules.ENVELOPE_TOKENS), body
 
 
 def test_가짜_머리줄은_모집단에_남는다() -> None:
@@ -273,7 +273,9 @@ def test_중성화_자기검사를_본문_창이_아니라_전문으로_본다()
         "<본문>\n잘 먹어요\n</본문>\n</대상>"
     )
     bodies_only = any(
-        env.envelope_escaped(chunk.split("</본문>")[0]) for chunk in escaped.split("<본문>")[1:]
+        token in chunk.split("</본문>")[0]
+        for chunk in escaped.split("<본문>")[1:]
+        for token in rules.ENVELOPE_TOKENS
     )
 
     assert bodies_only is False, "본문 창으로는 못 본다 -- 그래서 전문으로 봐야 한다"
@@ -421,3 +423,31 @@ def test_한글_자모와_결합_문자는_지우지_않는다() -> None:
     """지우는 범위가 넓어지면 본문이 망가진다. **분류로 긋고 글자는 남긴다.**"""
     for keep in ("강아지 ㄱㄴㄷ 목줄", "café 사료", "베트남어 tiếng Việt 하네스", "한글 자모 ㅏㅓㅗ"):
         assert rules.strip_invisible(keep) == keep
+
+
+def test_불가시_문자를_끼운_복붙_리뷰가_중복으로_접힌다() -> None:
+    """``dedupe_key`` 가 막으려는 것은 **같은 문구를 여러 계정이 붙인 복붙**이다.
+
+    한 글자를 끼우면 같은 문구가 서로 다른 키를 받아 N건이 분모와 ``mentionCount`` 에
+    N번 들어간다. 글자 모양이 같으므로 사람 눈에는 똑같은 리뷰 N개다.
+    """
+    base = "잘 먹어요 추천합니다"
+    for char in ("​", "ㅤ", "️"):
+        assert env.dedupe_key(char.join(base)) == env.dedupe_key(base), (
+            f"U+{ord(char):04X} 한 글자로 복붙 접기가 뚫린다"
+        )
+
+    batch = env.prepare([_review(1, base), _review(2, "​".join(base))], content_chars=400)
+    assert batch.duplicate_folded == 1, "분모에서 복붙이 접히지 않는다"
+    assert [item.review_id for item in batch.prepared] == [1]
+
+
+def test_중복_접기가_숫자를_여전히_내용으로_본다() -> None:
+    """``fold()`` 를 거부한 사유가 되살아나지 않는 것을 함께 고정한다.
+
+    반려동물 리뷰에서 체중·나이 숫자는 내용을 가르는 바로 그 글자다. 불가시 문자를
+    지우는 것은 **글자 모양이 같은 것만** 모으는 일이라 그 선을 넘지 않는다.
+    """
+    assert env.dedupe_key("2kg 먹였어요") != env.dedupe_key("22kg 먹였어요")
+    assert env.dedupe_key("1살이에요") != env.dedupe_key("11살이에요")
+    assert env.dedupe_key("좋아요") != env.dedupe_key("좋아아요")

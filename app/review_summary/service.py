@@ -138,8 +138,11 @@ class SummaryService:
                 continue
 
             attempted += 1
-            result = await self._extract(request, group)
-            calls.append(_usage(request.requestId, "EXTRACT", result))
+            # 재시도가 나면 두 시도가 다 과금된다. **둘 다 원장에 싣는다** -- 추출에
+            # 쓰는 것은 마지막 하나다.
+            attempts = await self._extract(request, group)
+            calls.extend(_usage(request.requestId, "EXTRACT", attempt) for attempt in attempts)
+            result = attempts[-1]
             if not result.ok:
                 extracted.extend(_unextracted(group, f"추출 호출 실패: {result.outcome.value}"))
                 self._record_extract(index, group, result, None, failed=True)
@@ -241,8 +244,7 @@ class SummaryService:
                 request, scope, new_rows, counts, unextracted_now=unextracted_now
             )
             summaries.append(summary)
-            if usage is not None:
-                calls.append(usage)
+            calls.extend(usage)
             attempted += int(did_attempt)
             succeeded += int(did_succeed)
 
@@ -265,7 +267,7 @@ class SummaryService:
 
     # --- 단계 ------------------------------------------------------------------------
 
-    async def _extract(self, request: ReviewSummaryRequest, group: list[env.PreparedReview]) -> Any:
+    async def _extract(self, request: ReviewSummaryRequest, group: list[env.PreparedReview]) -> list[Any]:
         text = env.render_envelope(request.categoryPath, group)
         if self._recorder is not None:
             self._recorder.envelope(text)
@@ -288,7 +290,7 @@ class SummaryService:
         counts: DroppedCounts,
         *,
         unextracted_now: int,
-    ) -> tuple[ScopeSummary, SummaryCallUsage | None, bool, bool]:
+    ) -> tuple[ScopeSummary, list[SummaryCallUsage], bool, bool]:
         settings = self._settings
         merged = tally_mod.from_rows(scope.tally)
 
@@ -360,7 +362,7 @@ class SummaryService:
                     ),
                     tallyFingerprint=fingerprint,
                 ),
-                None,
+                [],
                 False,
                 False,
             )
@@ -375,7 +377,7 @@ class SummaryService:
             )
             return (
                 _failed_scope(scope, unextracted, fingerprint, classified, "모델 클라이언트가 없다"),
-                None,
+                [],
                 False,
                 False,
             )
@@ -393,7 +395,7 @@ class SummaryService:
         if self._recorder is not None:
             self._recorder.tally_block(scope_label, block)
 
-        result = await self._call(
+        attempts = await self._call(
             stage="NARRATE",
             model=settings.summary_narrate_model,
             effort=settings.summary_narrate_effort,
@@ -403,7 +405,8 @@ class SummaryService:
             tool=NARRATE_TOOL,
             request_id=request.requestId,
         )
-        usage = _usage(request.requestId, "NARRATE", result)
+        usage = [_usage(request.requestId, "NARRATE", attempt) for attempt in attempts]
+        result = attempts[-1]
         if not result.ok:
             self._record_narrate(scope_label, result, None, failed=True)
             return (
@@ -453,19 +456,23 @@ class SummaryService:
             True,
         )
 
-    async def _call(self, *, stage: str, **kwargs: Any) -> Any:
-        """호출 한 번 + 조건부 재시도 1회. 예산을 한 자리에서 보이게 둔다.
+    async def _call(self, *, stage: str, **kwargs: Any) -> list[Any]:
+        """호출 한 번 + 조건부 재시도 1회. 쏜 호출을 **전부** 돌려준다.
 
         ``BUDGET_EXHAUSTED`` 와 ``TRUNCATED`` 는 다시 쏴도 같은 결과다 -- 재시도는 출력
         토큰만 한 번 더 태운다. ``pipeline._judge`` 의 조건이 선례다.
+
+        마지막 하나만 돌려주면 재시도 전 호출의 비용과 실패가 ``calls`` 에서 사라진다 --
+        하네스와 데모가 그 목록을 합산하므로 재시도가 난 건의 비용 표시가 틀어진다.
         """
         assert self._llm is not None
         result = await self._llm.call_tool(timeout_seconds=self._settings.summary_timeout_seconds, **kwargs)
         if result.ok or result.outcome in (CallOutcome.BUDGET_EXHAUSTED, CallOutcome.TRUNCATED):
-            return result
+            return [result]
         log.info("요약 %s 호출 실패. 한 번만 다시 쏜다. outcome=%s", stage, result.outcome.value)
         await asyncio.sleep(JUDGE_RETRY_DELAY_SECONDS)
-        return await self._llm.call_tool(timeout_seconds=self._settings.summary_timeout_seconds, **kwargs)
+        retried = await self._llm.call_tool(timeout_seconds=self._settings.summary_timeout_seconds, **kwargs)
+        return [result, retried]
 
     def _alert_cost(self, calls: list[SummaryCallUsage], request_id: str) -> None:
         """한 메시지가 일 예산의 눈에 띄는 몫을 태웠으면 남긴다.

@@ -208,10 +208,20 @@ def narrate(prompt: str) -> dict[str, Any]:
     return {"pros": pros, "cons": cons}
 
 
+def _subject_particle(word: str) -> str:
+    """받침이 있으면 "이", 없으면 "가". 화면에 나가는 문장이라 조사를 틀리지 않는다."""
+    if not word:
+        return "가"
+    last = word[-1]
+    if "\uac00" <= last <= "\ud7a3":
+        return "이" if (ord(last) - 0xAC00) % 28 else "가"
+    return "가"
+
+
 def _headline(name: str, polarity: str, count: int) -> str:
     """60자 이내. **효능·의료 단정을 쓰지 않는다** -- 쓰면 출력 게이트가 그 항목을 버린다."""
     tail = "좋았다는" if polarity == "PRO" else "아쉬웠다는"
-    return f"{name}이 {tail} 후기가 {count}건 있었다"[:60]
+    return f"{name}{_subject_particle(name)} {tail} 후기가 {count}건 있었다"[:60]
 
 
 def _pet(body: str) -> dict[str, Any]:

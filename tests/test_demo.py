@@ -268,8 +268,8 @@ async def test_카세트가_빠진_호출은_조용히_실패로_접히지_않�
 
 def test_관점_호출의_카세트_키가_툴_스키마에서_갈린다() -> None:
     """두 관점의 툴 이름이 같다. 분류 열거 집합이 관점의 지문이다."""
-    display, conduct = specs_for(TargetType.PRODUCT, fanout=True)
-    (single,) = specs_for(TargetType.PRODUCT, fanout=False)
+    display, conduct = specs_for(fanout=True)
+    (single,) = specs_for(fanout=False)
 
     assert cassette_key(findings_tool(display)) == ("report_findings", Perspective.DISPLAY_ADS)
     assert cassette_key(findings_tool(conduct)) == ("report_findings", Perspective.CONDUCT_TRADE)

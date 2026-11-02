@@ -95,7 +95,7 @@ class InspectionPipeline:
         request_id = f"insp-{request.inspectionId}"
         text = request.inspect_text()
         rule_result = rules.screen(text)
-        self._record_input(request_id, text, rule_result)
+        self._record_input(text, rule_result)
 
         perspectives: list[PerspectiveResult] = []
         violations: list[Violation] = []
@@ -216,7 +216,7 @@ class InspectionPipeline:
                     # 건너뛴 관점을 "선별이 깨끗하다고 해서 안 봤다"로 남긴다. 이 사유가 없으면
                     # 백엔드는 호출이 죽어서 못 본 것과 구분할 수 없어 통과를 받아들이지 못하고,
                     # 선별이 건너뛴 건을 전건 사람에게 넘긴다. 그러면 선별이 비용만 더한다.
-                    skipped = specs_for(request.target_type, fanout=self._settings.perspective_fanout)
+                    skipped = specs_for(fanout=self._settings.perspective_fanout)
                     perspectives.extend(
                         PerspectiveResult(
                             perspective=spec.perspective,
@@ -271,13 +271,23 @@ class InspectionPipeline:
         # tools -> system -> messages이고 findings_tool이 관점마다 다른 enum을 싣기 때문에
         # 두 호출의 접두부는 애초에 다르고, 캐시 엔트리도 관점별로 갈라진다.
         # 직렬로 두는 이유는 레이트 리밋 압력을 한 요청 안에서 분산하는 것 하나다.
-        specs = specs_for(request.target_type, fanout=self._settings.perspective_fanout)
+        specs = specs_for(fanout=self._settings.perspective_fanout)
+        reasons: dict[tuple[str, str], str] = {}
         for spec in specs:
-            result = await self._judge(spec, request, rule_result.redacted, request_id)
-            calls.extend(self._usage(result, request_id, perspective=spec.perspective))
+            # 재시도가 나면 두 시도가 다 과금된다. **둘 다 원장에 싣는다** -- 판정에 쓰는
+            # 것은 마지막 하나다.
+            attempts = await self._judge(spec, request, rule_result.redacted, request_id)
+            for attempt in attempts:
+                calls.extend(self._usage(attempt, request_id, perspective=spec.perspective))
+            result = attempts[-1]
             perspective_result, found, reported = self._interpret(spec, result, rule_result.redacted)
             perspectives.append(perspective_result)
             violations.extend(found)
+            # N1 이 적은 사유는 ``Violation`` 에 자리가 없어 여기서만 손에 있다. 비평이
+            # 그것을 봐야 하므로 인용별로 모아 둔다 -- 판정 계약은 건드리지 않는다.
+            for record in reported:
+                if record.reason:
+                    reasons.setdefault((record.category, record.quote), record.reason)
             self._record(
                 Stage.JUDGE,
                 StageStatus.RAN if result.ok else StageStatus.FAILED,
@@ -321,7 +331,9 @@ class InspectionPipeline:
 
         if verdict is Verdict.FLAG:
             # N3 — 반박. 셀러를 잘못 막는 비용이 커서 다른 모델에게 오탐 여부를 묻는다.
-            upheld = await self._criticize(request, model_violations, rule_result.redacted, request_id, calls)
+            upheld = await self._criticize(
+                request, model_violations, rule_result.redacted, request_id, calls, reasons
+            )
             if not upheld:
                 verdict = Verdict.PASS
                 violations = [v for v in violations if v.perspective is Perspective.RULE]
@@ -408,7 +420,12 @@ class InspectionPipeline:
         request: InspectionRequest,
         redacted: str,
         request_id: str,
-    ) -> LlmResult:
+    ) -> list[LlmResult]:
+        """쏜 호출을 **전부** 돌려준다. 마지막이 판정에 쓰는 것이다.
+
+        마지막 하나만 돌려주면 재시도 전 호출의 비용과 실패가 원장에서 사라진다 -- 하네스와
+        데모가 그 목록을 합산하므로 재시도가 난 건의 비용·실패 표시가 틀어진다.
+        """
         assert self._llm is not None
         tool = findings_tool(spec)
         system_blocks = _system_blocks()
@@ -425,13 +442,13 @@ class InspectionPipeline:
         )
         # 예산 소진과 상한 초과는 다시 쏴도 같은 결과다. 재시도는 출력 토큰만 한 번 더 태운다.
         if result.ok or result.outcome in (CallOutcome.BUDGET_EXHAUSTED, CallOutcome.TRUNCATED):
-            return result
+            return [result]
 
         # 한 번만 다시 시도한다. 두 번 넘게 매달리면 카프카 파티션이 그만큼 막히고,
         # 미검사로 기록하는 편이 안전하다. 대기 시간이 설정 모듈에 있는 이유는
         # Settings.worst_case_handle_seconds()가 같은 값을 봐야 하기 때문이다.
         await asyncio.sleep(JUDGE_RETRY_DELAY_SECONDS)
-        return await self._llm.call_tool(
+        retried = await self._llm.call_tool(
             model=self._settings.screening_model,
             effort=self._settings.screening_effort,
             max_tokens=self._settings.max_tokens_screening,
@@ -440,6 +457,7 @@ class InspectionPipeline:
             tool=tool,
             request_id=request_id,
         )
+        return [result, retried]
 
     def _interpret(
         self,
@@ -532,11 +550,17 @@ class InspectionPipeline:
         redacted: str,
         request_id: str,
         calls: list[CallUsage],
+        reasons: dict[tuple[str, str], str],
     ) -> bool:
         """위반 판정을 유지할지 묻는다. 실패하면 유지한다.
 
         실패를 통과로 읽으면 critic이 가용성 공격면이 된다. 모델을 느리게 만들거나
         레이트 리밋을 유도하는 것만으로 검수를 끌 수 있게 되기 때문이다.
+
+        ``reasons`` 는 N1 이 적은 사유다. ``Violation`` 은 그것을 버리고 ``suggestion``
+        만 들기 때문에, 그 자리에 제안을 넣으면 라벨이 "사유"인데 값이 제안이고 제안이
+        없는 건은 "제안 없음" 이 간다 -- 비평이 1차 판정의 근거를 못 본 채로 답한다.
+        판정 계약에 자리가 없어 **내부 인자**로 받는다.
         """
         if self._llm is None or not self._settings.enable_escalation:
             self._record(
@@ -549,7 +573,9 @@ class InspectionPipeline:
             return True
 
         issues = "\n".join(
-            f"- [{v.category}] 인용: {v.quote}\n  사유: {v.suggestion or '제안 없음'}" for v in violations
+            f"- [{v.category}] 인용: {v.quote}\n"
+            f"  사유: {reasons.get((str(v.category), v.quote or '')) or '사유 없음'}"
+            for v in violations
         )
         result = await self._llm.call_tool(
             model=self._settings.escalation_model,
@@ -698,14 +724,13 @@ class InspectionPipeline:
         if result is not None:
             # ``LlmResult.detail`` 은 ``CallUsage`` 로 넘어가지 않는다. 열거값만 남으면
             # max_tokens 초과와 스키마 오류 본문이 사라져 콘솔이 실패 이유를 설명할 수 없다.
-            record.call_id = result.call_id
             record.model_id = result.model_id
             record.latency_ms = result.latency_ms
             record.cost_micro_usd = result.cost_micro_usd
             record.detail = result.detail
         self._recorder.add(record)
 
-    def _record_input(self, request_id: str, text: str, rule_result: rules.RuleResult) -> None:
+    def _record_input(self, text: str, rule_result: rules.RuleResult) -> None:
         """원문·가린 본문과 규칙 적중 상세를 적는다.
 
         가린 본문을 함께 드는 이유가 중요하다. ``Violation.spanStart/spanEnd`` 는 **가린 본문
@@ -713,7 +738,7 @@ class InspectionPipeline:
         """
         if self._recorder is None:
             return
-        self._recorder.set_input(request_id=request_id, text=text, redacted=rule_result.redacted)
+        self._recorder.set_input(text=text, redacted=rule_result.redacted)
         self._recorder.set_rule_hits(
             [
                 RuleHitRecord(

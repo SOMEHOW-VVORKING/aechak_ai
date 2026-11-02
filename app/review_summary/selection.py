@@ -28,7 +28,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
 from typing import Any
@@ -329,8 +329,3 @@ def golden_vectors() -> dict[str, Any]:
             for name, viewer, reviewer in _GOLDEN_CASES
         ],
     }
-
-
-def pet_facts_field_names() -> tuple[str, ...]:
-    """``PetFacts``의 필드 이름. 테스트가 평점 축의 부재를 단언하는 데 쓴다."""
-    return tuple(f.name for f in fields(PetFacts))

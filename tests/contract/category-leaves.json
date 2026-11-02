@@ -1,0 +1,307 @@
+{
+  "note": "백엔드 V2__seed_categories.sql 의 리프(depth 3) 사본이다. 정본은 백엔드 레포이고 CI 가 그 레포를 볼 수 없어서 사본을 둔다. app/seller_draft/catalog.py 의 LEAVES 와 테스트가 대조하므로, 백엔드가 리프를 더하면 이 파일과 LEAVES 를 함께 갱신해야 한다.",
+  "source": "infra/persistence/jpa/src/main/resources/db/migration/V2__seed_categories.sql",
+  "leafCount": 50,
+  "leaves": [
+    {
+      "categoryId": 111,
+      "species": "DOG",
+      "midLabel": "사료",
+      "leafLabel": "건식사료"
+    },
+    {
+      "categoryId": 112,
+      "species": "DOG",
+      "midLabel": "사료",
+      "leafLabel": "습식/소프트사료"
+    },
+    {
+      "categoryId": 113,
+      "species": "DOG",
+      "midLabel": "사료",
+      "leafLabel": "동결건조/생식"
+    },
+    {
+      "categoryId": 114,
+      "species": "DOG",
+      "midLabel": "사료",
+      "leafLabel": "처방식사료"
+    },
+    {
+      "categoryId": 121,
+      "species": "DOG",
+      "midLabel": "간식",
+      "leafLabel": "껌/덴탈"
+    },
+    {
+      "categoryId": 122,
+      "species": "DOG",
+      "midLabel": "간식",
+      "leafLabel": "건조/수제간식"
+    },
+    {
+      "categoryId": 123,
+      "species": "DOG",
+      "midLabel": "간식",
+      "leafLabel": "캔/파우치"
+    },
+    {
+      "categoryId": 124,
+      "species": "DOG",
+      "midLabel": "간식",
+      "leafLabel": "트릿/져키"
+    },
+    {
+      "categoryId": 131,
+      "species": "DOG",
+      "midLabel": "영양제",
+      "leafLabel": "종합영양제"
+    },
+    {
+      "categoryId": 132,
+      "species": "DOG",
+      "midLabel": "영양제",
+      "leafLabel": "관절/뼈"
+    },
+    {
+      "categoryId": 133,
+      "species": "DOG",
+      "midLabel": "영양제",
+      "leafLabel": "피부/모질"
+    },
+    {
+      "categoryId": 134,
+      "species": "DOG",
+      "midLabel": "영양제",
+      "leafLabel": "유산균/장건강"
+    },
+    {
+      "categoryId": 141,
+      "species": "DOG",
+      "midLabel": "용품",
+      "leafLabel": "장난감"
+    },
+    {
+      "categoryId": 142,
+      "species": "DOG",
+      "midLabel": "용품",
+      "leafLabel": "하우스/방석"
+    },
+    {
+      "categoryId": 143,
+      "species": "DOG",
+      "midLabel": "용품",
+      "leafLabel": "훈련용품"
+    },
+    {
+      "categoryId": 151,
+      "species": "DOG",
+      "midLabel": "산책/외출",
+      "leafLabel": "하네스/가슴줄"
+    },
+    {
+      "categoryId": 152,
+      "species": "DOG",
+      "midLabel": "산책/외출",
+      "leafLabel": "목줄/리드줄"
+    },
+    {
+      "categoryId": 153,
+      "species": "DOG",
+      "midLabel": "산책/외출",
+      "leafLabel": "산책가방"
+    },
+    {
+      "categoryId": 154,
+      "species": "DOG",
+      "midLabel": "산책/외출",
+      "leafLabel": "이동장/유모차"
+    },
+    {
+      "categoryId": 161,
+      "species": "DOG",
+      "midLabel": "의류/패션",
+      "leafLabel": "상의/아우터"
+    },
+    {
+      "categoryId": 162,
+      "species": "DOG",
+      "midLabel": "의류/패션",
+      "leafLabel": "신발/양말"
+    },
+    {
+      "categoryId": 163,
+      "species": "DOG",
+      "midLabel": "의류/패션",
+      "leafLabel": "악세서리"
+    },
+    {
+      "categoryId": 211,
+      "species": "CAT",
+      "midLabel": "사료",
+      "leafLabel": "건식사료"
+    },
+    {
+      "categoryId": 212,
+      "species": "CAT",
+      "midLabel": "사료",
+      "leafLabel": "습식/파우치"
+    },
+    {
+      "categoryId": 213,
+      "species": "CAT",
+      "midLabel": "사료",
+      "leafLabel": "처방식사료"
+    },
+    {
+      "categoryId": 221,
+      "species": "CAT",
+      "midLabel": "간식",
+      "leafLabel": "츄르/캔"
+    },
+    {
+      "categoryId": 222,
+      "species": "CAT",
+      "midLabel": "간식",
+      "leafLabel": "건조간식"
+    },
+    {
+      "categoryId": 223,
+      "species": "CAT",
+      "midLabel": "간식",
+      "leafLabel": "캣닢/트릿"
+    },
+    {
+      "categoryId": 231,
+      "species": "CAT",
+      "midLabel": "영양제",
+      "leafLabel": "종합영양제"
+    },
+    {
+      "categoryId": 232,
+      "species": "CAT",
+      "midLabel": "영양제",
+      "leafLabel": "헤어볼/모질"
+    },
+    {
+      "categoryId": 233,
+      "species": "CAT",
+      "midLabel": "영양제",
+      "leafLabel": "신장/비뇨기"
+    },
+    {
+      "categoryId": 234,
+      "species": "CAT",
+      "midLabel": "영양제",
+      "leafLabel": "유산균/장건강"
+    },
+    {
+      "categoryId": 241,
+      "species": "CAT",
+      "midLabel": "용품",
+      "leafLabel": "장난감"
+    },
+    {
+      "categoryId": 242,
+      "species": "CAT",
+      "midLabel": "용품",
+      "leafLabel": "스크래처/캣타워"
+    },
+    {
+      "categoryId": 243,
+      "species": "CAT",
+      "midLabel": "용품",
+      "leafLabel": "하우스/방석"
+    },
+    {
+      "categoryId": 251,
+      "species": "CAT",
+      "midLabel": "모래/화장실",
+      "leafLabel": "고양이모래"
+    },
+    {
+      "categoryId": 252,
+      "species": "CAT",
+      "midLabel": "모래/화장실",
+      "leafLabel": "화장실"
+    },
+    {
+      "categoryId": 253,
+      "species": "CAT",
+      "midLabel": "모래/화장실",
+      "leafLabel": "모래삽/기타"
+    },
+    {
+      "categoryId": 311,
+      "species": "COMMON",
+      "midLabel": "미용/목욕",
+      "leafLabel": "샴푸/린스"
+    },
+    {
+      "categoryId": 312,
+      "species": "COMMON",
+      "midLabel": "미용/목욕",
+      "leafLabel": "미용도구/이발기"
+    },
+    {
+      "categoryId": 313,
+      "species": "COMMON",
+      "midLabel": "미용/목욕",
+      "leafLabel": "구강/덴탈케어"
+    },
+    {
+      "categoryId": 321,
+      "species": "COMMON",
+      "midLabel": "위생용품",
+      "leafLabel": "배변패드/배변판"
+    },
+    {
+      "categoryId": 322,
+      "species": "COMMON",
+      "midLabel": "위생용품",
+      "leafLabel": "탈취제/소독제"
+    },
+    {
+      "categoryId": 323,
+      "species": "COMMON",
+      "midLabel": "위생용품",
+      "leafLabel": "물티슈/티슈"
+    },
+    {
+      "categoryId": 324,
+      "species": "COMMON",
+      "midLabel": "위생용품",
+      "leafLabel": "청소/세정"
+    },
+    {
+      "categoryId": 331,
+      "species": "COMMON",
+      "midLabel": "리빙/가전",
+      "leafLabel": "식기/급식기"
+    },
+    {
+      "categoryId": 332,
+      "species": "COMMON",
+      "midLabel": "리빙/가전",
+      "leafLabel": "자동급식기"
+    },
+    {
+      "categoryId": 333,
+      "species": "COMMON",
+      "midLabel": "리빙/가전",
+      "leafLabel": "정수기/급수기"
+    },
+    {
+      "categoryId": 334,
+      "species": "COMMON",
+      "midLabel": "리빙/가전",
+      "leafLabel": "펫드라이룸"
+    },
+    {
+      "categoryId": 335,
+      "species": "COMMON",
+      "midLabel": "리빙/가전",
+      "leafLabel": "홈카메라"
+    }
+  ]
+}

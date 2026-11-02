@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.schemas.inspection import Perspective, TargetType, ViolationCategory
+from app.schemas.inspection import Perspective, ViolationCategory
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +34,8 @@ class PerspectiveSpec:
     question: str
 
 
+# 상품과 리뷰가 같이 쓴다. 리뷰도 효능을 주장할 수 있어서
+# ("이거 먹고 우리 아이 관절염 나았어요") 리뷰에서 이 관점을 빼지 않는다.
 _DISPLAY_ADS = PerspectiveSpec(
     perspective=Perspective.DISPLAY_ADS,
     categories=(
@@ -82,19 +84,19 @@ _SINGLE = PerspectiveSpec(
     ),
 )
 
-# 상품과 리뷰가 같은 두 관점을 쓴다. 리뷰도 효능을 주장할 수 있어서
-# ("이거 먹고 우리 아이 관절염 나았어요") 표시·광고 관점을 빼지 않는다.
-_BY_TARGET: dict[TargetType, tuple[PerspectiveSpec, ...]] = {
-    TargetType.PRODUCT: (_DISPLAY_ADS, _CONDUCT_TRADE),
-    TargetType.REVIEW: (_DISPLAY_ADS, _CONDUCT_TRADE),
-}
+_FANOUT: tuple[PerspectiveSpec, ...] = (_DISPLAY_ADS, _CONDUCT_TRADE)
 
 
-def specs_for(target: TargetType, *, fanout: bool) -> tuple[PerspectiveSpec, ...]:
-    """팬아웃을 끄면 단일 판정으로 되돌린다. 기준선과 비교하기 위한 스위치다."""
+def specs_for(*, fanout: bool) -> tuple[PerspectiveSpec, ...]:
+    """팬아웃을 끄면 단일 판정으로 되돌린다. 기준선과 비교하기 위한 스위치다.
+
+    대상 종류로 갈라지지 않는다. 상품과 리뷰가 같은 두 관점을 쓰고, 종류별 표를 두면
+    한쪽만 고쳐도 테스트가 그대로 녹색인 자리가 생긴다. ``TargetType`` 은 요청 계약과
+    프롬프트의 ``<대상>`` 줄이 쓰는 값으로 남는다.
+    """
     if not fanout:
         return (_SINGLE,)
-    return _BY_TARGET[target]
+    return _FANOUT
 
 
 def findings_tool(spec: PerspectiveSpec) -> dict[str, object]:

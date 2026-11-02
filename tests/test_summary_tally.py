@@ -164,8 +164,7 @@ def test_새_항목이_기존_집계에_누적된다() -> None:
         quote=QuoteSample(reviewId=99, text="하루 만에 왔어요"),
     )
 
-    row = tally.get(AspectCode.DELIVERY, Polarity.PRO)
-    assert row is not None
+    row = tally.rows[(AspectCode.DELIVERY, Polarity.PRO)]
     assert row.mentionCount == 5
     assert "배송 빠름" in row.labelSamples
 
@@ -182,8 +181,7 @@ def test_표본이_상한을_넘지_않는다() -> None:
             quote=QuoteSample(reviewId=index, text=f"인용 {index}"),
         )
 
-    row = tally.get(AspectCode.PRICE, Polarity.PRO)
-    assert row is not None
+    row = tally.rows[(AspectCode.PRICE, Polarity.PRO)]
     assert row.mentionCount == 20
     assert len(row.labelSamples) == tally_mod.LABEL_SAMPLES_MAX
     assert len(row.quoteSamples) == tally_mod.QUOTE_SAMPLES_MAX
@@ -198,8 +196,7 @@ def test_같은_키가_두_번_와도_셈이_사라지지_않는다() -> None:
         ]
     )
 
-    row = tally.get(AspectCode.PRICE, Polarity.PRO)
-    assert row is not None
+    row = tally.rows[(AspectCode.PRICE, Polarity.PRO)]
     assert row.mentionCount == 7
 
 

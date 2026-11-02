@@ -48,6 +48,12 @@ def fold(text: str) -> str:
     호환 분해로 전각·동형문자를 모으고, 소문자로 내리고, 구분 기호를 지우고,
     같은 글자 반복을 한 번으로 줄인다. 반복 축약을 사전에도 적용하므로
     ``coffee``가 ``cofe``가 되어도 양쪽이 같이 변해 매칭이 유지된다.
+
+    **불가시 문자는 지우지 않는다.** 지우는 함수(``rules.strip_invisible``)가 이 모듈을
+    import 하는 쪽에 있어 여기서 부르면 순환 import 다(양방향 모두 ``ImportError``).
+    그래서 **사람이 쓴 텍스트를 판정에 넘기는 호출자가 먼저 지운다** -- ``rules.screen``과
+    ``seller_draft.claims`` 의 두 입구다. 품목 신호(``seller_draft.catalog``)는 지우지
+    않는다. 거기서 적중이 줄면 품목 미확정이 되어 초안을 **건너뛰므로** 안전한 방향이다.
     """
     folded = unicodedata.normalize("NFKC", text).lower().translate(_HOMOGLYPHS)
     return _REPEATS.sub(r"\1", _SEPARATORS.sub("", folded))
@@ -85,7 +91,6 @@ BLOCKING_TERMS: tuple[BannedTerm, ...] = (
         (
             "xylitol",
             "자작나무설탕",
-            "자작나무 설탕",
             "birch sugar",
             "birch sap",
             "birch bark extract",
@@ -104,7 +109,12 @@ BLOCKING_TERMS: tuple[BannedTerm, ...] = (
         ("cacao",),
         # 메신저·금융 서비스 이름과 글자가 겹친다. 거르지 않으면 "카카오톡으로 문의"가
         # 금지 성분으로 기록된다 — 어차피 연락처 규칙이 차단하지만 분류가 틀린다.
-        deny_suffix=("톡", "페이", "뱅크", "맵", "T", "모빌리티", "엔터"),
+        #
+        # ``T`` 는 뺐다. ``fold`` 가 소문자로 내리므로 **tail 이 t 로 시작하는 표기가
+        # 전부 제외됐고**, ``cacao tea``·``cacao tree`` 가 적중 0이 됐다. 대가로
+        # ``카카오T`` 가 성분으로 걸릴 수 있다 -- 반려동물 상품·리뷰에서 그 언급보다
+        # 영문 표기의 거짓 음성이 비싸다고 보아 이쪽을 택했다.
+        deny_suffix=("톡", "페이", "뱅크", "맵", "모빌리티", "엔터"),
         note="초콜릿과 같은 메틸잔틴 원료",
     ),
     BannedTerm(
@@ -142,9 +152,7 @@ ADVISORY_TERMS: tuple[BannedTerm, ...] = (
         "알코올", ("alcohol", "에탄올", "ethanol", "주정"), blocking=False, note="위생용품에 정당하게 쓰인다"
     ),
     BannedTerm("아보카도", ("avocado",), blocking=False, note="개·고양이에게는 ASPCA가 명시하지 않는다"),
-    BannedTerm(
-        "코코넛오일", ("coconut oil", "코코넛 오일"), blocking=False, note="반려동물 샴푸·간식에 흔하다"
-    ),
+    BannedTerm("코코넛오일", ("coconut oil",), blocking=False, note="반려동물 샴푸·간식에 흔하다"),
     BannedTerm(
         "우유",
         ("milk", "유제품"),
@@ -209,7 +217,6 @@ class TermHit:
     """
 
     term: BannedTerm
-    matched_form: str
 
 
 def find_terms(text: str) -> list[TermHit]:
@@ -227,7 +234,7 @@ def find_terms(text: str) -> list[TermHit]:
         deny = term.folded_deny()
         for form in term.folded_forms():
             if _matches(folded, form, deny):
-                hits.append(TermHit(term, form))
+                hits.append(TermHit(term))
                 break
     return hits
 

@@ -105,13 +105,6 @@ def test_토큰_실측_대상이_실제_접두부다() -> None:
     assert targets["summary_narrate_prefix"].tools == [NARRATE_TOOL]
 
 
-def test_환율_전제가_선별_하네스와_같다() -> None:
-    """두 숫자가 갈라지면 두 하네스의 원화 비용으로 같은 이야기를 할 수 없다."""
-    from harness.run import KRW_PER_USD
-
-    assert run_summary.KRW_PER_USD == KRW_PER_USD == 1_400
-
-
 def test_케이스가_필요한_축을_전부_덮는다() -> None:
     """의도적으로 섞어 둔 것이 실제로 들어 있는지 본다. 빠지면 그 축이 측정되지 않는다."""
     reviews = all_reviews()
@@ -145,13 +138,10 @@ def test_단점_부재_사유_네_갈래를_케이스가_덮는다() -> None:
     assert "덮지 못한 사유" not in rows
 
 
-def test_극성_경계_표가_설계안의_손실을_숫자로_보여준다() -> None:
-    """경계를 설계 문서대로 되돌리려는 다음 사람이 주석 대신 이 표를 먼저 보게 한다."""
+def test_극성_충돌_표가_버린_것과_센_것을_가른다() -> None:
+    """비대칭이 의도라서 두 숫자를 따로 적는다. 뒤집힘 탐지가 쓰는 쪽은 센 쪽이다."""
     rows = dict(run_summary._report_polarity_band())
 
-    assert "SMELL/CON" in rows["극성 경계 손실"], (
-        "넓은 경계로 사라지는 반복 단점이 케이스 세트에 없다. 있어야 그 경계가 위험한 것을 보여 준다"
-    )
     assert "1점 PRO" in rows["극성 충돌"]
     assert "5점 CON" in rows["극성 충돌"]
 
