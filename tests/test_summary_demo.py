@@ -228,13 +228,16 @@ def test_환율_사본을_또_만들지_않았다() -> None:
 
 
 def test_검수_화면_모델을_건드리지_않았다() -> None:
-    """``demo/view.py`` 는 검수 6단계 전용이다. 값을 더하면 검수 화면이 흔들린다."""
+    """``demo/view.py`` 는 검수 5단계 전용이다. 값을 더하면 검수 화면이 흔들린다.
+
+    ``N3_CRITIC`` 이 빠진 자리를 메우지 않았다. 번호가 ``Stage`` 값이고 콘솔·테스트의
+    키라서, 뜻이 같은 재배열이 그 사본들을 전부 흔든다.
+    """
     assert [stage.value for stage, _ in view.CANONICAL_STAGES] == [
         "N0_RULE",
         "N0_5_TRIAGE",
         "N1_JUDGE",
         "N2_AGGREGATE",
-        "N3_CRITIC",
         "N4_NOTICE",
     ]
     assert [stage.value for stage, _ in summary_view.CANONICAL_SUMMARY_STAGES] == [

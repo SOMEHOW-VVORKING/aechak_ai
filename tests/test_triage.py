@@ -195,7 +195,7 @@ async def test_선별_사용량은_전용_관점으로_적힌다(triage_on: Sett
     assert triage_calls, "선별 호출이 원장에 없으면 비용과 승급률을 모두 못 센다"
     for call in triage_calls:
         assert call.perspective is Perspective.TRIAGE, (
-            "ALL로 적으면 원장에서 비평·수정문구와 한 덩어리가 된다"
+            "ALL로 적으면 원장에서 수정문구 호출과 한 덩어리가 된다"
         )
 
 
@@ -502,3 +502,210 @@ def test_길이를_넘기는_재사용_키는_조용히_넘어가지_않는다()
     settings = Settings(prompt_version="inspection-v2-banned-ingredient", enable_triage=True)
     with pytest.raises(ValueError, match="prompt_version"):
         InspectionPipeline(llm=None, settings=settings)._prompt_version()
+
+
+# --- 확정 위반(CERTAIN_VIOLATION) ----------------------------------------------
+#
+# 이 블록이 지키는 것은 하나다. **확정은 증거 두 조각이 있을 때만 성립하고, 성립하지 않으면
+# 승급으로 떨어진다.** 확정이 열거에 들어오면서 파이프라인 불변식 2가 좁아졌으므로
+# (성공한 인젝션이 보류 방향으로도 실패할 수 있다) 좁아진 폭을 테스트가 소유한다.
+
+CERTAIN_QUOTE = "관절염 치료에 효과가 있습니다"
+CERTAIN_TEXT = f"{CERTAIN_QUOTE}. 2주 만에 완치됩니다."
+NOTICE: dict[str, Any] = {"sellerNotice": "치료를 단정하는 표현은 쓸 수 없습니다.", "rewrites": []}
+
+
+def certain(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "decision": "CERTAIN_VIOLATION",
+        "reason": "치료를 단정하는 문장이 본문에 그대로 있다",
+        "category": "MEDICAL_CLAIM",
+        "quote": CERTAIN_QUOTE,
+    }
+    return {**base, **overrides}
+
+
+def haiku_ok(tool_input: dict[str, Any]) -> Any:
+    return ok(tool_input, model="claude-haiku-4-5")
+
+
+async def test_선별이_확정하면_Sonnet을_건너뛰고_보류로_간다(triage_on: Settings) -> None:
+    """확정 경로는 관점 둘을 아끼고 수정 문구만 태운다. 통과 쪽 절감과 같은 모양이다."""
+    llm = FakeLlmClient([triage_ok(certain(), triage_on), ok(NOTICE)])
+
+    verdict = await InspectionPipeline(llm=llm, settings=triage_on).run(product(CERTAIN_TEXT))
+
+    assert verdict.verdict is Verdict.FLAG
+    assert [call["tool"]["name"] for call in llm.calls] == ["triage_content", "propose_rewrite"]
+    assert verdict.sellerNotice == NOTICE["sellerNotice"]
+    assert verdict.criticOverturned is False
+
+
+async def test_확정_위반은_선별_관점에_달리고_모델_관점은_미검사다(triage_on: Settings) -> None:
+    """모델 관점 행에 위반을 달면 **안 본 관점이 위반을 찾은 것**으로 읽힌다.
+
+    사유도 ``TRIAGE_CLEAR`` 를 재사용하지 않는다 -- 재사용하면 보류된 상품의 관점 행이
+    "깨끗해서 안 봤다"로 적힌 채 어드민에 올라간다.
+    """
+    llm = FakeLlmClient([triage_ok(certain(), triage_on), ok(NOTICE)])
+
+    verdict = await InspectionPipeline(llm=llm, settings=triage_on).run(product(CERTAIN_TEXT))
+
+    rows = {p.perspective: p for p in verdict.perspectives}
+    assert rows[Perspective.TRIAGE].outcome is PerspectiveOutcome.VIOLATION
+    assert rows[Perspective.TRIAGE].skipReason is None
+    for perspective in (Perspective.DISPLAY_ADS, Perspective.CONDUCT_TRADE):
+        assert rows[perspective].outcome is PerspectiveOutcome.UNCHECKED
+        assert rows[perspective].skipReason == triage.TRIAGE_CERTAIN_SKIP_REASON
+    assert triage.TRIAGE_CERTAIN_SKIP_REASON != triage.TRIAGE_SKIP_REASON
+
+    (violation,) = verdict.violations
+    assert violation.perspective is Perspective.TRIAGE
+    assert violation.category is ViolationCategory.MEDICAL_CLAIM
+    assert violation.quote == CERTAIN_QUOTE
+    assert violation.suggestion is None, (
+        "수정 문구는 N4 가 만든다. 선별에 제안까지 내게 하면 출력 토큰이 늘어난다"
+    )
+
+
+async def test_확정_구간이_가린_본문에서_인용을_되찾는다(triage_on: Settings) -> None:
+    """계약의 구간은 **가린 본문** 좌표계다(``_record_input`` 참조).
+
+    상품명이 본문 앞에 붙어 오프셋이 0이 아니고, 그 수가 가린 본문에서 다시 찾은 값이어야
+    콘솔 하이라이트가 맞는 구간을 가리킨다.
+    """
+    from app.inspection import rules
+
+    request = product(CERTAIN_TEXT)
+    redacted = rules.screen(request.inspect_text()).redacted
+    llm = FakeLlmClient([triage_ok(certain(), triage_on), ok(NOTICE)])
+
+    verdict = await InspectionPipeline(llm=llm, settings=triage_on).run(request)
+
+    (violation,) = verdict.violations
+    assert redacted[violation.spanStart : violation.spanEnd] == CERTAIN_QUOTE
+    assert violation.spanStart > 0, "상품명이 앞에 붙으므로 0이 아니다"
+
+
+async def test_확정_인용이_본문에_없으면_확정을_버리고_승급한다(triage_on: Settings) -> None:
+    """꾸민 인용으로 보류가 나가면 선별 한 번이 멀쩡한 상품의 판매를 멈춘다."""
+    llm = FakeLlmClient(
+        [
+            triage_ok(certain(quote="본문에 없는 문장입니다"), triage_on),
+            ok(NO_FINDING),
+            ok(NO_FINDING),
+        ]
+    )
+
+    verdict = await InspectionPipeline(llm=llm, settings=triage_on).run(product(CERTAIN_TEXT))
+
+    assert verdict.verdict is Verdict.PASS, "확정을 버렸으면 관점 둘이 실제로 보고 판정한다"
+    assert len(llm.calls) == 3, "선별 + 관점 둘. 비용은 들고 판단은 남는다"
+    rows = {p.perspective: p for p in verdict.perspectives}
+    assert rows[Perspective.TRIAGE].skipReason == "PROMOTED"
+    assert rows[Perspective.DISPLAY_ADS].outcome is PerspectiveOutcome.CLEAR
+
+
+async def test_확정이_리뷰에는_수정_문구를_만들지_않는다(triage_on: Settings) -> None:
+    """리뷰는 작성자가 고쳐 올리는 흐름이 없다. 관점 경로와 같은 규칙이다."""
+    from app.schemas.inspection import ReviewInspectionRequest
+
+    request = ReviewInspectionRequest(
+        inspectionId=1,
+        reviewId=77,
+        productId=42,
+        contentHash="a" * 64,
+        content=CERTAIN_TEXT,
+        rating=5,
+        categoryPath=["강아지"],
+    )
+    llm = FakeLlmClient([triage_ok(certain(), triage_on)])
+
+    verdict = await InspectionPipeline(llm=llm, settings=triage_on).run(request)
+
+    assert verdict.verdict is Verdict.FLAG
+    assert verdict.sellerNotice is None
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("tool_input", "why"),
+    [
+        (certain(category=None), "분류가 없으면 어드민 큐도 수정 문구도 무엇을 고칠지 모른다"),
+        (certain(category="NOT_A_CATEGORY"), "모르는 분류는 계약 열거에 넣을 수 없다"),
+        (certain(quote=None), "인용이 없으면 본문에서 검증할 대상이 없다"),
+        (certain(quote="   "), "공백만 적은 인용은 본문의 어디도 가리키지 않는다"),
+    ],
+)
+def test_증거가_빠진_확정은_확정으로_세지_않는다(tool_input: dict[str, Any], why: str) -> None:
+    outcome = triage.decide(haiku_ok(tool_input))
+
+    assert outcome.certain is False, why
+    assert outcome.skip is False, "버린 확정이 통과 방향으로 떨어지면 아무도 안 본 상품이 통과한다"
+    assert outcome.decision == "CERTAIN_VIOLATION", "모델이 무엇을 냈는지는 추적에 남아야 한다"
+
+
+def test_선별_호출이_실패하면_확정도_통과도_아니다() -> None:
+    outcome = triage.decide(failed(CallOutcome.TIMEOUT, model="claude-haiku-4-5"))
+
+    assert (outcome.skip, outcome.certain) == (False, False)
+
+
+@pytest.mark.parametrize("raw", ["CERTAIN", "VIOLATION", "", "clear", "FLAG"])
+def test_모르는_결정값은_확정도_통과도_아니다(raw: str) -> None:
+    outcome = triage.decide(haiku_ok(certain(decision=raw)))
+
+    assert (outcome.skip, outcome.certain) == (False, False), raw
+
+
+@pytest.mark.parametrize("raw", ["CLEAR", "NEEDS_REVIEW", "CERTAIN_VIOLATION"])
+def test_확정과_통과는_동시에_참이_되지_않는다(raw: str) -> None:
+    """``decision`` 하나에서 나오므로 구조적으로 불가능해야 한다."""
+    outcome = triage.decide(haiku_ok(certain(decision=raw)))
+
+    assert not (outcome.skip and outcome.certain), raw
+
+
+async def test_확정_경로는_보류라서_백엔드_증거_게이트를_타지_않는다(triage_on: Settings) -> None:
+    """백엔드 ``applyGate`` 는 ``FLAG`` 를 증거와 무관하게 적용하고 ``PASS`` 만 증거로 거른다.
+
+    확정 경로의 모델 관점 행은 전부 미검사라 증거 술어는 거짓인데, 판정이 보류이므로 게이트가
+    그 축을 보지 않는다. 이것이 ``TRIAGE_CERTAIN`` 을 새 사유로 만들어도 노출 경로가 깨지지
+    않는 이유다 -- 사유를 모르는 백엔드가 그 행을 증거로 세지 않아도 결과가 달라지지 않는다.
+    """
+    llm = FakeLlmClient([triage_ok(certain(), triage_on), ok(NOTICE)])
+
+    verdict = await InspectionPipeline(llm=llm, settings=triage_on).run(product(CERTAIN_TEXT))
+
+    assert verdict.verdict is Verdict.FLAG
+    assert backend_model_verified(verdict) is False
+
+
+def test_확정_프롬프트가_애매함을_승급으로_보내라고_적는다() -> None:
+    """이 문장이 확정 쪽 오탐을 누르는 유일한 프롬프트 레버다.
+
+    열거에 반려 방향이 생기면서 좁아진 불변식 2의 대가를 여기서 갚는다. 문구가 사라지면
+    모델은 "아마 위반"에도 확정을 내고, 확정 한 번이 관점 둘을 건너뛰고 보류까지 간다.
+    """
+    assert "조금이라도 애매하면 NEEDS_REVIEW" in TRIAGE_PROMPT
+    assert "의심의 여지없이 분명합니다" in TRIAGE_PROMPT
+    assert "성분은 CERTAIN_VIOLATION의 사유로 쓰지 마십시오" in TRIAGE_PROMPT, (
+        "성분은 카테고리를 함께 봐야 가려지므로 선별이 확정할 근거가 없다"
+    )
+
+
+def test_선별_툴이_결정_셋을_받고_증거_칸을_든다() -> None:
+    schema: Any = triage.TRIAGE_TOOL["input_schema"]
+    properties = schema["properties"]
+
+    assert properties["decision"]["enum"] == ["CLEAR", "NEEDS_REVIEW", "CERTAIN_VIOLATION"]
+    # ``strict`` 모드는 선언한 속성 전부를 ``required`` 에 요구한다. 선택 항목은
+    # ``required`` 에서 빼지 않고 null 을 허용하는 타입으로 적는다.
+    assert set(schema["required"]) == set(properties)
+    for key in ("category", "quote"):
+        assert properties[key]["type"] == ["string", "null"], key
+
+
+def test_선별_프롬프트_버전이_올라갔다() -> None:
+    """버전은 판정 재사용 키에 섞여 나간다. 안 올리면 바뀐 프롬프트로 다시 보지 않는다."""
+    assert TRIAGE_VERSION == "triage-v3"
