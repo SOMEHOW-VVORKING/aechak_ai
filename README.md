@@ -202,6 +202,29 @@ SDK 재시도를 **0으로 끈다.** 기본값이 2라서 그냥 두면 429 한 
 적으면 비용 경보가 영원히 침묵한다. 설정에 적힌 모델 ID는 부팅에서 `validate_pricing`이 전부
 검사하고, 모르면 기동을 거부한다 — 돈을 쓰기 전에 설정 오타를 잡는 자리다.
 
+### 로컬 sLLM (`local/` 접두)
+
+모델 ID 를 `local/ax-4.0-light` 처럼 적으면 **그 호출만** `local_llm_base_url` 의 OpenAI 호환
+경로(`/v1/chat/completions`)로 간다. 돌려주는 것은 같은 `LlmResult` 라 호출부는 분기를 모른다.
+로컬 모델에는 tool use 가 없어서 구조화 출력을 툴 스키마 대신 `response_format` 의 json_schema
+로 받고 본문 JSON 을 파싱하며, 입력·출력 단가는 0이다 — 가격표 검증도 이 접두를 면제한다.
+Anthropic 쪽에 샘플링 파라미터를 보내지 않는 규칙은 그 API 가 400을 내기 때문이고, llama.cpp 의
+기본 `temperature` 는 0.8 이라 **로컬 경로에는 0을 보낸다**(같은 입력이 다른 판정을 내면 그
+흔들림이 승급률에 그대로 섞인다). 가중치 다운로드와 기동은 `harness/local-llm.sh` 가 맡고
+GGUF 는 레포 밖(`~/.cache/aechak-ai/models`)에 둔다.
+
+```bash
+harness/local-llm.sh                                    # 받고(없으면) llama-server 기동
+AECHAK_AI_TRIAGE_MODEL=local/ax-4.0-light uv run ...    # 선별만 로컬로
+```
+
+실측(M5 Pro 64GB, `skt/A.X-4.0-Light` Q4_K_M 4.1GiB, `-ngl 99 -c 4096`): 선별 한 건이 **0.7~1.3초**,
+디코딩 **47~56 tok/s**(서버 기준 59 tok/s, 프리필 911 tok/s), 입력 474~594 토큰. JSON 파싱은
+13건 전건 성공이고 `temperature=0` 에서 같은 입력이 5회 같은 바이트를 냈다. **판정 품질은 아직
+검증되지 않았다** — 소표본에서 위반 건을 `CLEAR` 로 내보낸 사례가 있었고, 그 방향의 오류는
+무검수 노출이다. 승급률·누락률은 `harness/run.py --mode triage-only` 로 재야 한다. 운영 ECS
+Fargate 에는 GPU 가 없으므로 이 경로는 로컬 측정용이다.
+
 ## 개발
 
 ```bash
