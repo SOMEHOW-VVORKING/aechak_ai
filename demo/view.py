@@ -20,7 +20,7 @@ from enum import StrEnum
 from typing import Any
 
 from app.inspection.trace import Stage, StageStatus, Trace
-from app.inspection.triage import TRIAGE_SKIP_REASON
+from app.inspection.triage import TRIAGE_CERTAIN_SKIP_REASON, TRIAGE_SKIP_REASON
 from app.schemas.inspection import (
     CallOutcome,
     ContentVerdict,
@@ -49,7 +49,7 @@ CANONICAL_STAGES: tuple[tuple[Stage, str], ...] = (
     (Stage.TRIAGE, "N0.5 선별"),
     (Stage.JUDGE, "N1 관점 판정"),
     (Stage.AGGREGATE, "N2 집계"),
-    (Stage.CRITIC, "N3 비평"),
+    # N3 자리가 비어 있다. 비평 노드를 뺀 자리이고 번호는 당기지 않았다(``Stage`` 머리 참조).
     (Stage.NOTICE, "N4 수정 문구"),
 )
 
@@ -70,11 +70,11 @@ _OUTCOME_LABELS = {
 
 _SKIP_REASON_LABELS = {
     TRIAGE_SKIP_REASON: "선별이 깨끗하다고 해서 보지 않았다",
+    TRIAGE_CERTAIN_SKIP_REASON: "선별이 위반을 확정해서 보지 않았다",
     "PROMOTED": "선별이 더 보라고 넘겼다",
     "RULE_HIT": "규칙이 적중해 선별에 묻지 않았다",
     "TRIAGE_DISABLED": "선별이 꺼져 있다",
     "LLM_DISABLED": "모델 클라이언트가 없다",
-    "ESCALATION_DISABLED": "비평이 꺼져 있다",
     "NOTICE_DISABLED": "수정 문구가 꺼져 있다",
     "EVIDENCE_UNVERIFIED": "인용이 본문에 없어 판정을 버렸다",
     CallOutcome.TIMEOUT.value: "호출이 시간 안에 끝나지 않았다",
@@ -96,12 +96,15 @@ _VERDICT_LABELS = {
 class ExitPoint(StrEnum):
     RULE_BLOCKED = "RULE_BLOCKED"
     TRIAGE_CLEARED = "TRIAGE_CLEARED"
+    # 선별이 **확정**해서 관점을 건너뛴 보류. TRIAGE_CLEARED 와 반대쪽 출구이고
+    # MODEL_FLAGGED 와 반드시 갈라야 한다 -- 둘을 합치면 Sonnet 두 관점이 읽고 찾은 위반과
+    # Haiku 한 번이 확정한 위반이 같은 배지로 보인다.
+    TRIAGE_FLAGGED = "TRIAGE_FLAGGED"
     MODEL_CLEAR = "MODEL_CLEAR"
     # 쏜 관점 가운데 일부만 판정한 통과. MODEL_CLEAR 와 반드시 갈라야 한다 --
     # 둘을 합치면 "의료·효능을 보는 유일한 관점이 아무 판정도 못 했다"가 머리줄에서
     # "관점이 실제로 읽고 위반을 찾지 못했다"로 뒤집힌다.
     MODEL_PARTIAL = "MODEL_PARTIAL"
-    CRITIC_OVERTURNED = "CRITIC_OVERTURNED"
     MODEL_FLAGGED = "MODEL_FLAGGED"
     # 표에 없는 경로 둘. 같은 방식으로 판정 하나에서 구분된다
     AGGREGATE_FAILED = "AGGREGATE_FAILED"
@@ -117,6 +120,11 @@ _EXIT_LABELS: dict[str, tuple[str, str]] = {
         "선별 통과",
         "선별이 깨끗하다고 해서 관점 호출을 건너뛰었다. 건너뛴 관점은 통과가 아니라 미검사다.",
     ),
+    ExitPoint.TRIAGE_FLAGGED.value: (
+        "선별 확정 위반",
+        "선별이 의심의 여지없는 위반을 찾아 관점 호출을 건너뛰고 보류로 확정했다. "
+        "인용은 본문에서 다시 찾아 검증한 것이고, 건너뛴 관점은 통과가 아니라 미검사다.",
+    ),
     ExitPoint.MODEL_CLEAR.value: (
         "모델 위반 없음",
         "쏜 관점이 전부 실제로 읽고 위반을 찾지 못했다. 이 통과는 미검사가 아니다.",
@@ -127,13 +135,9 @@ _EXIT_LABELS: dict[str, tuple[str, str]] = {
         "부분 미검사 통과",
         "쏜 관점 가운데 일부만 판정했다. 나머지는 통과가 아니라 미검사다.",
     ),
-    ExitPoint.CRITIC_OVERTURNED.value: (
-        "비평 뒤집힘",
-        "1차가 위반으로 봤지만 다른 모델이 오탐이라고 뒤집었다. 어드민 라우팅이 보는 신호다.",
-    ),
     ExitPoint.MODEL_FLAGGED.value: (
         "확정 위반",
-        "모델 위반이 비평을 통과해 확정됐다. 상품이면 셀러 안내가 함께 나간다.",
+        "관점이 실제로 읽고 위반을 찾았다. 상품이면 셀러 안내가 함께 나간다.",
     ),
     ExitPoint.AGGREGATE_FAILED.value: (
         "판정 실패",
@@ -148,9 +152,9 @@ _EXIT_LABELS: dict[str, tuple[str, str]] = {
 # 판정 메시지만으로는 되살릴 수 없는 것들. 얕은 재생에서 콘솔이 이 목록을 그대로 띄운다.
 WITHOUT_TRACE_MISSING: tuple[str, ...] = (
     "선별이 적은 사유 (reason). 계약에는 관점 행의 결과만 남는다",
-    "비평의 결정 (UPHOLD / INSUFFICIENT). 뒤집힘만 criticOverturned 로 남는다",
+    "선별의 결정 열거 (CLEAR / NEEDS_REVIEW / CERTAIN_VIOLATION). 관점 행의 결과로만 되살린다",
     "호출 실패 상세 (max_tokens 초과, 스키마 오류 본문). 열거값만 남는다",
-    "비평과 수정문구의 단계 구분. 원장에는 둘 다 ALL 관점으로 적힌다",
+    "수정 문구 호출의 단계 구분. 원장에는 ALL 관점으로 적힌다",
     "인용 검증으로 떨어낸 구절과 모델이 적은 사유",
     "수정 문구 후보 배열. 계약에는 sellerNotice 한 줄만 남는다",
     "가린 본문. 위반 구간은 가린 본문 기준 오프셋이라 하이라이트를 찍을 수 없다",
@@ -273,7 +277,6 @@ class ConsoleView:
     # 참이면 콘솔이 머리줄에 경고를 띄우고 백엔드 게이트 배지를 중립색으로 내린다.
     judgment_simulated: bool
     simulated_note: str
-    critic_overturned: bool
     prompt_version: str
     seller_notice: str | None
     text: str | None
@@ -291,27 +294,27 @@ class ConsoleView:
 def classify_exit(verdict: ContentVerdict) -> ExitPoint:
     """판정 하나만 보고 어디서 끝났는지 가른다. 추적이 없어도 돈다.
 
-    순서가 중요하다. 뒤집힘은 ``FLAG`` 를 ``PASS`` 로 바꾼 뒤의 상태라 통과 분기보다 먼저
-    봐야 하고, 규칙 차단은 "원장이 비어 있다"로만 모델 보류와 갈라진다.
+    순서가 중요하다. 규칙 차단은 "원장이 비어 있다"로만 모델 보류와 갈라지고, 선별 확정은
+    선별 관점 행이 위반인 것으로만 모델 보류와 갈라진다 -- 둘을 합치면 Haiku 한 번이
+    확정한 보류가 Sonnet 두 관점이 읽고 낸 보류와 같은 배지로 보인다.
     """
     rows = {p.perspective: p for p in verdict.perspectives}
     model_rows = _model_rows(verdict.perspectives)
-
-    if verdict.criticOverturned:
-        return ExitPoint.CRITIC_OVERTURNED
 
     if verdict.verdict is Verdict.FAILED:
         if any(p.skipReason == "LLM_DISABLED" for p in model_rows):
             return ExitPoint.LLM_DISABLED
         return ExitPoint.AGGREGATE_FAILED
 
+    triage_row = rows.get(Perspective.TRIAGE)
     if verdict.verdict is Verdict.FLAG:
         rule_row = rows.get(Perspective.RULE)
         if not verdict.calls and rule_row is not None and rule_row.outcome is PerspectiveOutcome.VIOLATION:
             return ExitPoint.RULE_BLOCKED
+        if triage_row is not None and triage_row.outcome is PerspectiveOutcome.VIOLATION:
+            return ExitPoint.TRIAGE_FLAGGED
         return ExitPoint.MODEL_FLAGGED
 
-    triage_row = rows.get(Perspective.TRIAGE)
     if triage_row is not None and triage_row.outcome is PerspectiveOutcome.CLEAR:
         # 선별이 통과시킨 것 자체가 탈출 지점이다. 그 모양이 백엔드 게이트를 넘는지는
         # 별 축이고 backend_accepts 가 답한다 -- 넘지 못하면 전건이 관리자 검토 큐로 간다.
@@ -384,7 +387,6 @@ def build(
         backend_note=_gate_note(gate_applies=gate_applies, accepted=accepted),
         judgment_simulated=simulated,
         simulated_note=SIMULATED_NOTE if simulated else "",
-        critic_overturned=verdict.criticOverturned,
         prompt_version=verdict.promptVersion,
         seller_notice=verdict.sellerNotice,
         text=trace.text if trace is not None else None,
@@ -659,31 +661,6 @@ def _stages_from_verdict(verdict: ContentVerdict) -> list[StageView]:
             note="판정 결과에서 되살린 셈이다. 쏜 관점 수는 관점 행 수로 본다",
         )
     )
-
-    if verdict.criticOverturned:
-        views.append(
-            StageView(
-                stage=Stage.CRITIC.value,
-                label="N3 비평",
-                status=StageStatus.RAN.value,
-                status_label=_STATUS_LABELS[StageStatus.RAN.value],
-                decision="OVERTURN",
-                note="뒤집힘만 계약에 남는다. 유지(UPHOLD)와 판단 불가(INSUFFICIENT)는 구분되지 않는다",
-            )
-        )
-    elif verdict.verdict is Verdict.FLAG:
-        views.append(
-            StageView(
-                stage=Stage.CRITIC.value,
-                label="N3 비평",
-                status=StageStatus.RAN.value,
-                status_label=_STATUS_LABELS[StageStatus.RAN.value],
-                decision=None,
-                note="유지된 것은 알 수 있지만 UPHOLD 인지 INSUFFICIENT 인지는 판정에 남지 않는다",
-            )
-        )
-    else:
-        views.append(_not_reached(Stage.CRITIC, "N3 비평", "위반 판정이 아니라 비평을 부르지 않았다"))
 
     if verdict.sellerNotice:
         views.append(
