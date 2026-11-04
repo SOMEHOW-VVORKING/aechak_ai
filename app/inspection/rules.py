@@ -8,6 +8,13 @@
   1. 결정론적 위반을 찾아 모델 호출 없이 판정한다.
   2. 모델에 보낼 텍스트에서 연락처·계좌를 가린다(레닥션). 개인정보 국외 이전 범위를 줄인다.
 
+적중에 강도가 둘이다. **차단**은 모델 없이 확정하고, **비차단**은 선별을 건너뛰고 관점
+둘에 넘긴다(``RuleResult.triage_trumping``). 정상 문구와 글자 모양으로 갈리지 않는 신호는
+전부 비차단이다 -- 오탐의 값은 Sonnet 2회이고, 차단으로 두면 그 값이 셀러의 판매 중단이다.
+클릭 유도·거짓 당첨·구절 반복 셋이 그 자리이고, 11/2 하네스 실측이 그 셋을 요구했다
+(Haiku 선별이 "무료 쿠폰 이벤트 당첨 지금 바로 클릭 지금 바로 클릭" 을 2/2 CLEAR로
+통과시켰고, 그 CLEAR는 관점 호출을 아예 없앤다).
+
 주의: 애착 백엔드의 기존 리뷰 마스킹(아호코라식)은 건드리지 않는다. 그쪽 ``matchedRatio``의
 분모를 바꾸면 기존 리뷰의 차단 비율이 조용히 변한다. 이것은 판정 전용 별 경로다.
 """
@@ -65,6 +72,35 @@ _INJECTION_WEAK = re.compile(
     r"(무시하\w*\s*(고|라|세요)|승인\s*(해|하세요|해주세요)|통과\s*(시켜|시키세요))",
     re.I,
 )
+
+# 클릭·이동 유도 문구. 11/2 하네스 실측의 수신자다.
+#
+# Haiku 선별이 "무료 쿠폰 이벤트 당첨 지금 바로 클릭 지금 바로 클릭" 을 2/2 CLEAR로
+# 통과시켰다. 선별이 CLEAR를 내면 관점 호출이 아예 안 나가므로 그 문구를 어느 계층도 보지
+# 않는다. 정규식은 주입으로 뚫리지 않고 0원이라 그 사각을 여기서 닫는다.
+#
+# **비차단이다.** "아래 옵션을 클릭하세요" 같은 정상 안내와 글자 모양으로 갈리지 않는다.
+# 비차단 적중은 ``triage_trumping`` 에 들어가 선별을 건너뛰고 관점 둘을 태우므로,
+# 오탐의 값은 Sonnet 2회이고 미탐의 값은 아무도 보지 않은 상품이다.
+_CTA = re.compile(
+    r"(지금\s*바로\s*클릭|클릭\s*하세요|여기\s*(를\s*)?클릭|링크\s*(를\s*)?클릭|아래\s*버튼)",
+    re.I,
+)
+
+# 거짓 당첨 안내.
+#
+# 2인칭 완료형("당첨되셨습니다")과 선정 통보("당첨자로 선정")만 본다. 정상 공지는
+# 그 모양이 아니다 -- "쿠폰 이벤트 진행 중", "이벤트 당첨자는 공지에서 확인" 은 걸리지
+# 않아야 하고 ``tests/test_rules.py`` 가 그 음성 케이스를 표로 고정한다.
+# "축하 ... 당첨" 은 순서가 있다. 당첨을 먼저 적고 축하가 뒤에 오는 정상 공지는 안 걸린다.
+_FAKE_PRIZE = re.compile(r"(당첨\s*(되셨|되었습니다|됐습니다)|당첨자로\s*선정|축하[^\n]{0,20}?당첨)")
+
+# 같은 구절의 반복. 어절 이 수만큼 이어진 창을 단위로 보고, 이 횟수 이상 나오면 적중이다.
+#
+# 창을 어절 4개로 고정한다. "4개 이상" 짜리 반복 구절은 그 안에 반복되는 4어절 창을
+# 반드시 품으므로, 창을 늘려 가며 훑지 않아도 더 긴 반복이 걸린다.
+_PHRASE_WORDS = 4
+_PHRASE_REPEAT_MIN = 3
 
 _REDACTION = "[가림]"
 
@@ -219,6 +255,10 @@ def screen(text: str) -> RuleResult:
         (_EXTERNAL_URL, ViolationCategory.OFF_PLATFORM, "외부 링크", True),
         (_INJECTION_STRONG, ViolationCategory.SPAM, "판정기를 겨냥한 지시형 문장", True),
         (_INJECTION_WEAK, ViolationCategory.SPAM, "지시형으로 읽힐 수 있는 문장", False),
+        # 아래 둘은 비차단이다. 정상 안내와 글자 모양으로 갈리지 않아 차단으로 두면 멀쩡한
+        # 상품이 모델 한 번 없이 막힌다. 비차단이어도 선별은 건너뛰고 관점 둘이 본다.
+        (_CTA, ViolationCategory.SPAM, "클릭·이동을 유도하는 문구", False),
+        (_FAKE_PRIZE, ViolationCategory.SPAM, "거짓 당첨 안내로 읽히는 문구", False),
     ):
         for m in pattern.finditer(probe):
             result.hits.append(RuleHit(category, m.group(0), m.start(), m.end(), reason, blocking))
@@ -236,6 +276,22 @@ def screen(text: str) -> RuleResult:
                     True,
                 )
             )
+
+    repeated = _repeated_phrase(probe)
+    if repeated is not None:
+        phrase, count = repeated
+        result.hits.append(
+            RuleHit(
+                ViolationCategory.SPAM,
+                phrase,
+                # 구간을 담지 않는다. 같은 구절이 세 번 이상 나온 것이 적중의 내용이라
+                # 어느 한 번을 가리키는 구간이 거짓이다. 금지 성분 적중과 같은 모양이다.
+                None,
+                None,
+                f"같은 구절이 {count}번 반복된다",
+                False,
+            )
+        )
 
     # 금지 성분은 전용 사전이 본다. 정규화로 띄어쓰기·기호·반복·전각 우회를 무력화하고,
     # 부정 표현과 제외 접미("포도당", "카카오톡")를 거른 뒤 적중을 돌려준다.
@@ -261,6 +317,36 @@ def screen(text: str) -> RuleResult:
     _realign(result.hits, text)
     result.redacted = _redact(text)
     return result
+
+
+def _repeated_phrase(probe: str) -> tuple[str, int] | None:
+    """어절 ``_PHRASE_WORDS`` 개짜리 구절이 ``_PHRASE_REPEAT_MIN`` 번 이상 나왔는가.
+
+    **가장 많이 나온 창 하나만** 돌려준다. 창이 겹치므로 같은 반복 블록이 창마다 적중을
+    내는데, 그건 한 가지 사실이다. 여러 줄로 보고하면 콘솔과 어드민 큐가 같은 문구를 서너
+    번 보여 주고, 위반 목록의 첫 건을 ``reasonCode`` 로 쓰는 백엔드 쪽도 그만큼 흔들린다.
+    횟수가 같으면 **본문에 먼저 나온 창**을 쓴다 -- 사전 순으로 고르면 같은 본문에서
+    판정이 흔들리지 않을 뿐 사람이 읽을 이유가 없는 구절이 뽑힌다.
+
+    적중은 비차단이다. 셀러가 옵션명을 비슷하게 여러 개 적으면(``inspect_text`` 가 옵션명을
+    본문에 이어 붙인다) 접두 네 어절이 같아 걸릴 수 있다. 차단으로 두면 그 오탐이 모델 한
+    번 없이 판매를 막으므로, 적중을 남기고 판단은 관점에 넘긴다.
+    """
+    words = probe.split()
+    # 창이 **겹칠 수 있으므로** 곱이 아니다. 한 창이 세 번 나오는 최소 본문은 창 길이에
+    # 두 어절을 더한 것이다("가 가 가 가 가 가"). 곱(12어절)으로 적었더니 반복이 꽉 찬
+    # 10어절 본문이 길이 검사에서 그대로 빠져나갔다.
+    if len(words) < _PHRASE_WORDS + _PHRASE_REPEAT_MIN - 1:
+        return None
+
+    counts: dict[str, int] = {}
+    for index in range(len(words) - _PHRASE_WORDS + 1):
+        phrase = " ".join(words[index : index + _PHRASE_WORDS])
+        counts[phrase] = counts.get(phrase, 0) + 1
+
+    # ``dict`` 가 삽입 순서를 지키므로 ``max`` 가 동률에서 먼저 나온 창을 남긴다.
+    phrase, count = max(counts.items(), key=lambda item: item[1])
+    return (phrase, count) if count >= _PHRASE_REPEAT_MIN else None
 
 
 def _realign(hits: list[RuleHit], original: str) -> None:

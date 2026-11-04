@@ -48,9 +48,6 @@ class Settings(BaseSettings):
     screening_model: str = "claude-sonnet-5"
     # 등급을 비우면 거부한다. 빈 값을 미지정으로 접으면 모델 기본값(high)으로 조용히 올라간다.
     screening_effort: EffortGrade = "low"
-    # 2단 에스컬레이션
-    escalation_model: str = "claude-opus-5"
-    escalation_effort: EffortGrade = "medium"
     # 수정 제안 생성
     notice_model: str = "claude-sonnet-5"
     notice_effort: EffortGrade = "medium"
@@ -70,7 +67,6 @@ class Settings(BaseSettings):
     # 사고 토큰과 tool_use가 한 상한을 나눠 쓴다. 상한이 좁으면 tool_use 블록이 안 나와
     # SCHEMA_INVALID로 떨어진다. max_tokens는 지출이 아니라 상한이라 넉넉히 둔다.
     max_tokens_screening: int = 8192
-    max_tokens_escalation: int = 8192
     max_tokens_notice: int = 4096
     # 선별도 좁게 두지 않는다. 툴의 ``reason``에 길이 제약을 걸 수 없어서(strict 모드가
     # maxLength 를 받지 않는다) 사유가 길어지면 응답이 끊기고, 끊긴 호출은 TRUNCATED 승급이
@@ -81,7 +77,9 @@ class Settings(BaseSettings):
     triage_timeout_seconds: float = 15.0
 
     # 파이프라인 토글. 노드를 측정으로 남기고 빼기 위해 설정으로 갈라 둔다.
-    enable_escalation: bool = True
+    #
+    # ``enable_escalation`` 이 있었다. 비평 노드를 뺐으므로 토글도 뺀다 -- 끄는 레버만 남기면
+    # 켜도 아무 일이 없는 설정이 되어 운영에서 "켰는데 왜 안 도나"가 된다.
     enable_notice: bool = True
     perspective_fanout: bool = True
     # 기본 꺼짐. 백엔드 열거에 TRIAGE가 없는 동안 켜면 판정 전건이 격리 토픽으로 간다.
@@ -233,7 +231,9 @@ class Settings(BaseSettings):
         것을 빠뜨리는 함정을 이 레포가 이미 한 번 밟았기** 때문이다.
         """
         judge = _FANOUT_PERSPECTIVES * (2 * self.request_timeout_seconds + JUDGE_RETRY_DELAY_SECONDS)
-        tail = self.request_timeout_seconds * 2  # 비평 + 수정 문구
+        # 수정 문구 한 번. 비평을 뺐으므로 종전의 두 배가 아니다 -- 줄이는 쪽이라 폴 간격과의
+        # 관계는 느슨해지고, 느슨해지는 방향은 테스트가 막지 않는다.
+        tail = self.request_timeout_seconds
         triage = self.triage_timeout_seconds if self.enable_triage else 0.0
         return triage + judge + tail
 
@@ -301,7 +301,6 @@ class Settings(BaseSettings):
         """
         return (
             self.screening_model,
-            self.escalation_model,
             self.notice_model,
             self.triage_model,
             self.summary_extract_model,

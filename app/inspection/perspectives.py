@@ -141,25 +141,6 @@ def findings_tool(spec: PerspectiveSpec) -> dict[str, object]:
     }
 
 
-CRITIC_TOOL: dict[str, object] = {
-    "name": "review_finding",
-    "description": "앞선 판정이 오탐인지 판단한다.",
-    "strict": True,
-    "input_schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["decision", "reason"],
-        "properties": {
-            "decision": {
-                "type": "string",
-                # UPHOLD 유지 / OVERTURN 오탐이라 뒤집음 / INSUFFICIENT 근거가 모자라 판단 불가
-                "enum": ["UPHOLD", "OVERTURN", "INSUFFICIENT"],
-            },
-            "reason": {"type": "string"},
-        },
-    },
-}
-
 REWRITE_TOOL: dict[str, object] = {
     "name": "propose_rewrite",
     "description": "정책을 지키면서 같은 뜻을 전하는 문구를 제안한다.",

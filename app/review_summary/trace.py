@@ -4,8 +4,8 @@
 보여 줘야 하는 것(단계 라벨, 왜 그 길로 갔는지, 떨어진 항목과 그 사유)이 결과 메시지에
 없기 때문이다. 운영 경로는 추적기를 주지 않으므로 동작이 바뀌지 않는다.
 
-``app/inspection/trace.py`` 의 ``Stage`` 를 재사용하지 않는다. 그 열거는 검수 6단계
-(``RULE``/``TRIAGE``/``JUDGE``/``AGGREGATE``/``CRITIC``/``NOTICE``)로 고정이고 콘솔의
+``app/inspection/trace.py`` 의 ``Stage`` 를 재사용하지 않는다. 그 열거는 검수 5단계
+(``RULE``/``TRIAGE``/``JUDGE``/``AGGREGATE``/``NOTICE``)로 고정이고 콘솔의
 ``CANONICAL_STAGES`` 가 그 순서에 묶여 있다. 값을 더하면 검수 화면 모델이 요약 단계를
 "도달하지 않음"으로 그린다.
 

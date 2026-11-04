@@ -90,8 +90,8 @@ async def test_탈출_지점_다섯을_시나리오가_모두_덮는다() -> Non
     five = {
         ExitPoint.RULE_BLOCKED.value,
         ExitPoint.TRIAGE_CLEARED.value,
+        ExitPoint.TRIAGE_FLAGGED.value,
         ExitPoint.MODEL_CLEAR.value,
-        ExitPoint.CRITIC_OVERTURNED.value,
         ExitPoint.MODEL_FLAGGED.value,
     }
     assert five <= covered, f"덮이지 않은 탈출 지점: {five - covered}"
@@ -141,8 +141,7 @@ async def test_단계가_파이프라인_순서대로_나온다() -> None:
     canonical = [stage.value for stage, _ in view.CANONICAL_STAGES]
     assert [s for s in canonical if s in order] == sorted(set(order), key=canonical.index)
     assert order.index("N0_RULE") < order.index("N0_5_TRIAGE") < order.index("N1_JUDGE")
-    assert order.index("N1_JUDGE") < order.index("N2_AGGREGATE") < order.index("N3_CRITIC")
-    assert order.index("N3_CRITIC") < order.index("N4_NOTICE")
+    assert order.index("N1_JUDGE") < order.index("N2_AGGREGATE") < order.index("N4_NOTICE")
 
 
 async def test_규칙이_확정한_건은_뒤_단계가_도달하지_않음으로_남는다() -> None:
@@ -152,7 +151,7 @@ async def test_규칙이_확정한_건은_뒤_단계가_도달하지_않음으�
     assert console.exit_point == ExitPoint.RULE_BLOCKED.value
     assert verdict.calls == [], "규칙이 확정한 건에 모델을 부르면 비용과 지연이 공짜로 늘어난다"
     assert console.ledger.total_cost_micro_usd == 0
-    for stage in ("N0_5_TRIAGE", "N1_JUDGE", "N2_AGGREGATE", "N3_CRITIC"):
+    for stage in ("N0_5_TRIAGE", "N1_JUDGE", "N2_AGGREGATE"):
         assert stages_of(console, stage)[0].status == "NOT_REACHED", stage
     hit = next(h for h in console.rule_hits if h.category == "CONTACT_INFO")
     assert hit.blocking is True
@@ -195,16 +194,26 @@ async def test_인용이_본문에_없으면_버린_판정으로_그린다() -> 
     assert console.violations == [], "검증되지 않은 인용은 판정에 실리지 않는다"
 
 
-async def test_비평이_뒤집으면_그_사실이_배지로_나온다() -> None:
-    verdict, recorder, _ = await run_scenario(BY_ID["critic-overturn"])
+async def test_선별이_확정한_보류를_모델_보류와_다른_배지로_그린다() -> None:
+    """같은 배지로 그리면 Haiku 한 번이 확정한 것이 Sonnet 둘이 읽고 낸 것으로 보인다."""
+    verdict, recorder, _ = await run_scenario(BY_ID["triage-certain"])
     console = built(verdict, recorder)
 
-    assert console.exit_point == ExitPoint.CRITIC_OVERTURNED.value
-    assert console.critic_overturned is True
-    assert console.verdict == Verdict.PASS.value
-    critic = stages_of(console, "N3_CRITIC")[0]
-    assert critic.decision == "OVERTURN"
-    assert stages_of(console, "N4_NOTICE")[0].status == "NOT_REACHED"
+    assert console.exit_point == ExitPoint.TRIAGE_FLAGGED.value
+    assert console.exit_label != view._EXIT_LABELS[ExitPoint.MODEL_FLAGGED.value][0]
+    assert console.verdict == Verdict.FLAG.value
+    triage = stages_of(console, "N0_5_TRIAGE")[0]
+    assert triage.decision == "CERTAIN_VIOLATION"
+    assert triage.outcome == PerspectiveOutcome.VIOLATION.value
+
+    judged = stages_of(console, "N1_JUDGE")
+    assert [row.status for row in judged] == ["SKIPPED", "SKIPPED"]
+    assert {row.outcome for row in judged} == {PerspectiveOutcome.UNCHECKED.value}
+    assert {row.outcome_label for row in judged} == {"미검사"}
+    assert {row.skip_reason for row in judged} == {"TRIAGE_CERTAIN"}
+    assert {row.skip_reason_label for row in judged} == {"선별이 위반을 확정해서 보지 않았다"}
+    assert [v.perspective for v in console.violations] == ["TRIAGE"]
+    assert console.seller_notice, "상품이므로 수정 안내가 함께 나간다"
 
 
 async def test_예산_소진은_통과가_아니라_판정_실패로_그린다() -> None:
@@ -256,7 +265,7 @@ async def test_재생이_결정론적이다() -> None:
 
 
 async def test_카세트가_빠진_호출은_조용히_실패로_접히지_않는다() -> None:
-    """선별과 비평이 실패를 각각 승급과 유지로 접는다. 조용히 접으면 거짓 단계가 그려진다."""
+    """선별이 실패를 승급으로 접는다. 조용히 접으면 거짓 단계가 그려진다."""
     scenario = BY_ID["model-clear"]
     missing = {k: v for k, v in scenario.entries.items() if k[0] != "triage_content"}
     settings = Settings(anthropic_api_key="test", enable_triage=True)
@@ -346,15 +355,14 @@ def test_판정만으로_다시_그려도_단계와_탈출_지점이_나온다()
     assert failed[0].skip_reason_label == "레이트 리밋에 걸렸다"
 
 
-def test_판정만으로는_비평_결정과_선별_사유를_되살릴_수_없다() -> None:
+def test_판정만으로는_선별_사유를_되살릴_수_없다() -> None:
     """얕은 재생의 한계를 화면이 숨기지 않는지 본다."""
     raw = json.loads((CONTRACT_DIR / "content-verdict-triage-promoted.json").read_text())
     console = view.build(ContentVerdict.model_validate(raw), mode="verdict", source="sample")
 
-    critic = next(s for s in console.stages if s.stage == "N3_CRITIC")
-    assert critic.decision == "OVERTURN", "뒤집힘은 계약에 남는다"
     triage = next(s for s in console.stages if s.stage == "N0_5_TRIAGE")
     assert triage.reason is None
+    assert triage.decision is None, "선별의 결정 열거는 계약에 남지 않는다"
     assert "선별이 적은 사유" in console.missing_without_trace[0]
 
 
@@ -690,7 +698,6 @@ def test_시나리오가_파이프라인_모양을_전부_들고_있다() -> Non
     "env",
     [
         {"AECHAK_AI_PERSPECTIVE_FANOUT": "false"},
-        {"AECHAK_AI_ENABLE_ESCALATION": "false"},
         {"AECHAK_AI_ENABLE_NOTICE": "false"},
         {"AECHAK_AI_ENABLE_TRIAGE": "true"},
         {"AECHAK_AI_SCREENING_MODEL": "claude-haiku-4-5"},
@@ -699,10 +706,10 @@ def test_시나리오가_파이프라인_모양을_전부_들고_있다() -> Non
 def test_환경변수가_있어도_시나리오가_같은_탈출_지점을_낸다(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
 ) -> None:
-    """실측으로 ``PERSPECTIVE_FANOUT=false`` 는 네 시나리오를 400으로 죽였고,
-    ``ENABLE_ESCALATION=false`` + ``ENABLE_NOTICE=false`` 는 critic-overturn 을 오류 없이
-    MODEL_FLAGGED / '확정 위반' 으로 그렸다 -- 사이드바에는 그 시나리오의 note 와
-    expected_exit=CRITIC_OVERTURNED 가 그대로 떠 있는 채로.
+    """실측으로 ``PERSPECTIVE_FANOUT=false`` 는 네 시나리오를 400으로 죽였다.
+
+    카세트 키가 (툴 이름, 관점)이고 관점은 ``findings_tool`` 의 분류 enum 집합으로
+    역산되므로 모양 토글 하나가 키를 바꾼다. 시나리오가 설정을 전부 들고 있어야 한다.
     """
     for key, value in env.items():
         monkeypatch.setenv(key, value)

@@ -1,7 +1,7 @@
 """단계 추적이 판정 계약 밖에서 "왜"를 남기는 것을 고정한다.
 
 이 추적은 데모 콘솔(SCRUM-290)이 단계를 눈으로 따라가게 하려고 있다. 그런데 콘솔이 보여 줘야
-하는 것들 -- 선별이 적은 사유, 비평의 결정, 호출 실패 상세, 가린 본문, 수정 문구 후보 --
+하는 것들 -- 선별이 적은 사유와 결정, 호출 실패 상세, 가린 본문, 수정 문구 후보 --
 가운데 어느 것도 ``ContentVerdict`` 에 없고, 그 계약은 백엔드 message 모듈과 1:1이라 필드를
 더할 수 없다. 그래서 인프로세스 추적 객체로 모으고, **추적기를 주지 않으면 아무 일도
 일어나지 않는 것**을 여기서 단언한다. 카프카 경로가 추적기를 주지 않기 때문이다.
@@ -69,7 +69,6 @@ async def test_추적기를_주지_않으면_판정이_그대로다(settings: Se
     scripted = [
         ok(finding(quote)),
         ok(NO_FINDING),
-        ok({"decision": "UPHOLD", "reason": "치료 효능 단정"}),
         ok({"sellerNotice": "치료 효능 표현은 쓸 수 없습니다.", "rewrites": []}),
     ]
 
@@ -128,30 +127,6 @@ async def test_건너뛴_관점과_통과한_관점이_추적에서_갈린다(tr
     assert {r.skip_reason for r in ran} == {None}
 
 
-async def test_비평의_UPHOLD와_INSUFFICIENT가_추적에서_갈린다(settings: Settings) -> None:
-    """판정 메시지에서는 둘이 같은 모양이다. 뒤집힘만 계약에 실린다."""
-    quote = "관절염 치료에 효과가 있습니다"
-    verdicts = []
-    decisions = []
-    for decision in ("UPHOLD", "INSUFFICIENT"):
-        recorder = TraceRecorder()
-        llm = FakeLlmClient(
-            [
-                ok(finding(quote)),
-                ok(NO_FINDING),
-                ok({"decision": decision, "reason": "판단"}),
-                ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
-            ]
-        )
-        verdict = await InspectionPipeline(llm=llm, settings=settings, recorder=recorder).run(product(quote))
-        verdicts.append(json.loads(verdict.model_dump_json(exclude={"decidedAt", "calls"})))
-        (critic_row,) = rows(recorder, Stage.CRITIC)
-        decisions.append(critic_row.decision)
-
-    assert verdicts[0] == verdicts[1], "계약은 둘을 구분하지 않는다. 그래서 추적이 필요하다"
-    assert decisions == ["UPHOLD", "INSUFFICIENT"]
-
-
 async def test_호출_실패_상세가_추적에_남는다(settings: Settings) -> None:
     """``LlmResult.detail`` 은 ``CallUsage`` 로 넘어가지 않아 열거값만 남는다."""
     recorder = TraceRecorder()
@@ -198,7 +173,6 @@ async def test_수정_문구_후보가_추적에_남는다(settings: Settings) -
         [
             ok(finding(quote)),
             ok(NO_FINDING),
-            ok({"decision": "UPHOLD", "reason": "치료 효능 단정"}),
             ok(
                 {
                     "sellerNotice": "치료 효능 표현은 쓸 수 없습니다.",

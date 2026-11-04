@@ -33,7 +33,6 @@ from demo.replay import CallKey, ScriptedCall
 
 InspectionRequest = ProductInspectionRequest | ReviewInspectionRequest
 
-_CRITIC_TOOL = "review_finding"
 _REWRITE_TOOL = "propose_rewrite"
 _FINDINGS_TOOL = "report_findings"
 
@@ -59,17 +58,13 @@ class Scenario:
     # (툴 이름, 관점)이고 관점은 ``findings_tool`` 의 분류 enum 집합으로 역산되므로
     # ``perspective_fanout`` 이 바뀌면 키가 바뀐다 -- 실측으로
     # ``AECHAK_AI_PERSPECTIVE_FANOUT=false`` 를 셸에 둔 채 콘솔을 띄우면 네 시나리오가 전부
-    # 400으로 죽었고, 비평·수정문구를 함께 끄면 critic-overturn 이 오류 없이 '확정 위반'으로
-    # 그려졌다(사이드바에는 ``expected_exit=CRITIC_OVERTURNED`` 가 그대로 떠 있는 채로).
-    # .env 가 없어도 배포용 셸이나 direnv 가 켜진 디렉터리에서 그대로 재현된다.
+    # 400으로 죽었다. .env 가 없어도 배포용 셸이나 direnv 가 켜진 디렉터리에서 재현된다.
     enable_triage: bool = True
     perspective_fanout: bool = True
-    enable_escalation: bool = True
     enable_notice: bool = True
     # 모델 ID 도 묶는다. 원장의 모델 이름과 비용이 환경에 따라 달라지면 콘솔이 보여 주는
     # 숫자로 손익분기를 이야기할 수 없다.
     screening_model: str = "claude-sonnet-5"
-    escalation_model: str = "claude-opus-5"
     notice_model: str = "claude-sonnet-5"
     triage_model: str = "claude-haiku-4-5"
     # 모델 클라이언트 자체가 없는 경로(stub 모드)를 보여 주는 시나리오만 참이다.
@@ -87,10 +82,8 @@ class Scenario:
             anthropic_api_key="",
             enable_triage=self.enable_triage,
             perspective_fanout=self.perspective_fanout,
-            enable_escalation=self.enable_escalation,
             enable_notice=self.enable_notice,
             screening_model=self.screening_model,
-            escalation_model=self.escalation_model,
             notice_model=self.notice_model,
             triage_model=self.triage_model,
         )
@@ -119,11 +112,23 @@ class Scenario:
         )
 
 
-def _triage_entry(decision: str, reason: str) -> tuple[CallKey, ScriptedCall]:
+def _triage_entry(
+    decision: str,
+    reason: str,
+    *,
+    category: str | None = None,
+    quote: str | None = None,
+) -> tuple[CallKey, ScriptedCall]:
+    """확정 경로는 분류와 인용을 함께 적는다. 둘 중 하나라도 비면 ``decide`` 가 승급으로 떨어뜨린다."""
     return (
         (triage.TRIAGE_TOOL["name"], Perspective.TRIAGE),
         ScriptedCall(
-            tool_input={"decision": decision, "reason": reason},
+            tool_input={
+                "decision": decision,
+                "reason": reason,
+                "category": category,
+                "quote": quote,
+            },
             input_tokens=320,
             # 0이어야 한다. Haiku 4.5의 최소 캐시 접두부(4,096토큰)에 못 미친다
             cache_read_input_tokens=0,
@@ -153,18 +158,6 @@ def _judge_entry(
             output_tokens=0 if failed else (95 + 40 * len(findings)),
             latency_ms=latency_ms,
             detail=detail,
-        ),
-    )
-
-
-def _critic_entry(decision: str, reason: str) -> tuple[CallKey, ScriptedCall]:
-    return (
-        (_CRITIC_TOOL, None),
-        ScriptedCall(
-            tool_input={"decision": decision, "reason": reason},
-            input_tokens=820,
-            output_tokens=140,
-            latency_ms=2_480,
         ),
     )
 
@@ -226,9 +219,9 @@ SCENARIOS: tuple[Scenario, ...] = (
     ),
     Scenario(
         id="model-flag",
-        title="확정 위반 (비평 유지 + 수정 문구)",
+        title="확정 위반 (관점 판정 + 수정 문구)",
         expected_exit="MODEL_FLAGGED",
-        note="비평이 1차 판정을 유지하면 보류가 확정되고, 상품이면 셀러에게 보낼 안내를 만든다.",
+        note="관점이 실제로 읽고 위반을 찾으면 보류가 확정되고, 상품이면 셀러에게 보낼 안내를 만든다.",
         text=_MEDICAL_TEXT,
         entries=dict(
             [
@@ -251,7 +244,6 @@ SCENARIOS: tuple[Scenario, ...] = (
                     ],
                 ),
                 _judge_entry(Perspective.CONDUCT_TRADE, [], latency_ms=1_210),
-                _critic_entry("UPHOLD", "치료와 완치 단정은 오탐이 아니다"),
                 _notice_entry(
                     "치료나 완치를 단정하는 표현은 쓸 수 없습니다. 아래 문구로 바꿔 주세요.",
                     [
@@ -266,30 +258,32 @@ SCENARIOS: tuple[Scenario, ...] = (
         ),
     ),
     Scenario(
-        id="critic-overturn",
-        title="비평 뒤집힘 (보류에서 통과로)",
-        expected_exit="CRITIC_OVERTURNED",
+        id="triage-certain",
+        title="선별 확정 위반 (Sonnet 건너뜀 + 수정 문구)",
+        expected_exit="TRIAGE_FLAGGED",
         note=(
-            "1차가 위반으로 봤지만 다른 모델이 오탐이라고 뒤집었다. 관점 행은 VIOLATION 으로 "
-            "남고 위반 목록에서는 모델 것이 빠진다. 뒤집힘은 criticOverturned 로만 알 수 있다."
+            "선별이 의심의 여지없는 위반을 찾으면 관점 호출을 건너뛰고 바로 보류로 확정한다. "
+            "위반은 선별 관점에 달리고 건너뛴 관점 행의 사유는 TRIAGE_CERTAIN 이다 -- "
+            "미검사 행에 위반을 달면 안 본 관점이 위반을 찾은 것으로 읽힌다."
         ),
-        text=_EDGE_TEXT,
+        text=_MEDICAL_TEXT,
         entries=dict(
             [
-                _triage_entry("NEEDS_REVIEW", "효능 표현을 더 봐야 한다"),
-                _judge_entry(
-                    Perspective.DISPLAY_ADS,
+                _triage_entry(
+                    "CERTAIN_VIOLATION",
+                    "치료와 완치를 단정하는 문장이 본문에 그대로 있다",
+                    category="MEDICAL_CLAIM",
+                    quote="관절염 치료에 효과가 있습니다",
+                ),
+                _notice_entry(
+                    "치료를 단정하는 표현은 쓸 수 없습니다. 아래 문구로 바꿔 주세요.",
                     [
-                        _finding(
-                            "MEDICAL_CLAIM",
-                            "관절 건강에 도움을 줄 수 있는",
-                            "효능을 주장한다",
-                            "관절 건강을 생각한 원료",
-                        )
+                        {
+                            "original": "관절염 치료에 효과가 있습니다",
+                            "suggestion": "관절 건강에 도움을 줄 수 있습니다",
+                        }
                     ],
                 ),
-                _judge_entry(Perspective.CONDUCT_TRADE, [], latency_ms=1_210),
-                _critic_entry("OVERTURN", "도움을 줄 수 있다는 표현은 정책이 허용하는 수준이다"),
             ]
         ),
     ),
@@ -315,7 +309,6 @@ SCENARIOS: tuple[Scenario, ...] = (
                     ],
                 ),
                 _judge_entry(Perspective.CONDUCT_TRADE, [], latency_ms=1_180),
-                _critic_entry("UPHOLD", "치료 효능 서술이 맞다"),
             ]
         ),
     ),
