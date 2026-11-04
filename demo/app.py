@@ -124,7 +124,7 @@ async def scenarios() -> JSONResponse:
             "defaults": {
                 "triageModel": settings.triage_model,
                 "screeningModel": settings.screening_model,
-                "escalationModel": settings.escalation_model,
+                "noticeModel": settings.notice_model,
                 "enableTriage": settings.enable_triage,
                 "krwPerUsd": view.KRW_PER_USD,
             },

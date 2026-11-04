@@ -490,8 +490,6 @@ function renderHead(view) {
   const row = el("div", "exit");
   row.appendChild(el("span", "badge", view.exit_label));
   row.appendChild(el("span", "verdict", "판정 " + view.verdict_label + " (" + view.verdict + ")"));
-  row.appendChild(pill(view.critic_overturned ? "VIOLATION" : "not_reached",
-    "criticOverturned " + view.critic_overturned));
   panel.appendChild(row);
   panel.appendChild(el("p", "note", view.exit_note));
 
