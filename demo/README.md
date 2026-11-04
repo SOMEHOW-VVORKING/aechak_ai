@@ -45,15 +45,14 @@ uv run uvicorn demo.app:app --port 8100
 ### 재생이 모델 **경계**에서 되돌리는 이유
 
 판정 JSON 하나를 다시 그리는 얕은 재생으로는 보여 줘야 하는 것의 절반이 나오지 않는다.
-선별 사유·비평 결정·단계 라벨·실패 상세가 판정 계약에 없기 때문이다. 그래서 `call_tool` 만
+선별 사유와 결정·단계 라벨·실패 상세가 판정 계약에 없기 때문이다. 그래서 `call_tool` 만
 구현한 `ReplayLlmClient` 를 끼운다. 그러면 **실제 파이프라인이 그대로 돌아** 추적 전체가
 생기고, 결정론적이며 비용이 0이다. 이 이음매는 이미 열려 있었다 — 파이프라인은 `llm` 을
 덕 타이핑으로 `call_tool`/`aclose` 만 부른다. **운영 코드는 한 줄도 바꾸지 않았다.**
 
 카세트 키는 호출 순서가 아니라 **(툴 이름, 관점)** 이다. 순서로 두면 분기가 바뀔 때마다
-조용히 어긋난 응답이 흘러 들어간다. 없는 키는 `CassetteMiss` 로 터뜨린다 — 선별과 비평이
-실패를 각각 승급과 유지로 접기 때문에, 빠진 카세트를 조용히 실패로 돌리면 콘솔이 거짓
-단계를 그린다.
+조용히 어긋난 응답이 흘러 들어간다. 없는 키는 `CassetteMiss` 로 터뜨린다 — 선별이 실패를
+승급으로 접기 때문에, 빠진 카세트를 조용히 실패로 돌리면 콘솔이 거짓 단계를 그린다.
 
 ### 모의는 모델이 아니다
 
@@ -96,10 +95,10 @@ NEEDS_REVIEW" 와 같은 방향이다. 대역은 깨끗함을 증명할 수 없�
 |---|---|
 | 규칙 차단 | `FLAG` + 원장이 빔 + RULE 행이 VIOLATION |
 | 선별 통과 | TRIAGE 행이 `CLEAR` |
+| 선별 확정 위반 | `FLAG` + TRIAGE 행이 `VIOLATION` |
 | 모델 위반 없음 | `PASS` + 모델 관점 **전부**가 실제로 판정 |
 | 부분 미검사 통과 | `PASS` + 모델 관점 가운데 `UNCHECKED` 가 하나라도 있음 |
-| 비평 뒤집힘 | `criticOverturned=true` |
-| 확정 위반 | `FLAG` + 모델 호출이 있음 |
+| 확정 위반 | `FLAG` + 모델 호출이 있음 + TRIAGE 행이 `VIOLATION` 이 아님 |
 | (판정 실패) | `FAILED` |
 | (stub 모드) | `FAILED` + `LLM_DISABLED` |
 
@@ -110,12 +109,11 @@ NEEDS_REVIEW" 와 같은 방향이다. 대역은 깨끗함을 증명할 수 없�
 아니라 관점 행에서 센 수치다 — "쏜 관점 2건 중 1건만 읽었다".
 
 **재생은 환경변수를 한 칸도 읽지 않는다.** `Scenario` 가 파이프라인 모양 전부
-(`enable_triage`·`perspective_fanout`·`enable_escalation`·`enable_notice`·모델 ID 넷)를 들고
+(`enable_triage`·`perspective_fanout`·`enable_notice`·모델 ID 셋)를 들고
 `Scenario.settings()` 가 리터럴에서 조립한다. 그리고 `_run` 이 끝에서 실제 탈출 지점을
 `expected_exit` 와 맞춰 보고 어긋나면 화면을 그리지 않고 400을 돌려준다 — 종전에는
-셸에 `AECHAK_AI_PERSPECTIVE_FANOUT=false` 가 있으면 네 시나리오가 카세트 미스로 죽고,
-비평·수정문구를 끄면 `critic-overturn` 이 오류 없이 "확정 위반"으로 그려졌다(사이드바에는
-`expected_exit=CRITIC_OVERTURNED` 가 그대로 떠 있는 채로).
+셸에 `AECHAK_AI_PERSPECTIVE_FANOUT=false` 가 있으면 네 시나리오가 카세트 미스로 죽었고,
+그 실패가 사이드바의 `expected_exit` 와 어긋난 채로 정상 응답으로 나갔다.
 
 **백엔드 게이트 배지**는 별 축이다. 백엔드 `InspectionFacade.modelVerified()` 를 그대로 옮긴
 술어로, 이 통과를 관리자 확인 없이 반영할 수 있는지 답한다. 그 거울은 이 레포에
@@ -158,7 +156,7 @@ NEEDS_REVIEW" 와 같은 방향이다. 대역은 깨끗함을 증명할 수 없�
 | "요약을 만들기에 리뷰가 아직 적습니다" | 분모 미달이라 **모델을 부르지 않았다** |
 | "반복이라고 셌는데 문장이 없다" (주황 점선) | 코드가 센 숫자는 있고 산문만 없다 |
 
-`demo/summary_view.py` 가 **별 모듈**인 이유: `demo/view.py`(721줄)는 검수 6단계 전용이고
+`demo/summary_view.py` 가 **별 모듈**인 이유: `demo/view.py` 는 검수 5단계 전용이고
 `CANONICAL_STAGES`·`ExitPoint` 8종·`_SKIP_REASON_LABELS` 가 검수 어휘로 고정이다. 거기
 끼우면 요약 단계가 전부 "도달하지 않음"으로 그려진다.
 
