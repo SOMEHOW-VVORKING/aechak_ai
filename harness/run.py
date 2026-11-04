@@ -570,7 +570,11 @@ async def _main(args: argparse.Namespace) -> int:
         return 0
 
     baseline = _load_baseline(Path(args.baseline_from)) if args.baseline_from else {}
-    llm = LlmClient(api_key=settings.anthropic_api_key, timeout_seconds=settings.request_timeout_seconds)
+    llm = LlmClient(
+        api_key=settings.anthropic_api_key,
+        timeout_seconds=settings.request_timeout_seconds,
+        local_base_url=settings.local_llm_base_url,
+    )
     try:
         if args.mode == "triage-only":
             records = await _run_triage_only(settings, llm, args.repeat, cases)

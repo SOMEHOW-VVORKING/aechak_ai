@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     # 빈 문자열도 미지정이고, "none"처럼 등급이 아닌 값은 부팅에서 떨어뜨린다.
     triage_effort: OptionalEffort = None
 
+    # 로컬 sLLM. 모델 ID 를 ``local/`` 로 시작하게 적으면(예: ``local/ax-4.0-light``) 그 호출만
+    # 이 주소의 OpenAI 호환 경로로 간다. 가중치와 기동은 ``harness/local-llm.sh`` 가 맡는다.
+    # **이 URL 의 정본은 여기 하나다** -- 클라이언트 쪽 기본값으로도 적어 두면 한쪽만 고치는
+    # 날 호출이 조용히 엉뚱한 포트로 간다.
+    local_llm_base_url: str = "http://127.0.0.1:8080"
+
     request_timeout_seconds: float = 60.0
     # 사고 토큰과 tool_use가 한 상한을 나눠 쓴다. 상한이 좁으면 tool_use 블록이 안 나와
     # SCHEMA_INVALID로 떨어진다. max_tokens는 지출이 아니라 상한이라 넉넉히 둔다.
