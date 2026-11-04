@@ -139,7 +139,8 @@ def test_토큰_실측_대상이_실제_캐시_접두부다() -> None:
     """
     from harness.run import cache_prefix_targets
 
-    targets = {t.name: t for t in cache_prefix_targets(Settings())}
+    fanout = Settings(perspective_fanout=True)
+    targets = {t.name: t for t in cache_prefix_targets(fanout)}
 
     assert "triage_prompt_on_haiku" in targets
     judged = [t for name, t in targets.items() if name.startswith("perspective_")]
@@ -149,6 +150,15 @@ def test_토큰_실측_대상이_실제_캐시_접두부다() -> None:
     assert judged[0].tools != judged[1].tools, (
         "관점마다 tools가 같다면 접두부를 공유할 수 있다는 뜻이고, 직렬 실행의 근거가 달라진다"
     )
+
+    # 기본값인 단일 관점은 엔트리가 하나다. 갈라질 것이 없으니 그 하나를 재야 한다.
+    single = [
+        t
+        for name, t in {t.name: t for t in cache_prefix_targets(Settings())}.items()
+        if name.startswith("perspective_")
+    ]
+    assert len(single) == 1
+    assert single[0].tools, "tools를 빼면 접두부를 실제보다 짧게 잰다"
 
 
 def test_규칙이_비차단으로_적중해_선별을_안_물은_건은_OFF와_다르다() -> None:

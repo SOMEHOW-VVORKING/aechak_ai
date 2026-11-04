@@ -81,8 +81,13 @@ class Settings(BaseSettings):
     # ``enable_escalation`` 이 있었다. 비평 노드를 뺐으므로 토글도 뺀다 -- 끄는 레버만 남기면
     # 켜도 아무 일이 없는 설정이 되어 운영에서 "켰는데 왜 안 도나"가 된다.
     enable_notice: bool = True
-    perspective_fanout: bool = True
-    # 기본 꺼짐. 백엔드 열거에 TRIAGE가 없는 동안 켜면 판정 전건이 격리 토픽으로 간다.
+    # 기본 꺼짐. 하네스 108건에서 관점 하나가 둘보다 나았다 -- 건당 비용 31%, 지연 p50 42%가
+    # 줄고 두 관점에서 나던 과탐 한 종이 사라졌다. 관점을 쪼개면 각자 자기 분류만 보려다
+    # 맥락을 잃는다. 켜면 두 관점이 순차로 돌아 지연이 두 배가 된다.
+    perspective_fanout: bool = False
+    # 기본 꺼짐. 로컬 sLLM(local/ 접두)으로 켜면 호출이 0원이지만 GPU 없이는 건당 60초가
+    # 넘는다 -- Mac Metal 1.2초 대 CPU 4스레드 42.7초 실측이고 Fargate x86은 더 느리다.
+    # Haiku로 켜면 캐시 접두부 4,096 미달로 선별만 건당 4.76원이라 전체가 더 비싸진다.
     enable_triage: bool = False
 
     # --- 리뷰 요약(SCRUM-310). 검수와 모델·토픽·폴 간격을 공유하지 않는다 ------------

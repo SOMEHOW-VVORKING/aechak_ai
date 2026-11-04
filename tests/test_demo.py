@@ -46,7 +46,11 @@ CONTRACT_DIR = Path(__file__).parent / "contract"
 
 async def run_scenario(scenario: Scenario) -> tuple[ContentVerdict, TraceRecorder, ReplayLlmClient | None]:
     """시나리오를 재생으로 돌린다. 네트워크도 대기도 없다."""
-    settings = Settings(anthropic_api_key="test", enable_triage=scenario.enable_triage)
+    settings = Settings(
+        anthropic_api_key="test",
+        enable_triage=scenario.enable_triage,
+        perspective_fanout=True,
+    )
     llm = None if scenario.llm_disabled else ReplayLlmClient(entries=dict(scenario.entries))
     recorder = TraceRecorder()
     pipeline = InspectionPipeline(llm=llm, settings=settings, recorder=recorder)
@@ -268,7 +272,7 @@ async def test_카세트가_빠진_호출은_조용히_실패로_접히지_않�
     """선별이 실패를 승급으로 접는다. 조용히 접으면 거짓 단계가 그려진다."""
     scenario = BY_ID["model-clear"]
     missing = {k: v for k, v in scenario.entries.items() if k[0] != "triage_content"}
-    settings = Settings(anthropic_api_key="test", enable_triage=True)
+    settings = Settings(anthropic_api_key="test", enable_triage=True, perspective_fanout=True)
     pipeline = InspectionPipeline(llm=ReplayLlmClient(entries=missing), settings=settings)
 
     with pytest.raises(CassetteMiss):
@@ -369,7 +373,7 @@ def test_판정만으로는_선별_사유를_되살릴_수_없다() -> None:
 async def test_모의_판정기는_내_문장에서_인용을_떼어_온다() -> None:
     """꾸며 쓴 인용은 검증에서 떨어진다. 대역이 거짓 단계를 그리는 자리다."""
     scenario = BY_ID["model-flag"]
-    settings = Settings(anthropic_api_key="", enable_triage=True)
+    settings = Settings(anthropic_api_key="", enable_triage=True, perspective_fanout=True)
     recorder = TraceRecorder()
     pipeline = InspectionPipeline(llm=MockLlmClient(), settings=settings, recorder=recorder)
 
@@ -386,7 +390,7 @@ async def test_모의_판정기는_내_문장에서_인용을_떼어_온다() ->
 
 
 async def test_모의_판정기도_깨끗한_본문은_선별에서_끝낸다() -> None:
-    settings = Settings(anthropic_api_key="", enable_triage=True)
+    settings = Settings(anthropic_api_key="", enable_triage=True, perspective_fanout=True)
     recorder = TraceRecorder()
     pipeline = InspectionPipeline(llm=MockLlmClient(), settings=settings, recorder=recorder)
 
@@ -600,7 +604,11 @@ async def test_관점_하나가_죽은_통과도_부분_미검사로_그린다()
         outcome=CallOutcome.RATE_LIMITED,
         latency_ms=90,
     )
-    settings = Settings(anthropic_api_key="test", enable_triage=scenario.enable_triage)
+    settings = Settings(
+        anthropic_api_key="test",
+        enable_triage=scenario.enable_triage,
+        perspective_fanout=True,
+    )
     recorder = TraceRecorder()
     pipeline = InspectionPipeline(llm=ReplayLlmClient(entries=entries), settings=settings, recorder=recorder)
     verdict = await pipeline.run(scenario.to_request())
@@ -647,7 +655,7 @@ async def test_모의_선별은_표에_안_걸리면_더_보라고_넘긴다() -
     """
     from app.schemas.inspection import ReviewInspectionRequest
 
-    settings = Settings(anthropic_api_key="", enable_triage=True)
+    settings = Settings(anthropic_api_key="", enable_triage=True, perspective_fanout=True)
     for text in (
         "배송기사 김철수님이 서울시 강남구 101동 202호에 잘못 두고 갔어요",
         "오늘 날씨 참 좋네요",
