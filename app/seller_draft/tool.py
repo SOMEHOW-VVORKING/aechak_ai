@@ -50,9 +50,14 @@ DRAFT_TOOL_NAME = "draft_product_form"
 # "고르지 못했다"의 센티넬. nullable 을 쓰지 않기 위한 값이고 ``guard.py`` 가 None 으로 접는다.
 LEAF_DECLINED = 0
 
+# **슬롯 설명이 확인 출처를 열거하지 않는다.** 출처가 모드마다 다르기 때문이다 --
+# ``FILL`` 은 상품명·사진이고 ``REFINE`` 은 거기에 셀러 원문이 더해진다. 여기 "사진이나
+# 상품명으로 확인되지 않으면 비워라" 를 적어 두면 **툴 스키마가 모드 지시를 이겨** 다시 쓰기
+# 요청에서 슬롯이 전멸하고, 서버는 원문으로 되돌려 유료 호출 한 번이 아무 일도 하지 않는다.
+# 출처를 말하는 자리는 ``prompt.DRAFT_PREFIX`` 의 지시 1 하나다.
 _SLOT_KEYS: tuple[tuple[str, str], ...] = (
     ("itemSummary", "이 상품이 무엇인가. 품목·용도·대상 반려동물 크기대. 모르면 빈 문자열."),
-    ("materialOrSpec", "소재·규격·구성. 사진이나 상품명으로 확인되지 않으면 빈 문자열."),
+    ("materialOrSpec", "소재·규격·구성. 확인되지 않으면 빈 문자열."),
     ("usage", "사용법 또는 급여법. 확인되지 않으면 빈 문자열."),
     ("careAndStorage", "보관·세탁·주의. 확인되지 않으면 빈 문자열."),
 )
@@ -71,7 +76,7 @@ def _basis_field(what: str) -> dict[str, Any]:
 DRAFT_TOOL: dict[str, Any] = {
     "name": DRAFT_TOOL_NAME,
     "description": (
-        "셀러가 입력한 상품명과 (있으면) 사진으로 상품 등록 폼의 초안을 채운다. "
+        "셀러가 입력한 상품명과 (있으면) 사진·셀러가 쓴 설명으로 상품 등록 폼의 초안을 채운다. "
         "확인할 수 없는 것은 빈 문자열로 두고 근거를 NONE 으로 적는다. 상품명은 고치지 않는다."
     ),
     "strict": True,

@@ -31,6 +31,7 @@ from typing import Any
 
 from app.schemas.draft import (
     DraftImage,
+    DraftMode,
     ImageMode,
     LockedFields,
     OptionGroupDraft,
@@ -138,6 +139,8 @@ class DraftScenario:
     expected_exit: str
     category_id: int | None = None
     locked: LockedFields | None = None
+    # 셀러 원문을 그대로 둘지 다시 쓸지. 기본은 ``FILL`` 이다.
+    mode: DraftMode = DraftMode.FILL
     llm_disabled: bool = False
     # 텍스트 변형(가)의 카세트.
     entries: dict[SequencedCallKey, ScriptedCall] = field(default_factory=dict)
@@ -171,6 +174,7 @@ class DraftScenario:
             productName=self.product_name,
             categoryId=self.category_id,
             lockedFields=self.locked,
+            mode=self.mode,
             image=draft_image(self.image_px, self.image_px) if with_image else None,
         )
 
@@ -463,6 +467,33 @@ DRAFT_SCENARIOS: tuple[DraftScenario, ...] = (
                     slots=_slots(item="응고형 벤토나이트 고양이 모래입니다."),
                     groups=[{"name": "향", "values": ["무향", "베이비파우더"]}],
                     notice="용량 옵션을 이미 적어 주셨으므로 향 옵션만 제안했습니다.",
+                )
+            )
+        },
+    ),
+    DraftScenario(
+        id="draft-refine",
+        title="셀러 원문을 다시 쓴다 — REFINE",
+        note="같은 원문을 **다시 쓸 대상으로** 모델에 주고 돌아온 문구를 설명에 쓴다. 같은 입력을 "
+        "`FILL` 로 보내면 원문이 그대로 남는다. **옵션은 모드와 무관하게 셀러 값이다**",
+        product_name="고양이모래 벤토나이트 10L",
+        mode=DraftMode.REFINE,
+        locked=LockedFields(
+            description="저희 매장에서 직접 소분해서 보냅니다. 응고 잘되고 먼지 적어요 재구매 많아요",
+            optionGroups=[OptionGroupDraft(name="용량", values=["5L", "10L"])],
+        ),
+        expected_exit=DraftExit.FILLED.value,
+        entries={
+            _KEY: _call(
+                _tool_input(
+                    leaf=251,
+                    slots=_slots(
+                        item="응고형 벤토나이트 고양이 모래입니다. 매장에서 직접 소분해 보냅니다.",
+                        spec="벤토나이트 100%, 10L 단위 소분 포장.",
+                        usage="배변함에 5~7cm 높이로 깔고 뭉친 덩어리만 걷어내 주세요.",
+                        care="직사광선을 피해 밀폐 보관해 주세요.",
+                    ),
+                    notice="용량 옵션은 적어 주신 값을 그대로 뒀습니다.",
                 )
             )
         },

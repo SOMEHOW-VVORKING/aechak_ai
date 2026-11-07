@@ -102,7 +102,15 @@ _FAKE_PRIZE = re.compile(r"(당첨\s*(되셨|되었습니다|됐습니다)|당�
 _PHRASE_WORDS = 4
 _PHRASE_REPEAT_MIN = 3
 
-_REDACTION = "[가림]"
+# 레닥션 마커. **공개 상수다** -- 다른 모듈이 이 문자열을 떨어뜨려야 한다.
+#
+# 초안 다시 쓰기(``seller_draft``)는 레닥션을 지난 셀러 원문을 모델에게 "다시 적어라" 와
+# 함께 준다. 모델이 이 마커를 그대로 옮겨 적으면 서버 내부 표식이 셀러 폼에 실리므로
+# ``seller_draft.guard.screen_text`` 가 마커를 품은 조각을 떨어뜨린다. 그 가드가 문자열을
+# 베껴 두면 여기서 문구를 고치는 날 조용히 어긋난다.
+#
+# **판정 로직은 한 줄도 바뀌지 않는다 -- 이름만 공개로 올렸다.**
+REDACTION_MARKER = "[가림]"
 
 # 모델에 보내는 본문을 감싸는 구분자. ``triage.py``와 ``pipeline.py``가 같은 토큰을 쓴다.
 #
@@ -111,7 +119,8 @@ _REDACTION = "[가림]"
 # 구별되지 않는다. 선별이 켜지면 그 한 번의 CLEAR가 Sonnet 두 관점과 백엔드 게이트를 모두
 # 건너뛰게 하므로, 성공한 인젝션이 곧 무검수 자동 승인이 된다.
 ENVELOPE_TOKENS: tuple[str, ...] = ("</본문>", "<본문>", "</대상>", "<대상")
-_NEUTRALIZED = "[태그]"
+# 중성화 마커. 공개 이유는 ``REDACTION_MARKER`` 와 같다.
+NEUTRALIZED_MARKER = "[태그]"
 
 # 폭이 0이거나 방향만 바꾸는 서식 문자. **글자 모양에 나타나지 않으면서 문자열 비교만 깬다.**
 #
@@ -176,7 +185,7 @@ def neutralize_envelope(text: str) -> str:
     """
     out = strip_invisible(text)
     for token in ENVELOPE_TOKENS:
-        out = out.replace(token, _NEUTRALIZED)
+        out = out.replace(token, NEUTRALIZED_MARKER)
     return out
 
 
@@ -373,5 +382,5 @@ def _redact(text: str) -> str:
     out = text
     # 지시형 문장을 함께 가린다. 규칙이 찾아 놓고도 그대로 보여주면 방어 한 겹을 버린다.
     for pattern in (_PHONE, _EMAIL, _ACCOUNT, _INJECTION_STRONG, _INJECTION_WEAK):
-        out = pattern.sub(_REDACTION, out)
+        out = pattern.sub(REDACTION_MARKER, out)
     return out

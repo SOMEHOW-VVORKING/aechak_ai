@@ -808,8 +808,270 @@ async def test_집계가_1순위_지표_행을_전부_찍는다() -> None:
         assert key in rows, key
 
 
+# --- 다시 쓰기 측정 ---------------------------------------------------------------------
+#
+# **이 모드만 측정 장치가 없었다.** 레포가 ``draft_image_mode``·``enable_triage`` 에 적용한
+# "구현하고 측정하고 기본은 끈다" 에서 다시 쓰기가 빠져 있었다 -- 러너가 ``mode`` 도
+# ``lockedFields`` 도 넣지 않는 요청을 만들어 **되돌림률이 한 번도 측정되지 않았다.**
+
+
+class _RefineClient:
+    """다시 쓴 문구를 돌려주는 가짜. ``mode`` 로 세 가지 종료 모양을 만든다.
+
+    품질을 재는 것이 아니라 **되돌림률 행이 실제로 찍히는가**를 고정한다.
+    """
+
+    def __init__(self, *, slots: str = "rewritten") -> None:
+        self.calls: list[dict[str, object]] = []
+        self._slots = slots
+
+    async def call_tool(self, **kwargs: object) -> object:
+        from app.llm.client import LlmResult
+        from app.schemas.inspection import CallOutcome
+
+        request_id = str(kwargs["request_id"])
+        self.calls.append({"request_id": request_id})
+        if self._slots == "empty":
+            parts = {"itemSummary": "", "materialOrSpec": "", "usage": "", "careAndStorage": ""}
+        elif self._slots == "marker":
+            parts = {
+                "itemSummary": f"{rules.REDACTION_MARKER} 로 문의 주세요.",
+                "materialOrSpec": "",
+                "usage": "",
+                "careAndStorage": "",
+            }
+        else:
+            parts = {
+                "itemSummary": "다시 쓴 품목 설명입니다.",
+                "materialOrSpec": "나일론 소재입니다.",
+                "usage": "",
+                "careAndStorage": "",
+            }
+        case = draft_cases.BY_ID[request_id.split("-", 2)[-1]]
+        return LlmResult(
+            call_id=request_id,
+            outcome=CallOutcome.SUCCESS,
+            model_id="claude-haiku-4-5",
+            tool_input={
+                "leafCategoryId": case.leaf_truth or LEAF_DECLINED,
+                "descriptionParts": parts,
+                "optionGroups": [],
+                "basis": {"categoryId": "NAME", "description": "NAME", "optionGroups": "NONE"},
+                "imageUsability": "NO_IMAGE_SENT",
+                "sellerNotice": "",
+            },
+            input_tokens=2_340,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+            output_tokens=450,
+            cost_micro_usd=4_590,
+            latency_ms=1_200,
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _measure_refine(**client_kwargs: object) -> list[run_draft.Record]:
+    client = _RefineClient(**client_kwargs)  # type: ignore[arg-type]
+    return await run_draft._measure(
+        mode="refine",
+        model="haiku",
+        variant=896,
+        repeat=1,
+        llm=client,
+        cases=draft_cases.refine_cases(),
+    )
+
+
+def test_다시_쓰기_corpus_가_모델에_닿는_케이스만_가리킨다() -> None:
+    """0원 케이스에 원문을 붙이면 그 건은 모델에 닿지 않고 **되돌림률 분모만 부풀린다.**
+
+    자기검사가 같은 것을 막지만, 그 검사가 지워지는 변경을 이 테스트가 막는다.
+    """
+    reachable = {case.id for case in run_draft.model_called_cases("refine")}
+
+    assert draft_cases.REFINE_DESCRIPTIONS, "corpus 가 비면 되돌림률을 영구히 못 잰다"
+    for case_id in draft_cases.REFINE_DESCRIPTIONS:
+        assert case_id in draft_cases.BY_ID, case_id
+        assert case_id in reachable, f"{case_id}: 0원 케이스에 원문이 붙었다"
+
+
+def test_다시_쓰기_요청이_원문과_모드를_싣는다() -> None:
+    """**러너가 모드도 잠근 값도 넣지 않으면 영원히 FILL 을 측정한다.** 그 상태였다."""
+    from app.schemas.draft import DraftMode
+
+    case = draft_cases.BY_ID[next(iter(draft_cases.REFINE_DESCRIPTIONS))]
+    refine = run_draft._request_for(case, "refine", 896)
+    plain = run_draft._request_for(case, "a", 896)
+
+    assert refine.mode is DraftMode.REFINE
+    assert refine.lockedFields is not None
+    assert refine.lockedFields.description == draft_cases.REFINE_DESCRIPTIONS[case.id]
+    # (가)는 그대로다 -- 변수가 "원문을 다시 쓸 대상으로 주는가" 하나여야 공정하다.
+    assert plain.mode is DraftMode.FILL
+    assert plain.lockedFields is None
+    assert run_draft._settings_for("refine", "haiku", 896) == run_draft._settings_for("a", "haiku", 896)
+
+
+async def test_되돌림률이_숫자로_찍힌다() -> None:
+    """다시 쓴 비율과 되돌린 비율이 **둘 다** 한 줄에 나온다."""
+    rewritten = dict(run_draft._summarize(await _measure_refine(), "refine"))
+    reverted = dict(run_draft._summarize(await _measure_refine(slots="empty"), "refine"))
+
+    assert "[refine] 다시 쓰기 반영률" in rewritten
+    assert "다시 씀 10/10(100%)" in rewritten["[refine] 다시 쓰기 반영률"]
+    assert "원문 유지(되돌림) 10(100%)" in reverted["[refine] 다시 쓰기 반영률"]
+    # 케이스별 줄이 있어야 "어느 모양의 원문에서 되돌아갔는지" 를 사람이 읽을 수 있다.
+    assert "되돌림" in reverted["[refine] 다시 쓰기 케이스별"]
+    assert "다시 씀" in rewritten["[refine] 다시 쓰기 케이스별"]
+
+
+async def test_표식_유출이_0_으로_찍힌다() -> None:
+    """**가드가 막는다를 주장이 아니라 측정으로 남긴다.**
+
+    모델이 서버 레닥션 표식을 그대로 옮겨 적어도 초안에 실려서는 안 된다. 이 줄이 0 이
+    아니면 정확도와 무관하게 모드를 켜지 않는다.
+    """
+    rows = dict(run_draft._summarize(await _measure_refine(slots="marker"), "refine"))
+
+    assert rows["[refine] 표식 유출"].startswith("0/10 — 없음")
+    # 표식 때문에 떨어졌으므로 되돌림으로 센다.
+    assert "원문 유지(되돌림) 10" in rows["[refine] 다시 쓰기 반영률"]
+
+
+async def test_다시_쓰기_행이_다른_모드에서는_나오지_않는다() -> None:
+    """분모가 0 인 모드에 빈 줄을 찍지 않는다 -- ``0/0`` 은 숫자가 아니다."""
+    rows = dict(run_draft._summarize(await _measure_a(), "a"))
+
+    assert not any(key.startswith("[a] 다시 쓰기") for key in rows)
+
+
 async def test_0단_기준선과의_비교가_층별로_나온다() -> None:
     rows = dict(run_draft._compare(run_draft._lexicon_only_records(), await _measure_a(), label="(x)"))
 
     assert "한계 이득 (x)" in rows
     assert "n=" in rows["한계 이득 (x)"]
+
+
+def _refine_record(
+    case_id: str,
+    *,
+    description_status: str,
+    guard_kinds: list[str],
+    description_guard_kinds: list[str],
+    model_produced: bool = True,
+) -> run_draft.Record:
+    """되돌림 집계만 보기 위한 최소 기록. 필드 대부분은 이 집계가 읽지 않는다."""
+    return run_draft.Record(
+        mode="refine",
+        repeat=1,
+        case_id=case_id,
+        name_reveals="CLEAR",
+        category_given=None,
+        image_variant=None,
+        leaf_truth=None,
+        gate_grade="CLEAR",
+        gate_leaf=None,
+        predicted_leaf=None,
+        leaf_correct=False,
+        scorable=False,
+        model_called=True,
+        image_usability="NO_IMAGE_SENT",
+        option_group_names=[],
+        option_group_hit=None,
+        field_status={"description": description_status},
+        guard_kinds=guard_kinds,
+        basis={},
+        cost_micro_usd=1,
+        latency_ms=1,
+        cache_read_tokens=0,
+        refine_locked=True,
+        description_guard_kinds=description_guard_kinds,
+        model_produced=model_produced,
+    )
+
+
+def test_되돌림_사유는_설명_필드_적중만_센다() -> None:
+    """``guardDrops`` 전부로 세면 **옵션 쪽 적중이 되돌림 사유로 찍힌다.**
+
+    되돌림은 설명 한 필드의 사건이다. 옵션 그룹이 가드에 걸린 건은 설명을 되돌린 이유가
+    아닌데, 축을 좁히지 않으면 그 적중이 사유 표에 들어가고 거꾸로 **사유 없이 되돌아간
+    건이 "사유 있는 되돌림" 으로 세어진다** -- 그 수가 "프롬프트가 다시 쓰기를 못 끌어낸다"
+    는 신호라서, 거짓이면 모드를 켤지 판단하는 근거가 사라진다.
+    """
+    records = [
+        # 설명은 사유 없이 되돌아갔고, 적중은 옵션 쪽에만 있다.
+        _refine_record(
+            next(iter(draft_cases.REFINE_DESCRIPTIONS)),
+            description_status="KEPT_LOCKED",
+            guard_kinds=["BANNED"],
+            description_guard_kinds=[],
+        ),
+    ]
+
+    rows = dict(run_draft._refine_rows("refine", records))
+
+    reason = rows["[refine] 되돌림 사유"]
+    assert "사유 없는 되돌림 1건" in reason, "옵션 적중이 설명 되돌림 사유로 세어졌다"
+    assert "BANNED" not in reason.split("/")[0], "옵션 쪽 적중이 사유 표에 들어갔다"
+
+
+def test_설명_적중은_되돌림_사유로_센다() -> None:
+    """위 테스트의 짝. 설명 필드에서 떨어진 건은 사유가 있는 되돌림이다."""
+    records = [
+        _refine_record(
+            next(iter(draft_cases.REFINE_DESCRIPTIONS)),
+            description_status="KEPT_LOCKED",
+            guard_kinds=["RULE", "BANNED"],
+            description_guard_kinds=["RULE"],
+        ),
+    ]
+
+    rows = dict(run_draft._refine_rows("refine", records))
+
+    reason = rows["[refine] 되돌림 사유"]
+    assert "RULE=1" in reason
+    assert "사유 없는 되돌림 0건" in reason
+
+
+def test_호출이_안_된_되돌림을_프롬프트_탓으로_세지_않는다() -> None:
+    """0원 분기와 호출 실패도 셀러 원문을 에코하므로 응답만 보면 ``KEPT_LOCKED`` 로 같다.
+
+    뭉개면 **타임아웃이 "프롬프트가 다시 쓰기를 못 끌어낸다" 로 세어진다.** 그 수를 보고
+    모드를 켤지 판단하므로 거짓이면 판단이 무너진다.
+    """
+    case_id = next(iter(draft_cases.REFINE_DESCRIPTIONS))
+    records = [
+        _refine_record(
+            case_id,
+            description_status="KEPT_LOCKED",
+            guard_kinds=[],
+            description_guard_kinds=[],
+            model_produced=False,
+        ),
+    ]
+
+    rows = dict(run_draft._refine_rows("refine", records))
+
+    reason = rows["[refine] 되돌림 사유"]
+    assert "사유 없는 되돌림 0건" in reason, "호출 실패가 프롬프트 탓으로 세어졌다"
+    assert "호출이 안 된 되돌림 1건" in reason
+
+
+async def test_되돌림_사유가_실제_응답에서도_한_번만_세어진다() -> None:
+    """위 둘은 기록을 손으로 만든다. **그 경로만 보면 중복 집계를 놓친다.**
+
+    되돌림 기록은 ``GuardKind`` 를 유발한 겹에서 빌려 쓰므로, 서비스 응답에는 같은 종류가
+    적중과 요약으로 **두 번** 들어 있다. 기록 시점에서 요약을 가리지 않으면 10건에서
+    ``RULE=20`` 이 찍힌다. 서비스부터 집계까지 이어 확인한다.
+    """
+    records = await _measure_refine(slots="marker")
+
+    assert records, "표식 경로가 기록을 만들지 못했다"
+    for record in records:
+        assert record.description_guard_kinds == ["RULE"], record.description_guard_kinds
+
+    rows = dict(run_draft._summarize(records, "refine"))
+
+    assert f"RULE={len(records)}" in rows["[refine] 되돌림 사유"]

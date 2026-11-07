@@ -60,6 +60,26 @@ def test_권고_등급_성분은_떨어뜨리지_않는다() -> None:
     assert guard.screen_text("우유 성분이 들어 있습니다.").ok is True
 
 
+def test_서버가_가린_표식을_옮겨_적은_조각을_떨어뜨린다() -> None:
+    """**사전에 없는 글자라 이 겹이 없으면 아무것도 막지 못한다.**
+
+    다시 쓰기(``REFINE``)는 레닥션을 지난 셀러 원문을 모델에게 "다시 적어라" 와 함께 준다.
+    모델이 ``[가림]``·``[태그]`` 를 그대로 옮겨 적으면 rules/banned/claims 어느 사전에도
+    없으므로 ``FILLED`` 로 셀러 폼까지 가고, 셀러는 자기 상품 설명에서 **서버 내부 표식**을
+    본다. 마커 문자열은 ``rules`` 에서 가져온다 -- 베껴 두면 저쪽 문구를 고치는 날 이 겹이
+    조용히 아무것도 잡지 않는다.
+    """
+    from app.inspection import rules
+
+    for marker in (rules.REDACTION_MARKER, rules.NEUTRALIZED_MARKER):
+        verdict = guard.screen_text(f"{marker} 안에 적힌 규격입니다.")
+
+        assert verdict.ok is False, marker
+        assert verdict.status is FieldStatus.EMPTY_GUARD_RULE
+        assert verdict.kind is GuardKind.RULE
+        assert marker not in verdict.detail, "사유가 마커를 인용하면 화면에 되돌아온다"
+
+
 def test_빈_문구는_통과로_센다() -> None:
     """모델이 비운 슬롯은 가드가 떨어뜨린 것이 아니다. 섞으면 사유가 거짓이 된다."""
     assert guard.screen_text("").ok is True

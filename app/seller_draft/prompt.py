@@ -1,4 +1,4 @@
-"""초안 접두부와 봉투. **``rules.py`` 를 한 줄도 고치지 않는다.**
+"""초안 접두부와 봉투. **``rules.py`` 의 판정을 한 줄도 고치지 않는다.**
 
 ## 봉투 — 기존 네 토큰을 그대로 쓴다
 
@@ -27,11 +27,27 @@
 Sonnet 으로 뒤집으면 ``draft_cache_prefix_targets()`` 가 ``required=True`` 로 등록해
 ``--count-tokens`` 가 하한 미달을 종료 코드로 알린다.
 
-## 지시를 다섯 개 안으로 둔다
+## 지시를 다섯 개 안으로 둔다 — 세는 단위는 **모델이 보는 명령문 전체**다
 
 ``perspectives.py`` 머리글이 적은 그대로 -- 지시 하나당 95%를 지켜도 열 개를 동시에 지킬
 확률은 훨씬 낮다. 나머지는 툴 스키마의 구조로 강제한다(리프는 닫힌 정수 열거, 효능 슬롯
 없음, 상품명 필드 없음, ``basis``·``imageUsability`` 는 닫힌 열거).
+
+**블록 위치는 근거가 아니다.** 근거가 모델 준수율이므로 "접두부가 아니라 meta 줄에 뒀다"
+는 수를 줄이지 않는다. 그래서 ``REFINE`` 은 명령문을 더하지 않고 **지시 1 을 조건절로
+넓히는 쪽**을 골랐다(출처에 셀러 원문을 더한다). meta 줄의 ``REFINE_DIRECTIVE`` 는 그
+모드에서만 붙고 세 문장이며, 그 셋은 지시 1·2·3 과 방향이 같다 -- 반대 방향 지시를 두
+층에 두면 슬롯이 전멸한다(아래 "세 층이 같은 말을 해야 한다").
+
+## 세 층이 같은 말을 해야 한다 — 접두부 · 툴 스키마 · 모드 지시
+
+모델은 같은 질문("이 조각을 채울 근거가 있는가")에 대해 **세 자리에서 답을 받는다.**
+시스템 접두부의 지시 1, 툴 스키마의 슬롯 설명, 그리고 모드 지시다. 앞 두 자리가
+"상품명·사진으로 확인되지 않으면 비워라" 라고 적고 모드 지시만 "셀러 원문을 다시 적어라"
+라고 하면, 더 강한 자리(system + tool schema)가 이겨 **슬롯이 전멸하고** 서버는 원문으로
+되돌린다 -- 유료 호출 한 번을 태우고 아무 일도 하지 않는 모양이다. 그래서 출처를 열거하는
+자리를 **접두부 한 곳으로 모았고**(지시 1), 툴 스키마의 슬롯 설명은 출처를 열거하지 않는다
+(``tool.py`` 의 ``_SLOT_KEYS``). 테스트가 그 일치를 고정한다.
 """
 
 from __future__ import annotations
@@ -39,13 +55,15 @@ from __future__ import annotations
 from typing import Any
 
 from app.inspection import rules
-from app.schemas.draft import LockedFields
+from app.schemas.draft import DraftMode, LockedFields
 from app.seller_draft.catalog import ItemSignal, leaf_path, render_leaf_paths
 from app.seller_draft.claims import forbidden_examples_block
 from app.seller_draft.tool import LEAF_DECLINED
 
 # 프롬프트를 고치면 올린다. 초안 재사용 키의 일부다.
-DRAFT_VERSION = "draft-v1"
+# v2: 다시 쓰기 모드(``REFINE``). meta 줄 지시 + 지시 1 의 출처에 셀러 원문 추가 +
+#     툴 스키마 슬롯 설명에서 출처 열거 제거(세 층이 서로 반대로 말하지 않게).
+DRAFT_VERSION = "draft-v2"
 # 리프 표와 품목 어휘를 고치면 올린다. 분리해 두는 이유는 사전 2층을 채울 때 프롬프트는
 # 그대로이고 게이트 결과만 바뀌기 때문이다 -- 한 문자열이면 그 구분이 사라진다.
 CATALOG_VERSION = "catalog-v1"
@@ -64,17 +82,39 @@ def draft_version_string() -> str:
 # 300 -> 900 토큰 증분(+4.20원)이 896 사방 이미지 전체(+1.43원)의 **3배**다(전부 추정).
 DESCRIPTION_MAX_CHARS = 400
 
+# 다시 쓰기 모드의 지시. **봉투 바깥 meta 줄에 둔다** -- 서버가 쓴 글이고 셀러가 타이핑한
+# 문자열과 섞이면 안 된다. 모드마다 접두부가 갈라지지 않는 것도 이 자리의 이득이다.
+#
+# **접두부의 지시 1 과 같은 방향이어야 한다.** 거기서 셀러 원문을 확인된 출처로 허가하지
+# 않으면 이 문장은 더 강한 자리에 눌려 슬롯이 전멸한다(모듈 머리글 "세 층이 같은 말을").
+#
+# 슬롯별로 근거를 적으라고 하지 않는다 -- ``basis`` 는 필드 단위(설명 하나)라 슬롯 단위로
+# 표현할 수 없고, 모델이 따르면 채운 설명에 "채우지 않았다" 뜻의 값이 붙는다. 다시 쓴
+# 설명의 ``basis`` 는 서버가 적는다(``service._assemble``).
+#
+# 지시 안에 ``<본문>`` 같은 봉투 토큰을 적지 않는다. 적으면 그 토큰이 봉투보다 앞에 나와
+# 봉투 경계를 세는 쪽(테스트와 중성화 검사)이 엉뚱한 자리를 집는다.
+REFINE_DIRECTIVE = (
+    "모드: 다시 쓰기. 아래 '셀러가 쓴 설명' 을 설명 슬롯 네 조각으로 다시 적어라. "
+    "**원문에 적힌 사실은 확인된 것으로 쓴다** -- 원문에 적힌 것, 그리고 함께 준 상품명·"
+    "카테고리·옵션에서 확인되는 것만 쓰고 그 밖의 사실(소재·규격·효능·인증)을 새로 만들지 않는다. "
+    f"'{rules.REDACTION_MARKER}' 표식이 박힌 자리는 옮겨 적지 말고 그 조각을 비워라. "
+    f"전체 {DESCRIPTION_MAX_CHARS}자 이내."
+)
+
 DRAFT_PREFIX = f"""\
 당신은 반려동물 용품 오픈마켓 '애착'의 상품 등록 보조기입니다. 셀러가 입력한 상품명과
-(있으면) 사진 한 장을 받아 **등록 폼의 초안**을 채웁니다. 판정하지 않고 차단하지 않습니다.
+(있으면) 사진 한 장·셀러가 쓴 설명을 받아 **등록 폼의 초안**을 채웁니다. 판정하지 않고 차단하지 않습니다.
 
 # 소분류 (이 목록 밖의 값을 쓸 수 없습니다)
 {render_leaf_paths()}
 
 # 지켜야 할 다섯 가지
 
-1. **확인할 수 없는 것은 비우십시오.** 상품명과 사진으로 확인되지 않는 소재·규격·사용법을
-   추측으로 채우지 마십시오. 빈 문자열로 두고 그 필드의 근거를 NONE 으로 적으십시오.
+1. **확인할 수 없는 것은 비우십시오.** 확인된 출처는 상품명과 사진, 그리고 **다시 쓰기
+   모드에서 함께 주는 '셀러가 쓴 설명'** 입니다(셀러가 자기 상품에 대해 적은 글이므로 그
+   모드에서는 사실의 출처입니다). 그 출처로 확인되지 않는 소재·규격·사용법을 추측으로 채우지
+   마십시오. 빈 문자열로 두고 그 필드의 근거를 NONE 으로 적으십시오.
    셀러는 당신이 채운 것을 사실로 읽습니다. **빈 칸은 정직한 답이고 추측은 거짓입니다.**
 2. **소분류를 모르면 {LEAF_DECLINED} 을 적으십시오.** 위 목록에서 하나를 고를 근거가 없으면
    비슷해 보이는 것을 고르지 말고 {LEAF_DECLINED} 을 적습니다. 틀린 분류는 셀러가 다시
@@ -146,6 +186,19 @@ def envelope_safe(text: str) -> str:
     return rules.neutralize_envelope(rules.screen(text).redacted)
 
 
+def refine_active(mode: DraftMode, locked: LockedFields | None) -> bool:
+    """이 요청에서 **다시 쓰기가 실효인가.** 세 자리가 같은 함수를 부른다.
+
+    다시 쓸 원문이 없으면 모드가 할 일이 없다 -- 지시도 붙지 않고 조립 분기도 갈리지 않으며
+    프롬프트가 ``FILL`` 과 바이트 단위로 같다. 그래서 **재사용 키도 갈라서는 안 된다**
+    (갈리면 그 건마다 같은 프롬프트로 유료 호출을 한 번 더 태운다).
+
+    조건식을 복제하지 않는 것이 요점이다. 앞 판은 ``prompt`` 와 ``service._assemble`` 과
+    ``service._cache_key`` 가 서로 다른 세 식을 들고 있었다.
+    """
+    return mode is DraftMode.REFINE and locked is not None and bool(locked.description)
+
+
 def draft_user_content(
     *,
     product_name: str,
@@ -153,6 +206,7 @@ def draft_user_content(
     locked: LockedFields | None,
     image_block: dict[str, Any] | None,
     low_fidelity: bool,
+    mode: DraftMode = DraftMode.FILL,
 ) -> list[dict[str, Any]]:
     """봉투를 조립한다. **이미지 블록은 텍스트 앞에 둔다.**
 
@@ -163,6 +217,9 @@ def draft_user_content(
 
     셀러가 타이핑한 문자열은 전부 ``<본문>`` 안에 ``envelope_safe()`` 를 지나 들어간다.
     meta 줄에 있는 것은 **서버가 리프 id 로 렌더한 신뢰 값**뿐이다.
+
+    ``REFINE`` 은 같은 원문을 **다시 쓸 대상으로** 표시해 보낸다. 레닥션·중성화는 그대로
+    지난다 -- 다시 쓸 대상이라는 것이 신뢰할 수 있다는 뜻은 아니다.
     """
     meta: list[str] = ['<대상 종류="PRODUCT_DRAFT">', _gate_line(signal)]
     if signal.given_category_id is not None:
@@ -173,9 +230,16 @@ def draft_user_content(
     if image_block is not None and low_fidelity:
         meta.append("사진 힌트: 해상도 대비 용량이 작아 흐릴 수 있다. 읽히지 않으면 그렇게 적어라")
 
+    # 다시 쓸 원문이 없으면 모드가 할 일이 없다. 지시도 붙이지 않는다.
+    refine = refine_active(mode, locked)
+    if refine:
+        meta.append(REFINE_DIRECTIVE)
+
     body: list[str] = ["<본문>", f"상품명: {envelope_safe(product_name)}"]
     if locked is not None and locked.description:
-        body.append("셀러가 고친 설명(그대로 두고 톤을 맞춘다):")
+        body.append(
+            "셀러가 쓴 설명(다시 쓸 대상):" if refine else "셀러가 고친 설명(그대로 두고 톤을 맞춘다):"
+        )
         body.append(envelope_safe(locked.description))
     if locked is not None and locked.optionGroups:
         names = " / ".join(
@@ -211,9 +275,11 @@ __all__ = [
     "DESCRIPTION_MAX_CHARS",
     "DRAFT_PREFIX",
     "DRAFT_VERSION",
+    "REFINE_DIRECTIVE",
     "draft_system_blocks",
     "draft_user_content",
     "draft_version_string",
     "envelope_safe",
     "image_block",
+    "refine_active",
 ]

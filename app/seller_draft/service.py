@@ -40,6 +40,7 @@ from app.schemas.draft import (
     DRAFT_FIELDS,
     Basis,
     DraftCallUsage,
+    DraftMode,
     DraftState,
     FieldStatus,
     GuardDrop,
@@ -63,6 +64,7 @@ from app.seller_draft.prompt import (
     draft_user_content,
     draft_version_string,
     image_block,
+    refine_active,
 )
 from app.seller_draft.tool import DRAFT_TOOL, LEAF_DECLINED
 from app.seller_draft.trace import (
@@ -136,11 +138,14 @@ class DraftService:
         if not name:
             raise DraftUnprocessable("상품명이 비어 있다. 초안을 만들 입력이 없다")
 
-        mode = _image_mode(settings.draft_image_mode)
+        # **``image_mode`` 다. ``request.mode``(``DraftMode``) 와 다른 개념이다.**
+        # 한 함수 안에서 둘을 다 읽는 자리가 있어 이름을 가른다 -- 하네스에서도 'mode' 는
+        # 이미 이미지 변형(a/b/gated)을 뜻한다.
+        image_mode = _image_mode(settings.draft_image_mode)
         signal = resolve(name, request.categoryId)
-        image_meta, image_bytes = self._read_image(request, mode)
+        image_meta, image_bytes = self._read_image(request, image_mode)
 
-        cache_key = self._cache_key(request, mode=mode, image_bytes=image_bytes)
+        cache_key = self._cache_key(request, image_mode=image_mode, image_bytes=image_bytes)
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._cache.move_to_end(cache_key)
@@ -151,7 +156,7 @@ class DraftService:
 
         if not settings.enable_draft:
             # 기본 꺼짐이다. 끈 상태에서 돌면 **0원이고 전 필드가 비며 사유가 그렇게 적힌다.**
-            return self._skipped(request, signal, image_meta, mode, SkipReason.DRAFT_DISABLED)
+            return self._skipped(request, signal, image_meta, image_mode, SkipReason.DRAFT_DISABLED)
 
         screened = rules.screen(name)
         if screened.blocking:
@@ -161,7 +166,7 @@ class DraftService:
                 request,
                 signal,
                 image_meta,
-                mode,
+                image_mode,
                 SkipReason.NAME_RULE_BLOCKED,
                 notice=(
                     f"상품명이 플랫폼 정책에 걸립니다({reasons}). 그대로 등록하면 검수에서 "
@@ -198,7 +203,7 @@ class DraftService:
                 request,
                 signal,
                 image_meta,
-                mode,
+                image_mode,
                 SkipReason.NAME_CLAIM_BLOCKED,
                 notice=(
                     f"상품명이 효능이나 질병 치료를 단정하고 있습니다({expressions}). 그대로 "
@@ -216,7 +221,7 @@ class DraftService:
                 request,
                 signal,
                 image_meta,
-                mode,
+                image_mode,
                 SkipReason.ITEM_UNIDENTIFIED,
                 notice=(
                     "상품명에서 어떤 품목인지 읽히지 않았습니다. 카테고리를 먼저 골라 주시거나 "
@@ -227,16 +232,16 @@ class DraftService:
 
         if self._llm is None:
             self._record_gate(signal, image_meta, skip=SkipReason.LLM_UNAVAILABLE)
-            return self._skipped(request, signal, image_meta, mode, SkipReason.LLM_UNAVAILABLE)
+            return self._skipped(request, signal, image_meta, image_mode, SkipReason.LLM_UNAVAILABLE)
 
-        use_image = _should_use_image(mode, signal, image_meta)
+        use_image = _should_use_image(image_mode, signal, image_meta)
         self._record_gate(signal, image_meta, use_image=use_image)
         response = await self._generate(
             request,
             signal=signal,
             image_meta=image_meta,
             image_bytes=image_bytes,
-            mode=mode,
+            image_mode=image_mode,
             use_image=use_image,
         )
         if response.state is DraftState.OK:
@@ -247,7 +252,7 @@ class DraftService:
     # --- N0 ---------------------------------------------------------------------------
 
     def _read_image(
-        self, request: SellerDraftRequest, mode: ImageMode
+        self, request: SellerDraftRequest, image_mode: ImageMode
     ) -> tuple[imagemeta.ImageMeta | None, bytes | None]:
         """헤더 선검사. **거부와 "빼고 진행"을 섞지 않는다.**
 
@@ -256,7 +261,7 @@ class DraftService:
         """
         if request.image is None or not request.image.base64:
             return None, None
-        if mode is ImageMode.OFF:
+        if image_mode is ImageMode.OFF:
             return None, None
 
         try:
@@ -275,7 +280,9 @@ class DraftService:
             )
         return meta, data
 
-    def _cache_key(self, request: SellerDraftRequest, *, mode: ImageMode, image_bytes: bytes | None) -> str:
+    def _cache_key(
+        self, request: SellerDraftRequest, *, image_mode: ImageMode, image_bytes: bytes | None
+    ) -> str:
         """내용 해시 재사용 키. ``requestId`` 를 넣지 않는다 -- 넣으면 절대 적중하지 않는다.
 
         판정 재사용을 ``contentHash + promptVersion`` 으로 잡은 관례와 같다. 버전을 올리면
@@ -302,7 +309,16 @@ class DraftService:
         parts = [
             DRAFT_VERSION,
             _CATALOG_VERSION,
-            mode.value,
+            image_mode.value,
+            # **초안 모드도 키의 일부다.** 안 섞으면 같은 상품명·같은 잠근 값에 대해
+            # ``FILL`` 이 만든 응답(= 셀러 원문 그대로)이 ``REFINE`` 요청에
+            # ``reusedFromCache=True`` 로 돌아가 다시 쓰기가 아무 일도 하지 않는다.
+            #
+            # **섞는 것은 요청의 모드가 아니라 실효 모드다**(``prompt.refine_active``).
+            # 다시 쓸 원문이 없는 ``REFINE`` 은 ``FILL`` 과 바이트 단위로 같은 프롬프트를
+            # 쏘므로, 요청 모드로 가르면 그 건마다 같은 답을 받으려고 유료 호출을 한 번 더
+            # 태운다. 조건식은 ``prompt`` 와 ``_assemble`` 이 부르는 그 함수 하나다.
+            (DraftMode.REFINE if refine_active(request.mode, locked) else DraftMode.FILL).value,
             _identity_key(request.productName),
             str(request.categoryId),
             hashlib.sha256(image_bytes).hexdigest() if image_bytes else "-",
@@ -328,7 +344,7 @@ class DraftService:
         signal: ItemSignal,
         image_meta: imagemeta.ImageMeta | None,
         image_bytes: bytes | None,
-        mode: ImageMode,
+        image_mode: ImageMode,
         use_image: bool,
     ) -> SellerDraftResponse:
         block = (
@@ -345,6 +361,7 @@ class DraftService:
             locked=request.lockedFields,
             image_block=block,
             low_fidelity=bool(image_meta and image_meta.low_fidelity),
+            mode=request.mode,
         )
         if self._recorder is not None:
             text = next(part["text"] for part in content if part.get("type") == "text")
@@ -358,14 +375,14 @@ class DraftService:
 
         if not result.ok:
             self._record_generate(result, failed=True)
-            return self._failed(request, signal, image_meta, mode, usage, result)
+            return self._failed(request, signal, image_meta, image_mode, usage, result)
 
         self._record_generate(result, failed=False)
         return self._assemble(
             request,
             signal=signal,
             image_meta=image_meta,
-            mode=mode,
+            image_mode=image_mode,
             use_image=use_image,
             tool_input=result.tool_input or {},
             usage=usage,
@@ -406,7 +423,7 @@ class DraftService:
         *,
         signal: ItemSignal,
         image_meta: imagemeta.ImageMeta | None,
-        mode: ImageMode,
+        image_mode: ImageMode,
         use_image: bool,
         tool_input: dict[str, Any],
         usage: list[DraftCallUsage],
@@ -466,21 +483,54 @@ class DraftService:
         # 충돌에는 ``pinned_leaf_id`` 조건을 붙이지 않는다. 어휘 게이트가 리프를 집었더라도
         # 모델은 다른 품목을 보고 문구를 썼으므로 그 문구를 믿을 근거가 없다. 셀러가 잠근
         # 값은 아래 ``locked`` 분기가 **앞에** 있어 그대로 보존된다.
-        item_unknown = leaf_status is FieldStatus.EMPTY_CATEGORY_CONFLICT or (
-            leaf_status is FieldStatus.EMPTY_MODEL_DECLINED and signal.pinned_leaf_id is None
+        #
+        # **셀러가 리프를 골라 둔 경우도 충돌이다.** 그때 ``_resolve_leaf`` 는 채울 것이 없어
+        # ``EMPTY_NOT_ATTEMPTED`` 를 돌려주고 불일치를 드롭에만 적는데, 상태만 보면 충돌이
+        # 사라진다 -- 셀러가 고른 품목과 다른 품목으로 쓴 문구가 그대로 실린다(강아지 목줄에
+        # "고양이용 건식 사료입니다"). 셀러가 직접 고른 값은 어휘 게이트보다 더 믿을 근거이므로
+        # 같은 이유가 더 세게 적용된다. 드롭의 종류로 가린다.
+        leaf_conflicted = leaf_drop is not None and leaf_drop.kind is GuardKind.CATEGORY_CONFLICT
+        item_unknown = (
+            leaf_status is FieldStatus.EMPTY_CATEGORY_CONFLICT
+            or leaf_conflicted
+            or (leaf_status is FieldStatus.EMPTY_MODEL_DECLINED and signal.pinned_leaf_id is None)
         )
 
-        # (ㄷ) 설명 슬롯.
-        if locked is not None and locked.description:
+        # (ㄷ) 설명 슬롯. **모드가 여기서 갈린다.**
+        #
+        # ``FILL`` 은 셀러가 쓴 설명을 그대로 두고 모델 출력을 버린다. ``REFINE`` 은 같은
+        # 원문을 모델에 주고 다시 쓴 결과를 쓴다 -- 그래서 잠근 분기를 타지 않는다.
+        #
+        # 다만 **다시 쓴 결과를 쓸 수 없을 때는 원문으로 되돌린다.** 품목 미확정·근거
+        # 불일치·가드 탈락으로 그냥 비우면 셀러가 타이핑한 글이 응답에서 사라지고, 그것은
+        # 다시 쓰기가 고치려던 것보다 나쁘다.
+        #
+        # **되돌렸다는 사실을 ``guardDrops`` 에 따로 적는다.** 슬롯 가드 적중만으로는
+        # 거짓이 된다 -- 그 적중의 detail 은 "…비웠다" 로 끝나는데 같은 응답의 설명은 비어
+        # 있지 않고 화면 문장은 "직접 고친 값을 그대로 두었습니다" 다. 셀러가 읽는 두 글자가
+        # 서로 모순된다. 새 ``GuardKind`` 를 더하지 않고 사유의 겹을 그대로 재사용한다.
+        locked_text = locked.description if locked is not None else None
+        refine = refine_active(request.mode, locked)
+        if locked_text and not refine:
             status["description"] = FieldStatus.KEPT_LOCKED
-            draft.description = locked.description
+            draft.description = locked_text
             basis["description"] = Basis.NONE
-        elif item_unknown:
-            status["description"] = FieldStatus.EMPTY_ITEM_UNIDENTIFIED
+        elif item_unknown or "description" in mismatched:
+            unusable = (
+                FieldStatus.EMPTY_ITEM_UNIDENTIFIED
+                if item_unknown
+                else FieldStatus.EMPTY_GUARD_BASIS_MISMATCH
+            )
+            status["description"] = FieldStatus.KEPT_LOCKED if locked_text else unusable
+            draft.description = locked_text
             basis["description"] = Basis.NONE
-        elif "description" in mismatched:
-            status["description"] = FieldStatus.EMPTY_GUARD_BASIS_MISMATCH
-            basis["description"] = Basis.NONE
+            if refine:
+                drops.append(
+                    _refine_reverted(
+                        GuardKind.CATEGORY_CONFLICT if item_unknown else GuardKind.BASIS_MISMATCH,
+                        "품목을 확정하지 못했다" if item_unknown else "근거가 사진 사용 여부와 어긋났다",
+                    )
+                )
         else:
             built = guard.build_description(
                 _slots(tool_input.get("descriptionParts")),
@@ -488,9 +538,31 @@ class DraftService:
                 max_chars=settings.draft_description_chars,
             )
             drops.extend(built.drops)
-            status["description"] = built.status
-            draft.description = built.text
-            basis["description"] = reported.get("description", Basis.NONE) if built.text else Basis.NONE
+            if built.text:
+                status["description"] = built.status
+                draft.description = built.text
+                # **다시 쓴 설명의 근거를 모델이 적은 값으로 내보내지 않는다.**
+                #
+                # ``Basis`` 열거에 '셀러 원문' 이 없다. 모델은 보통 ``NAME`` 을 적는데 실제
+                # 근거는 셀러가 타이핑한 글이므로, 그대로 내보내면 셀러 화면이 자기가 쓴
+                # 사실을 "상품명 근거로 채운 사실" 로 읽는다 -- ``_cache_key`` 주석이 결함으로
+                # 기록해 둔 바로 그 모양이다. 열거를 늘리는 것은 계약 변경이라
+                # ``NONE``("채운 근거를 주장하지 않는다", ``KEPT_LOCKED`` 가 이미 쓰는 값)으로
+                # 둔다. 다시 쓴 것인지는 ``fieldStatus=FILLED`` + 요청 모드로 가린다.
+                basis["description"] = Basis.NONE if refine else reported.get("description", Basis.NONE)
+            else:
+                # 살아남은 슬롯이 없다. 되돌릴 원문이 있으면 되돌리고, 없으면 가드 사유를 쓴다.
+                status["description"] = FieldStatus.KEPT_LOCKED if locked_text else built.status
+                draft.description = locked_text
+                basis["description"] = Basis.NONE
+                # **가드가 실제로 떨어뜨렸을 때만 되돌림을 적는다.**
+                #
+                # 슬롯이 전부 빈 채로 왔으면(``built.drops`` 가 비어 있다) 걸린 것이 아니라
+                # 모델이 아무것도 내지 않은 것이다. 그때 아무 ``GuardKind`` 를 붙이면 겹별
+                # 탈락률(하네스가 재는 축)에 일어나지 않은 적중이 쌓인다. 그 건은
+                # **``KEPT_LOCKED`` + 빈 ``guardDrops``** 라는 모양으로 구별된다.
+                if refine and built.drops:
+                    drops.append(_refine_reverted(built.drops[0].kind, "다시 쓴 조각이 전부 가드에 걸렸다"))
 
         # (ㄹ) 옵션. 그룹·값만 받고 조합은 서버가 만든다.
         if locked is not None and locked.optionGroups:
@@ -501,6 +573,10 @@ class DraftService:
             #
             # 잠근 값을 버리는 것이 목적이 아니다. 불변식을 지키면 그대로 ``KEPT_LOCKED``
             # 이고, 어기면 사유와 함께 비워 셀러가 고칠 수 있게 한다.
+            #
+            # **``REFINE`` 도 잠근 옵션은 그대로 둔다.** 다시 쓰기는 문장을 다듬는 일이고
+            # 옵션 값은 문장이 아니다 -- 셀러가 타이핑한 사이즈·색상 이름을 모델이 고치면
+            # 그 이름에 묶인 가격·재고를 셀러가 전부 다시 맞춰야 한다.
             verdict = guard.check_locked_options(list(locked.optionGroups))
             drops.extend(verdict.drops)
             kept = verdict.status is FieldStatus.FILLED
@@ -535,9 +611,9 @@ class DraftService:
             draftVersion=draft_version_string(),
             state=DraftState.OK,
             itemSignal=_signal_out(signal),
-            image=_image_report(image_meta, usability, mode=mode, use_image=use_image),
+            image=_image_report(image_meta, usability, mode=image_mode, use_image=use_image),
             imageUsability=usability,
-            imageMode=mode,
+            imageMode=image_mode,
             draft=draft,
             basis=basis,
             fieldStatus=_complete(status),
@@ -640,22 +716,24 @@ class DraftService:
         request: SellerDraftRequest,
         signal: ItemSignal,
         image_meta: imagemeta.ImageMeta | None,
-        mode: ImageMode,
+        image_mode: ImageMode,
         reason: SkipReason,
         *,
         notice: str | None = None,
     ) -> SellerDraftResponse:
         status = _field_status_for_skip(reason)
+        draft, kept = _locked_echo(request)
         return SellerDraftResponse(
             requestId=request.requestId,
             draftVersion=draft_version_string(),
             state=DraftState.OK,
             itemSignal=_signal_out(signal),
-            image=_image_report(image_meta, ImageUsability.NO_IMAGE_SENT, mode=mode, use_image=False),
+            image=_image_report(image_meta, ImageUsability.NO_IMAGE_SENT, mode=image_mode, use_image=False),
             imageUsability=ImageUsability.NO_IMAGE_SENT,
-            imageMode=mode,
+            imageMode=image_mode,
+            draft=draft,
             basis=dict.fromkeys(("categoryId", "description", "optionGroups"), Basis.NONE),
-            fieldStatus=_complete({}, default=status),
+            fieldStatus=_complete(kept, default=status),
             sellerNotice=notice,
             modelCalled=False,
             skipReason=reason,
@@ -667,7 +745,7 @@ class DraftService:
         request: SellerDraftRequest,
         signal: ItemSignal,
         image_meta: imagemeta.ImageMeta | None,
-        mode: ImageMode,
+        image_mode: ImageMode,
         usage: list[DraftCallUsage],
         result: Any,
     ) -> SellerDraftResponse:
@@ -676,15 +754,17 @@ class DraftService:
         호출이 실패해 못 본 것과 모델이 제안하지 않은 것은 둘 다 빈 필드지만 뜻이 정반대다.
         셀러 화면도 둘을 다르게 보여 줘야 한다 -- "다시 시도" 대 "직접 작성해 주세요".
         """
-        status = _complete({}, default=FieldStatus.EMPTY_CALL_FAILED)
+        draft, kept = _locked_echo(request)
+        status = _complete(kept, default=FieldStatus.EMPTY_CALL_FAILED)
         return SellerDraftResponse(
             requestId=request.requestId,
             draftVersion=draft_version_string(),
             state=DraftState.FAILED,
             itemSignal=_signal_out(signal),
-            image=_image_report(image_meta, ImageUsability.NO_IMAGE_SENT, mode=mode, use_image=False),
+            image=_image_report(image_meta, ImageUsability.NO_IMAGE_SENT, mode=image_mode, use_image=False),
             imageUsability=ImageUsability.NO_IMAGE_SENT,
-            imageMode=mode,
+            imageMode=image_mode,
+            draft=draft,
             basis=dict.fromkeys(("categoryId", "description", "optionGroups"), Basis.NONE),
             fieldStatus=status,
             modelCalled=True,
@@ -913,6 +993,54 @@ def _image_report(
         detail=meta.detail,
         maxLongEdgePx=meta.max_long_edge_px,
         skippedByMode=not use_image and meta.usable,
+    )
+
+
+def _locked_echo(
+    request: SellerDraftRequest,
+) -> tuple[ProductDraftSaveRequest, dict[str, FieldStatus]]:
+    """셀러가 잠근 설명을 **모든 종료 지점에서** 응답에 그대로 싣는다.
+
+    ``_assemble`` 만 이 불변식을 지키고 0원 분기(``NAME_RULE_BLOCKED``·``ITEM_UNIDENTIFIED``
+    ·``LLM_UNAVAILABLE``·``DRAFT_DISABLED``)와 호출 실패는 ``description=None`` 을 돌려줬다.
+    그러면 FE 가 **같은 응답 모양에 두 가지 병합 규칙**을 써야 한다 -- 어느 쪽이든 셀러가
+    타이핑한 글이 지워질 수 있고, ``REFINE`` 은 정의상 셀러가 글을 **쓴 뒤에** 누르는
+    버튼이라 이 경로들에 잠근 설명이 실려 들어올 확률이 ``FILL`` 보다 높다(특히 타임아웃).
+
+    모드와 무관하게 에코한다 -- ``FILL`` 의 ``_assemble`` 이 이미 같은 값을 돌려주므로
+    종료 지점마다 뜻이 갈리지 않는 것이 요점이다. 응답 모양은 바뀌지 않는다
+    (``KEPT_LOCKED`` 는 기존 열거값이고 ``draft.description`` 은 널 허용이다).
+
+    옵션은 에코하지 않는다 -- 그룹만 싣고 조합을 비우면 등록이 거부되는 모양이 되고,
+    0원 분기에서 ``check_locked_options`` 를 태우는 것은 이 함수의 일이 아니다.
+    """
+    text = request.lockedFields.description if request.lockedFields is not None else None
+    if not text:
+        return ProductDraftSaveRequest(), {}
+    return ProductDraftSaveRequest(description=text), {"description": FieldStatus.KEPT_LOCKED}
+
+
+# 되돌림 기록의 사유 접두. **하네스가 집계에서 이 항목을 가리는 표식이다.**
+#
+# 되돌림 기록은 ``GuardKind`` 를 유발한 겹에서 빌려 쓰므로(새 열거값을 더하지 않는다) 종류만
+# 보면 실제 적중과 구별되지 않는다. 그대로 세면 한 건이 두 번 세어져 겹별 탈락률이 배로 찍힌다.
+REFINE_REVERTED_PREFIX = "다시 쓴 문구를 쓸 수 없어 셀러 원문을 그대로 두었다: "
+
+
+def _refine_reverted(kind: GuardKind, why: str) -> GuardDrop:
+    """다시 쓴 문구를 버리고 셀러 원문을 복원했다는 기록.
+
+    **셀러가 읽는 두 글자가 서로 모순되지 않게 하는 줄이다.** 슬롯 가드 적중의 detail 은
+    "…비웠다" 로 끝나는데 같은 응답의 설명은 비어 있지 않다(원문이 그대로 있다). 그 사실을
+    적는 항목이 없으면 ``guardDrops`` 를 읽는 사람도, 화면 문장도 둘 중 하나가 거짓이다.
+
+    ``GuardKind`` 를 새로 더하지 않는다 -- 백엔드·FE 거울 열거에 모르는 값이 가면
+    역직렬화가 깨진다. 되돌림을 **유발한 겹**의 값을 그대로 쓴다.
+    """
+    return GuardDrop(
+        field="description",
+        kind=kind,
+        detail=f"{REFINE_REVERTED_PREFIX}{why}",
     )
 
 
