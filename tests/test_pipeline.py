@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from typing import Any
 
@@ -14,6 +15,7 @@ from conftest import FakeLlmClient, failed, ok
 
 from app.inspection import rules
 from app.inspection.pipeline import InspectionPipeline
+from app.inspection.policy import POLICY_PREFIX, POLICY_VERSION
 from app.schemas.inspection import (
     CallOutcome,
     Perspective,
@@ -88,13 +90,12 @@ async def test_깨끗한_상품은_두_관점을_타고_통과한다(settings: S
     assert outcomes[Perspective.CONDUCT_TRADE] is PerspectiveOutcome.CLEAR
 
 
-async def test_반박이_유지하면_수정_문구가_붙는다(settings: Settings) -> None:
+async def test_관점이_위반을_찾으면_수정_문구가_붙는다(settings: Settings) -> None:
     quote = "관절염 치료에 효과가 있습니다"
     llm = FakeLlmClient(
         [
             ok(finding(quote)),
             ok(NO_FINDING),
-            ok({"decision": "UPHOLD", "reason": "치료 효능 단정"}),
             ok({"sellerNotice": "치료 효능 표현은 쓸 수 없습니다.", "rewrites": []}),
         ]
     )
@@ -104,45 +105,9 @@ async def test_반박이_유지하면_수정_문구가_붙는다(settings: Setti
 
     assert verdict.verdict is Verdict.FLAG
     assert verdict.sellerNotice == "치료 효능 표현은 쓸 수 없습니다."
-    assert len(llm.calls) == 4
+    assert len(llm.calls) == 3, "관점 둘 + 수정 문구. 비평 단계를 뺐으므로 넷이 아니다"
     assert verdict.violations[0].spanStart is not None
-
-
-async def test_반박이_뒤집으면_통과로_내려간다(settings: Settings) -> None:
-    quote = "관절 건강에 도움을 줄 수 있습니다"
-    llm = FakeLlmClient(
-        [
-            ok(finding(quote)),
-            ok(NO_FINDING),
-            ok({"decision": "OVERTURN", "reason": "정상적인 표현"}),
-        ]
-    )
-    pipeline = InspectionPipeline(llm=llm, settings=settings)
-
-    verdict = await pipeline.run(product(quote))
-
-    assert verdict.verdict is Verdict.PASS
-    assert verdict.sellerNotice is None, "뒤집혔으면 수정 문구를 만들 이유가 없다"
-    assert len(llm.calls) == 3, "뒤집힌 뒤에 수정 문구를 부르면 비용만 쓴다"
-
-
-async def test_반박_실패는_위반_판정을_유지한다(settings: Settings) -> None:
-    quote = "관절염 치료에 효과가 있습니다"
-    llm = FakeLlmClient(
-        [
-            ok(finding(quote)),
-            ok(NO_FINDING),
-            failed(CallOutcome.TIMEOUT),
-            ok({"sellerNotice": "수정이 필요합니다.", "rewrites": []}),
-        ]
-    )
-    pipeline = InspectionPipeline(llm=llm, settings=settings)
-
-    verdict = await pipeline.run(product(quote))
-
-    assert verdict.verdict is Verdict.FLAG, (
-        "반박 실패를 통과로 읽으면 모델을 느리게 만드는 것만으로 검수를 끌 수 있다"
-    )
+    assert verdict.criticOverturned is False, "비평 단계가 없으므로 항상 거짓이다"
 
 
 async def test_관점_실패는_통과가_아니라_미검사로_기록된다(settings: Settings) -> None:
@@ -216,20 +181,14 @@ async def test_원문에_없는_인용은_판정으로_쓰지_않는다(settings
 
 async def test_리뷰에는_수정_문구를_만들지_않는다(settings: Settings) -> None:
     quote = "이거 먹고 관절염 나았어요"
-    llm = FakeLlmClient(
-        [
-            ok(finding(quote)),
-            ok(NO_FINDING),
-            ok({"decision": "UPHOLD", "reason": "치료 효능 단정"}),
-        ]
-    )
+    llm = FakeLlmClient([ok(finding(quote)), ok(NO_FINDING)])
     pipeline = InspectionPipeline(llm=llm, settings=settings)
 
     verdict = await pipeline.run(review(quote))
 
     assert verdict.verdict is Verdict.FLAG
     assert verdict.sellerNotice is None, "리뷰는 작성자가 고쳐 올리는 흐름이 없다"
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 2
 
 
 async def test_stub_모드는_통과가_아니라_판정_실패로_답한다(settings: Settings) -> None:
@@ -342,91 +301,6 @@ async def test_팬아웃_스위치가_호출_수를_바꾼다(settings: Settings
     assert len(llm.calls) == (2 if fanout else 1)
 
 
-async def test_비평이_뒤집으면_그_사실을_판정에_싣는다(settings: Settings) -> None:
-    """뒤집었다는 사실이 메시지에 없으면 백엔드가 깨끗한 통과와 구분할 수 없다.
-
-    백엔드는 이 신호로 어드민 큐 등재와 보류를 정한다. 비지 않으면 조용히 통과한다.
-    """
-    quote = "관절 건강에 도움을 줄 수 있습니다"
-    llm = FakeLlmClient(
-        [
-            ok(finding(quote)),
-            ok(NO_FINDING),
-            ok({"decision": "OVERTURN", "reason": "정상적인 표현"}),
-        ]
-    )
-    pipeline = InspectionPipeline(llm=llm, settings=settings)
-
-    verdict = await pipeline.run(product(quote))
-
-    assert verdict.verdict is Verdict.PASS
-    assert verdict.criticOverturned is True
-
-
-async def test_비평이_유지하면_뒤집힘_신호가_꺼진다(settings: Settings) -> None:
-    quote = "관절염 치료에 효과가 있습니다"
-    llm = FakeLlmClient(
-        [
-            ok(finding(quote)),
-            ok(NO_FINDING),
-            ok({"decision": "UPHOLD", "reason": "타당하다"}),
-            ok({"sellerNotice": "수정이 필요합니다.", "rewrites": []}),
-        ]
-    )
-    pipeline = InspectionPipeline(llm=llm, settings=settings)
-
-    verdict = await pipeline.run(product(quote))
-
-    assert verdict.verdict is Verdict.FLAG
-    assert verdict.criticOverturned is False
-
-
-async def test_비평을_타지_않은_판정은_뒤집힘_신호가_꺼진다(settings: Settings) -> None:
-    """통과·규칙 확정·판정 실패는 비평을 타지 않는다. 그 셋에 신호가 켜지면 어드민 큐가 잡음으로 찬다."""
-    cases = [
-        (FakeLlmClient([ok(NO_FINDING), ok(NO_FINDING)]), product("글루코사민 함유 영양제입니다")),
-        (FakeLlmClient([]), product("문의는 010-1234-5678로 주세요")),
-        (FakeLlmClient([failed(), failed(), failed(), failed()]), product("글루코사민 함유")),
-    ]
-    for llm, request in cases:
-        pipeline = InspectionPipeline(llm=llm, settings=settings)
-
-        verdict = await pipeline.run(request)
-
-        assert verdict.criticOverturned is False, verdict.verdict
-
-
-async def test_뒤집힘_신호는_통과_판정에만_붙는다(settings: Settings) -> None:
-    """FLAG 와 뒤집힘이 함께 나가면 백엔드에서 완화가 사라진다.
-
-    백엔드 ``adminReviewReasonOf`` 의 when 순서가 ``criticOverturned`` 를 과탐 의심보다
-    먼저 보기 때문에, 그 조합이 가면 전건 금지 성분이어도 보류가 아니라 확정 반려가 된다.
-    여기서 그 조합을 만들지 않는 것이 그 결함을 잠복 상태로 묶어 둔다.
-    """
-    quote = "관절염 치료에 효과가 있습니다"
-    scripts = [
-        [ok(finding(quote)), ok(NO_FINDING), ok({"decision": "OVERTURN", "reason": "오탐"})],
-        [
-            ok(finding(quote)),
-            ok(NO_FINDING),
-            ok({"decision": "UPHOLD", "reason": "타당"}),
-            ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
-        ],
-        [
-            ok(finding(quote)),
-            ok(NO_FINDING),
-            ok({"decision": "INSUFFICIENT", "reason": "근거 부족"}),
-            ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
-        ],
-    ]
-    for scripted in scripts:
-        pipeline = InspectionPipeline(llm=FakeLlmClient(scripted), settings=settings)
-
-        verdict = await pipeline.run(product(quote))
-
-        assert not (verdict.criticOverturned and verdict.verdict is Verdict.FLAG), verdict.verdict
-
-
 def test_자사_도메인을_접두로_단_외부_호스트는_차단된다() -> None:
     """부정 전방탐색이 **호스트 경계를 보지 않으면** 자사 도메인이 접두사로 쓰인다.
 
@@ -458,26 +332,85 @@ def test_같은_규칙_적중_두_건이_서로_다른_구간을_가리킨다() 
     assert [text[s:e] for s, e in spans] == ["010-1234-5678"] * 2
 
 
-async def test_비평에_1차_판정_사유가_간다(settings: Settings) -> None:
-    """``Violation`` 은 모델이 적은 ``reason`` 을 버리고 ``suggestion`` 만 든다.
+def test_정책_문구가_바뀌면_버전도_올리게_한다() -> None:
+    """``POLICY_VERSION`` 은 판정 재사용 키의 일부다. 백엔드는 내용 해시와 이 값이 같으면
+    기존 검수를 그대로 쓰므로, 문구를 고치고 버전을 안 올리면 **바뀐 정책으로 다시 보지 않는다.**
 
-    그 자리에 제안을 넣으면 라벨이 "사유"인데 값이 제안이고, 제안이 없는 건은
-    "사유: 제안 없음" 이 나간다 -- 비평이 1차 판정의 근거를 아예 못 본 채로
-    오탐 여부를 답하게 된다.
+    모듈 머리에 "문구를 고치면 올린다" 고 적어 두었는데도 한 번 놓쳤다. 적어 두는 것으로는
+    모자라서 문구의 지문을 고정한다.
+
+    **강제가 아니라 알림이다.** 문구를 고친 사람이 해시만 갱신하고 버전을 그대로 두면 이
+    테스트는 다시 통과한다. 그것까지 막으려면 버전별 해시를 이력으로 쌓고 기준 브랜치와
+    대조해야 하는데, 지키려는 것이 "둘을 같이 본다" 뿐이라 비용이 맞지 않는다. 한 ``assert``
+    에 묶어 둔 것은 실패 메시지가 버전과 해시를 나란히 보여 주기 때문이다.
     """
-    quote = "관절염 치료에 효과가 있습니다"
-    llm = FakeLlmClient(
-        [
-            ok(finding(quote)),
-            ok(NO_FINDING),
-            ok({"decision": "UPHOLD", "reason": "타당"}),
-            ok({"sellerNotice": "고쳐 주세요.", "rewrites": []}),
-        ]
+    digest = hashlib.sha256(POLICY_PREFIX.encode()).hexdigest()[:12]
+
+    assert (POLICY_VERSION, digest) == ("policy-v2", "227891222abe")
+
+
+# --- 관점 응답의 모양 --------------------------------------------------------------
+#
+# 이 블록이 지키는 것은 불변식 하나다. **아무것도 읽지 못한 응답을 "위반 없음"으로 읽지
+# 않는다.** 모델이 계약을 어기는 모양은 둘로 갈린다 -- findings 자리가 배열이 아닌 것과,
+# 배열 안 항목이 계약과 다른 것이다. 전자는 관점 전체가 미검사이고, 후자는 그 항목만
+# 버린다(원문에 없는 문장을 인용한 것과 같은 취급).
+
+NO_FINDING_SHAPES: list[Any] = [None, {}, False, "findings", 0]
+
+
+@pytest.mark.parametrize("broken", NO_FINDING_SHAPES)
+async def test_findings가_배열이_아니면_통과가_아니라_미검사다(
+    settings: Settings,
+    broken: Any,
+) -> None:
+    llm = FakeLlmClient([ok({"findings": broken}), ok({"findings": broken})])
+
+    verdict = await InspectionPipeline(llm=llm, settings=settings).run(
+        product("글루코사민 함유 영양제입니다")
     )
-    pipeline = InspectionPipeline(llm=llm, settings=settings)
 
-    await pipeline.run(product(quote))
+    rows = {p.perspective: p for p in verdict.perspectives}
+    for perspective in (Perspective.DISPLAY_ADS, Perspective.CONDUCT_TRADE):
+        assert rows[perspective].outcome is PerspectiveOutcome.UNCHECKED, broken
+        assert rows[perspective].skipReason == CallOutcome.SCHEMA_INVALID.value
+    assert verdict.verdict is not Verdict.PASS, "관점 둘이 미검사인데 통과로 적으면 무검수 노출이다"
 
-    sent = llm.calls[2]["user_content"][0]["text"]
-    assert "정책 위반" in sent, "비평이 1차 판정 사유를 못 본다"
-    assert "제안 없음" not in sent, "사유 자리에 제안을 넣어 거짓 라벨이 됐다"
+
+async def test_항목이_객체가_아니면_그_항목만_버리고_미검사로_떨어진다(settings: Settings) -> None:
+    """``item.get`` 이 터지면 예외가 소비 루프까지 올라가 상품이 PENDING 에 남는다."""
+    llm = FakeLlmClient([ok({"findings": [None]}), ok({"findings": [None]})])
+
+    verdict = await InspectionPipeline(llm=llm, settings=settings).run(
+        product("글루코사민 함유 영양제입니다")
+    )
+
+    rows = {p.perspective: p for p in verdict.perspectives}
+    assert rows[Perspective.DISPLAY_ADS].outcome is PerspectiveOutcome.UNCHECKED
+    assert verdict.verdict is not Verdict.PASS
+
+
+async def test_분류가_없거나_열거에_없으면_인용이_맞아도_버린다(settings: Settings) -> None:
+    """인용 검증만으로는 모자라다. ``Violation`` 의 분류가 열거라 모르는 값은 생성에서 터진다."""
+    quote = "관절염 치료에 효과가 있습니다"
+    for finding in ({"quote": quote}, {"category": "NOT_A_CATEGORY", "quote": quote}):
+        llm = FakeLlmClient([ok({"findings": [finding]}), ok({"findings": [finding]})])
+
+        verdict = await InspectionPipeline(llm=llm, settings=settings).run(product(quote))
+
+        rows = {p.perspective: p for p in verdict.perspectives}
+        assert rows[Perspective.DISPLAY_ADS].outcome is PerspectiveOutcome.UNCHECKED, finding
+        assert verdict.violations == [], finding
+
+
+async def test_빈_배열은_읽었고_위반이_없다는_뜻이다(settings: Settings) -> None:
+    """위 셋과 가르는 자리다. 빈 배열까지 미검사로 떨어뜨리면 통과가 아예 나오지 않는다."""
+    llm = FakeLlmClient([ok(NO_FINDING), ok(NO_FINDING)])
+
+    verdict = await InspectionPipeline(llm=llm, settings=settings).run(
+        product("글루코사민 함유 영양제입니다")
+    )
+
+    assert verdict.verdict is Verdict.PASS
+    rows = {p.perspective: p for p in verdict.perspectives}
+    assert rows[Perspective.DISPLAY_ADS].outcome is PerspectiveOutcome.CLEAR

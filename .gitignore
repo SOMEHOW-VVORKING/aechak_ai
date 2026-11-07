@@ -6,3 +6,4 @@ __pycache__/
 .env
 harness/out/
 harness/draft_images/
+*.gguf

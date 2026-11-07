@@ -172,7 +172,12 @@ class ContentVerdict(BaseModel):
     violations: list[Violation]
     sellerNotice: str | None = None
     calls: list[CallUsage]
-    # 비평이 모델 위반을 뒤집어 통과로 바꿨는지. 백엔드 어드민 검수 라우팅이 보는 신호다
+    # 비평이 모델 위반을 뒤집어 통과로 바꿨는지. 백엔드 어드민 검수 라우팅이 보는 신호다.
+    #
+    # **이쪽은 비평 단계를 뺐으므로 항상 거짓을 보낸다.** 필드를 지우지 않는 이유는 계약이
+    # 백엔드 ``ContentVerdictMessage`` 와 1:1이어야 하고 그쪽에는 필드가 남아 있기 때문이다.
+    # 백엔드가 쓴 계약 표본(``tests/contract/content-verdict-triage-promoted.json``)이 참을
+    # 들고 있어 **읽는 쪽은 참도 받아야 한다** -- 그 표본의 왕복을 테스트가 단언한다.
     criticOverturned: bool = False
     promptVersion: str
     schemaVersion: int = SCHEMA_VERSION

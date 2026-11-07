@@ -304,10 +304,13 @@ def test_판정_계약을_건드리지_않았다() -> None:
 def test_요약_버전이_검수_promptVersion에_섞이지_않는다() -> None:
     """``PROMPT_VERSION_MAX_LENGTH = 40`` 이고 현재 합성값이 33자라 여유가 7자다."""
     from app.inspection.pipeline import PROMPT_VERSION_MAX_LENGTH
+    from app.inspection.policy import POLICY_VERSION
+    from app.inspection.triage import TRIAGE_VERSION
     from app.review_summary.extract_prompt import EXTRACT_VERSION
     from app.review_summary.narrate_prompt import NARRATE_VERSION
 
-    composed = "inspection-v1+policy-v1+triage-v2"
+    # 하드코딩하지 않는다. 적어 둔 값이 낡으면 "여유 7자"가 거짓이 된 뒤에도 통과한다.
+    composed = f"{Settings().prompt_version}+{POLICY_VERSION}+{TRIAGE_VERSION}"
     assert len(composed) <= PROMPT_VERSION_MAX_LENGTH
     assert EXTRACT_VERSION not in composed
     assert NARRATE_VERSION not in composed

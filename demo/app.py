@@ -124,7 +124,7 @@ async def scenarios() -> JSONResponse:
             "defaults": {
                 "triageModel": settings.triage_model,
                 "screeningModel": settings.screening_model,
-                "escalationModel": settings.escalation_model,
+                "noticeModel": settings.notice_model,
                 "enableTriage": settings.enable_triage,
                 "krwPerUsd": view.KRW_PER_USD,
             },
@@ -165,7 +165,11 @@ async def inspect(body: InspectBody) -> JSONResponse:
     if not settings.anthropic_api_key:
         # 키 이름이 ANTHROPIC_API_KEY 가 아니라 이것이다(Settings 의 env_prefix 가 AECHAK_AI_).
         return _error("AECHAK_AI_ANTHROPIC_API_KEY 가 없어 라이브 모드를 쓸 수 없다. 재생이나 모의로 돌려라")
-    llm = LlmClient(api_key=settings.anthropic_api_key, timeout_seconds=settings.request_timeout_seconds)
+    llm = LlmClient(
+        api_key=settings.anthropic_api_key,
+        timeout_seconds=settings.request_timeout_seconds,
+        local_base_url=settings.local_llm_base_url,
+    )
     try:
         return await _run(
             request=request,

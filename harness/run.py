@@ -50,7 +50,10 @@ SONNET_CACHE_MIN_TOKENS = 1_024
 HAIKU_CACHE_MIN_TOKENS = 4_096
 
 # 예상 비용 계산에 쓰는 건당 microUSD. 토큰 전제는 --count-tokens가 실측으로 치환한다.
-_ESTIMATE_MICRO_USD = {"triage": 1_400, "sonnet_pair": 3_680, "critic_and_notice": 9_000}
+# ``critic_and_notice`` 가 9,000이었다. 비평(Opus 1회)이 그 대부분이었고 노드를 뺐으므로
+# 수정 문구 한 번(Sonnet, 입력 ~480 / 출력 ~180)만 남는다. 손익분기 승급률은 이 수를 보지
+# 않고 ``triage``/``sonnet_pair`` 두 수로만 나오므로 62.0% 는 그대로다.
+_ESTIMATE_MICRO_USD = {"triage": 1_400, "sonnet_pair": 3_680, "notice": 2_000}
 
 
 def _breakeven_promotion_rate() -> float:
@@ -114,14 +117,18 @@ def _percentile(values: list[float], pct: float) -> float:
 TRIAGE_OFF = "OFF"
 TRIAGE_SKIPPED_RULE_HIT = "SKIPPED_RULE_HIT"
 TRIAGE_CLEARED = "CLEAR"
+TRIAGE_CERTAIN = "CERTAIN"
 TRIAGE_PROMOTED = "PROMOTED"
 TRIAGE_FAILED = "FAILED"
 
 # 승급 쪽으로 세는 값. 선별이 아무것도 아끼지 못한 건 전부다.
+#
+# ``CERTAIN`` 은 여기 들어오지 않는다. 확정도 관점 호출을 건너뛰므로 Sonnet 2회를 아낀
+# 쪽이고, 승급으로 세면 손익분기 승급률이 아끼지 못한 비율을 과장한다.
 _PROMOTING = (TRIAGE_PROMOTED, TRIAGE_FAILED, TRIAGE_SKIPPED_RULE_HIT)
 # 실제로 Haiku 에 물은 건. 실패율의 분모는 이쪽이어야 한다 -- 묻지 않은 건을 넣으면
 # 실패율이 희석된다.
-_ASKED = (TRIAGE_CLEARED, TRIAGE_PROMOTED, TRIAGE_FAILED)
+_ASKED = (TRIAGE_CLEARED, TRIAGE_CERTAIN, TRIAGE_PROMOTED, TRIAGE_FAILED)
 
 
 def _triage_outcome(verdict: Any) -> tuple[str, str | None]:
@@ -152,6 +159,10 @@ def _triage_outcome(verdict: Any) -> tuple[str, str | None]:
         return TRIAGE_FAILED, outcome
     if row is not None and row.outcome is PerspectiveOutcome.CLEAR:
         return TRIAGE_CLEARED, outcome
+    if row is not None and row.outcome is PerspectiveOutcome.VIOLATION:
+        # 확정. 관점 행은 미검사이고 사유가 ``TRIAGE_CERTAIN`` 이지만, 선별 자신의 행이
+        # 위반인 것으로 가르는 편이 사유 문자열에 의존하지 않아 모양 변화에 덜 흔들린다.
+        return TRIAGE_CERTAIN, outcome
     return TRIAGE_PROMOTED, outcome
 
 
@@ -238,8 +249,12 @@ async def _run_triage_only(
             decision = triage.decide(result)
             if not result.ok:
                 outcome = TRIAGE_FAILED
+            elif decision.skip:
+                outcome = TRIAGE_CLEARED
+            elif decision.certain:
+                outcome = TRIAGE_CERTAIN
             else:
-                outcome = TRIAGE_CLEARED if decision.skip else TRIAGE_PROMOTED
+                outcome = TRIAGE_PROMOTED
 
             records.append(
                 _record_of(
@@ -391,17 +406,17 @@ def _report_tokens(counted: list[tuple[CachePrefixTarget, int]]) -> int:
 def _estimate(mode: str, repeat: int, cases: list[Case]) -> None:
     rule_passed = len(promotable(cases))
     per_case = {
-        "baseline": _ESTIMATE_MICRO_USD["sonnet_pair"] + _ESTIMATE_MICRO_USD["critic_and_notice"],
+        "baseline": _ESTIMATE_MICRO_USD["sonnet_pair"] + _ESTIMATE_MICRO_USD["notice"],
         "triage-only": _ESTIMATE_MICRO_USD["triage"],
         "full": _ESTIMATE_MICRO_USD["triage"]
         + _ESTIMATE_MICRO_USD["sonnet_pair"]
-        + _ESTIMATE_MICRO_USD["critic_and_notice"],
+        + _ESTIMATE_MICRO_USD["notice"],
     }[mode]
     micro = per_case * rule_passed * repeat
     print()
     print(f"모드 {mode} / 케이스 {len(cases)}건(규칙 통과 {rule_passed}건) / 반복 {repeat}회")
     print(f"예상 상한 비용  {micro / 1_000_000:.3f} USD  = {micro * KRW_PER_USD / 1_000_000:,.0f}원")
-    print("위반이 전부 비평과 수정문구를 태우는 최악을 가정한 상한이다. 실제는 이보다 적다.")
+    print("위반이 전부 수정문구를 태우는 최악을 가정한 상한이다. 실제는 이보다 적다.")
     print("실행하려면 --yes 를 붙여라.")
 
 
@@ -570,7 +585,11 @@ async def _main(args: argparse.Namespace) -> int:
         return 0
 
     baseline = _load_baseline(Path(args.baseline_from)) if args.baseline_from else {}
-    llm = LlmClient(api_key=settings.anthropic_api_key, timeout_seconds=settings.request_timeout_seconds)
+    llm = LlmClient(
+        api_key=settings.anthropic_api_key,
+        timeout_seconds=settings.request_timeout_seconds,
+        local_base_url=settings.local_llm_base_url,
+    )
     try:
         if args.mode == "triage-only":
             records = await _run_triage_only(settings, llm, args.repeat, cases)

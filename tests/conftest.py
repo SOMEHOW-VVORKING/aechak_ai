@@ -25,9 +25,14 @@ def contract() -> Any:
 
 @pytest.fixture
 def settings() -> Settings:
+    """두 관점을 명시한다. 기본값이 단일 관점으로 바뀌어도 기존 단언이 흔들리지 않게 한다.
+
+    단일 관점 경로는 ``test_pipeline.py`` 가 ``model_copy`` 로 따로 덮어 검사한다.
+    """
     return Settings(
         anthropic_api_key="test",
         kafka_bootstrap_servers="localhost:9092",
+        perspective_fanout=True,
     )
 
 

@@ -110,19 +110,31 @@ class MockLlmClient:
         self.calls.append({"tool": name, "perspective": perspective, "model": model})
 
         if name == "triage_content":
+            # 대역은 **확정을 내지 않는다.** 키워드 표가 "의심의 여지없음" 을 증명할 수단이
+            # 아니고, 확정은 관점 둘을 건너뛰고 바로 보류까지 간다. 확정 경로는 카세트
+            # 시나리오(``triage-certain``)가 보여 준다.
             if hits:
                 tool_input: dict[str, Any] = {
                     "decision": "NEEDS_REVIEW",
                     "reason": f"걸릴 구석이 있다: {hits[0][1].value}",
+                    "category": None,
+                    "quote": None,
                 }
             elif _is_clear_sample(body):
-                tool_input = {"decision": "CLEAR", "reason": "깨끗하다고 적어 둔 표본 문구다"}
+                tool_input = {
+                    "decision": "CLEAR",
+                    "reason": "깨끗하다고 적어 둔 표본 문구다",
+                    "category": None,
+                    "quote": None,
+                }
             else:
                 # 표에 안 걸린다는 것은 깨끗하다는 뜻이 아니다. 대역은 그것을 증명할 수
                 # 없으므로 더 보라고 넘긴다. CLEAR_SAMPLE_MARKERS 머리에 근거를 적었다.
                 tool_input = {
                     "decision": "NEEDS_REVIEW",
                     "reason": "대역의 키워드 표로는 깨끗함을 확인할 수 없다",
+                    "category": None,
+                    "quote": None,
                 }
         elif name == "report_findings":
             allowed = _categories_for(perspective)
@@ -138,9 +150,6 @@ class MockLlmClient:
                     if category in allowed
                 ]
             }
-        elif name == "review_finding":
-            # 대역은 뒤집지 않는다. 뒤집힘 경로는 카세트 시나리오(critic-overturn)가 보여 준다.
-            tool_input = {"decision": "UPHOLD", "reason": "모의 판정기는 1차 판정을 유지한다"}
         else:
             quoted = _quoted_violations(prompt)
             tool_input = {

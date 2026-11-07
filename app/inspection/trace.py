@@ -1,9 +1,9 @@
 """단계 추적. 판정 계약 **밖**이다.
 
-왜 계약 밖인가. 콘솔이 "왜 이렇게 판정했는가"를 보여 주려면 아래 여덟이 필요한데
-``ContentVerdict`` 에는 어느 것도 없다 — 선별이 적은 사유, 비평의 결정 열거,
-호출 실패 상세(``LlmResult.detail``), 비평·수정문구의 단계 라벨, 인용 검증으로 떨어낸 개수,
-수정 문구 후보 배열, 가린 본문, 규칙 적중의 사유와 차단 여부.
+왜 계약 밖인가. 콘솔이 "왜 이렇게 판정했는가"를 보여 주려면 아래 여섯이 필요한데
+``ContentVerdict`` 에는 어느 것도 없다 — 선별이 적은 사유, 호출 실패 상세
+(``LlmResult.detail``), 수정 문구 단계의 라벨, 인용 검증으로 떨어낸 개수,
+수정 문구 후보 배열, 가린 본문과 규칙 적중의 사유·차단 여부.
 
 그런데 ``app/schemas/inspection.py`` 는 백엔드 ``com.aechak.message.inspection`` 패키지와
 1:1이라 필드를 더할 수 없다. 더하면 백엔드 매퍼가 모르는 필드를 **에러 없이 버리고**,
@@ -15,8 +15,8 @@
    추적기를 주지 않으므로 운영 동작이 바뀌지 않는다. ``tests/test_trace.py`` 가 추적 유무로
    판정 바이트가 같은 것을 단언한다.
 2. **단계 라벨은 여기에만 둔다.** 원장(``CallUsage.perspective``)은 백엔드 열거에 있는 값만
-   실어야 한다. 비평과 수정문구 호출이 둘 다 ``ALL`` 로 적히는 것을 고치려고 새 관점을
-   만들면 백엔드 역직렬화가 깨진다. 구분은 추적 쪽에서 한다.
+   실어야 한다. 수정 문구 호출이 ``ALL`` 로 적히는 것을 고치려고 새 관점을 만들면 백엔드
+   역직렬화가 깨진다. 구분은 추적 쪽에서 한다.
 
 통과(``CLEAR``)와 미검사(``UNCHECKED``)를 뭉개지 않는 것이 이 프로젝트 전체의 불변식이라,
 단계 레코드도 **돌았는지(status)** 와 **무엇으로 판정됐는지(outcome)** 를 따로 든다.
@@ -31,13 +31,16 @@ from app.schemas.inspection import Perspective, PerspectiveOutcome, ViolationCat
 
 
 class Stage(StrEnum):
-    """파이프라인 노드. 값은 콘솔이 그대로 표시하는 순서 표시다."""
+    """파이프라인 노드. 값은 콘솔이 그대로 표시하는 순서 표시다.
+
+    ``N3`` 자리가 비어 있다. 비평 노드를 뺀 자리이고, 번호를 당기지 않았다 -- 이 값이
+    추적·콘솔·테스트의 키라서 뜻이 같은 재배열이 사본을 전부 흔든다.
+    """
 
     RULE = "N0_RULE"
     TRIAGE = "N0_5_TRIAGE"
     JUDGE = "N1_JUDGE"
     AGGREGATE = "N2_AGGREGATE"
-    CRITIC = "N3_CRITIC"
     NOTICE = "N4_NOTICE"
 
 
@@ -93,12 +96,12 @@ class RuleHitRecord:
 class StageRecord:
     stage: Stage
     status: StageStatus
-    # 사람이 읽는 단계 이름. 비평과 수정문구를 원장에서 가를 수 없는 것을 여기서 가른다
+    # 사람이 읽는 단계 이름. 수정문구 호출이 원장에서 ``ALL`` 로 묻히는 것을 여기서 가른다
     label: str
     perspective: Perspective | None = None
     outcome: PerspectiveOutcome | None = None
     skip_reason: str | None = None
-    # 모델이 돌려준 열거값과 사유. 선별의 CLEAR/NEEDS_REVIEW, 비평의 UPHOLD/OVERTURN/INSUFFICIENT
+    # 모델이 돌려준 열거값과 사유. 선별의 CLEAR/NEEDS_REVIEW/CERTAIN_VIOLATION
     decision: str | None = None
     reason: str | None = None
     # 실패 상세. CallOutcome 열거만으로는 max_tokens 초과와 스키마 오류 본문이 사라진다

@@ -48,9 +48,6 @@ class Settings(BaseSettings):
     screening_model: str = "claude-sonnet-5"
     # 등급을 비우면 거부한다. 빈 값을 미지정으로 접으면 모델 기본값(high)으로 조용히 올라간다.
     screening_effort: EffortGrade = "low"
-    # 2단 에스컬레이션
-    escalation_model: str = "claude-opus-5"
-    escalation_effort: EffortGrade = "medium"
     # 수정 제안 생성
     notice_model: str = "claude-sonnet-5"
     notice_effort: EffortGrade = "medium"
@@ -60,11 +57,16 @@ class Settings(BaseSettings):
     # 빈 문자열도 미지정이고, "none"처럼 등급이 아닌 값은 부팅에서 떨어뜨린다.
     triage_effort: OptionalEffort = None
 
+    # 로컬 sLLM. 모델 ID 를 ``local/`` 로 시작하게 적으면(예: ``local/ax-4.0-light``) 그 호출만
+    # 이 주소의 OpenAI 호환 경로로 간다. 가중치와 기동은 ``harness/local-llm.sh`` 가 맡는다.
+    # **이 URL 의 정본은 여기 하나다** -- 클라이언트 쪽 기본값으로도 적어 두면 한쪽만 고치는
+    # 날 호출이 조용히 엉뚱한 포트로 간다.
+    local_llm_base_url: str = "http://127.0.0.1:8080"
+
     request_timeout_seconds: float = 60.0
     # 사고 토큰과 tool_use가 한 상한을 나눠 쓴다. 상한이 좁으면 tool_use 블록이 안 나와
     # SCHEMA_INVALID로 떨어진다. max_tokens는 지출이 아니라 상한이라 넉넉히 둔다.
     max_tokens_screening: int = 8192
-    max_tokens_escalation: int = 8192
     max_tokens_notice: int = 4096
     # 선별도 좁게 두지 않는다. 툴의 ``reason``에 길이 제약을 걸 수 없어서(strict 모드가
     # maxLength 를 받지 않는다) 사유가 길어지면 응답이 끊기고, 끊긴 호출은 TRUNCATED 승급이
@@ -75,10 +77,17 @@ class Settings(BaseSettings):
     triage_timeout_seconds: float = 15.0
 
     # 파이프라인 토글. 노드를 측정으로 남기고 빼기 위해 설정으로 갈라 둔다.
-    enable_escalation: bool = True
+    #
+    # ``enable_escalation`` 이 있었다. 비평 노드를 뺐으므로 토글도 뺀다 -- 끄는 레버만 남기면
+    # 켜도 아무 일이 없는 설정이 되어 운영에서 "켰는데 왜 안 도나"가 된다.
     enable_notice: bool = True
-    perspective_fanout: bool = True
-    # 기본 꺼짐. 백엔드 열거에 TRIAGE가 없는 동안 켜면 판정 전건이 격리 토픽으로 간다.
+    # 기본 꺼짐. 하네스 108건에서 관점 하나가 둘보다 나았다 -- 건당 비용 31%, 지연 p50 42%가
+    # 줄고 두 관점에서 나던 과탐 한 종이 사라졌다. 관점을 쪼개면 각자 자기 분류만 보려다
+    # 맥락을 잃는다. 켜면 두 관점이 순차로 돌아 지연이 두 배가 된다.
+    perspective_fanout: bool = False
+    # 기본 꺼짐. 로컬 sLLM(local/ 접두)으로 켜면 호출이 0원이지만 GPU 없이는 건당 60초가
+    # 넘는다 -- Mac Metal 1.2초 대 CPU 4스레드 42.7초 실측이고 Fargate x86은 더 느리다.
+    # Haiku로 켜면 캐시 접두부 4,096 미달로 선별만 건당 4.76원이라 전체가 더 비싸진다.
     enable_triage: bool = False
 
     # --- 리뷰 요약(SCRUM-310). 검수와 모델·토픽·폴 간격을 공유하지 않는다 ------------
@@ -204,7 +213,9 @@ class Settings(BaseSettings):
     kafka_publish_attempts: int = 3
     kafka_publish_retry_seconds: float = 2.0
 
-    prompt_version: str = "inspection-v1"
+    # 판정 동작을 바꾸면 올린다. 비평 단계를 빼고 관점을 하나로 줄이면서 v2 로 올렸다 --
+    # 이 값과 정책 버전이 재사용 키라, 올리지 않으면 옛 구성으로 낸 판정이 그대로 쓰인다.
+    prompt_version: str = "inspection-v2"
 
     # 계약 버전. 모르는 major를 받으면 떨어뜨리지 않고 거절한다.
     supported_schema_version: int = 1
@@ -227,7 +238,9 @@ class Settings(BaseSettings):
         것을 빠뜨리는 함정을 이 레포가 이미 한 번 밟았기** 때문이다.
         """
         judge = _FANOUT_PERSPECTIVES * (2 * self.request_timeout_seconds + JUDGE_RETRY_DELAY_SECONDS)
-        tail = self.request_timeout_seconds * 2  # 비평 + 수정 문구
+        # 수정 문구 한 번. 비평을 뺐으므로 종전의 두 배가 아니다 -- 줄이는 쪽이라 폴 간격과의
+        # 관계는 느슨해지고, 느슨해지는 방향은 테스트가 막지 않는다.
+        tail = self.request_timeout_seconds
         triage = self.triage_timeout_seconds if self.enable_triage else 0.0
         return triage + judge + tail
 
@@ -295,7 +308,6 @@ class Settings(BaseSettings):
         """
         return (
             self.screening_model,
-            self.escalation_model,
             self.notice_model,
             self.triage_model,
             self.summary_extract_model,

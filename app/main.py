@@ -51,6 +51,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         LlmClient(
             api_key=settings.anthropic_api_key,
             timeout_seconds=settings.request_timeout_seconds,
+            local_base_url=settings.local_llm_base_url,
         )
         if settings.anthropic_api_key
         else None
