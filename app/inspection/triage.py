@@ -53,8 +53,10 @@ from app.schemas.inspection import (
 if TYPE_CHECKING:
     from app.llm.client import LlmResult
 
-# 프롬프트를 고치면 올린다. 판정 재사용 키에 섞여 나간다.
-TRIAGE_VERSION = "triage-v3"
+# 선별 판정이 달라지는 수정을 하면 올린다. 판정 재사용 키에 섞여 나가므로, 프롬프트 문구를
+# 그대로 두고 코드만 고친 경우도 포함한다 -- 성분을 확정 사유에서 뺀 것이(v3 -> v4) 그 예다.
+# 올리지 않으면 같은 본문이 옛 판정을 그대로 받는다.
+TRIAGE_VERSION = "triage-v4"
 
 # 선별이 낼 수 있는 결정 셋. 분기 조건은 이 문자열의 완전 일치 하나이고 그게 불변식 1이다.
 TRIAGE_CLEAR = "CLEAR"
@@ -80,6 +82,14 @@ TRIAGE_SKIP_REASON = "TRIAGE_CLEAR"
 # ``model_dispatched``에 한 건씩 잘못 들어가고 ``exit_code``는 ``UNCLASSIFIED``로 떨어진다.
 # 숫자가 틀리는 것이지 조용히 사라지는 것은 아니라서 이쪽은 그대로 두고 보강은 따로 올린다.
 TRIAGE_CERTAIN_SKIP_REASON = "TRIAGE_CERTAIN"
+
+# 선별이 확정 사유로 쓸 수 없는 분류.
+#
+# 성분은 섭취용인지 위생용품인지를 카테고리와 함께 봐야 가려지는 축이라, 본문만 읽는 선별이
+# 단독으로 확정할 근거가 없다. 프롬프트도 그렇게 지시하지만 모델이 지시를 어길 수 있어
+# 코드에서 한 번 더 막는다 -- 막히면 ``certain``이 거짓이 되어 ``NEEDS_REVIEW``와 같은
+# 경로로 떨어지고, 관점 호출이 본문을 다시 읽는다.
+TRIAGE_CERTAIN_FORBIDDEN_CATEGORIES = frozenset({ViolationCategory.BANNED_INGREDIENT})
 
 # Haiku 4.5의 최소 캐시 접두부가 4,096토큰이라 이 프롬프트는 캐시되지 않는다. 그래서 짧게 쓴다.
 TRIAGE_PROMPT = """\
@@ -238,7 +248,13 @@ def decide(result: LlmResult) -> TriageOutcome:
     category = _category(tool_input.get("category"))
     raw_quote = tool_input.get("quote")
     quote = raw_quote.strip() if isinstance(raw_quote, str) else ""
-    certain = result.ok and decision == TRIAGE_CERTAIN and category is not None and bool(quote)
+    certain = (
+        result.ok
+        and decision == TRIAGE_CERTAIN
+        and category is not None
+        and category not in TRIAGE_CERTAIN_FORBIDDEN_CATEGORIES
+        and bool(quote)
+    )
     return TriageOutcome(
         skip=skip,
         decision=decision,

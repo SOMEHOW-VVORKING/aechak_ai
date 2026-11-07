@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import pytest
@@ -606,6 +607,30 @@ async def test_확정_인용이_본문에_없으면_확정을_버리고_승급�
     assert rows[Perspective.DISPLAY_ADS].outcome is PerspectiveOutcome.CLEAR
 
 
+async def test_확정_분류가_성분이면_확정을_버리고_승급한다(triage_on: Settings) -> None:
+    """성분은 섭취용인지 위생용품인지를 카테고리와 함께 봐야 가려지는 축이라, 본문만 읽는
+    선별에게는 확정할 근거가 없다. 프롬프트가 그렇게 지시하지만 지시만으로는 모자라서
+    ``decide`` 가 분류를 한 번 더 막는다.
+
+    인용은 본문에 있는 것으로 둔다 -- 증거 두 조각이 모두 갖춰져도 분류 하나로 떨어진다는
+    것이 이 테스트가 지키는 바다.
+    """
+    llm = FakeLlmClient(
+        [
+            triage_ok(certain(category="BANNED_INGREDIENT"), triage_on),
+            ok(NO_FINDING),
+            ok(NO_FINDING),
+        ]
+    )
+
+    verdict = await InspectionPipeline(llm=llm, settings=triage_on).run(product(CERTAIN_TEXT))
+
+    assert verdict.verdict is Verdict.PASS
+    assert len(llm.calls) == 3, "선별 + 관점 둘"
+    rows = {p.perspective: p for p in verdict.perspectives}
+    assert rows[Perspective.TRIAGE].skipReason == "PROMOTED"
+
+
 async def test_확정이_리뷰에는_수정_문구를_만들지_않는다(triage_on: Settings) -> None:
     """리뷰는 작성자가 고쳐 올리는 흐름이 없다. 관점 경로와 같은 규칙이다."""
     from app.schemas.inspection import ReviewInspectionRequest
@@ -706,6 +731,17 @@ def test_선별_툴이_결정_셋을_받고_증거_칸을_든다() -> None:
         assert properties[key]["type"] == ["string", "null"], key
 
 
-def test_선별_프롬프트_버전이_올라갔다() -> None:
-    """버전은 판정 재사용 키에 섞여 나간다. 안 올리면 바뀐 프롬프트로 다시 보지 않는다."""
-    assert TRIAGE_VERSION == "triage-v3"
+def test_선별_문구나_판정이_바뀌면_버전도_올리게_한다() -> None:
+    """버전은 판정 재사용 키에 섞여 나간다. 안 올리면 바뀐 선별로 다시 보지 않는다.
+
+    버전만 단언하면 **문구를 고치고 버전을 안 올린 경우를 못 잡는다** -- 실제로 정책 쪽에서
+    그 일이 있었다. 그래서 문구의 지문을 같이 고정한다. 둘을 한 ``assert`` 에 묶어 둔 것은
+    해시만 갱신하고 버전을 빼먹는 길을 막기 위해서다.
+
+    프롬프트를 그대로 두고 ``decide`` 만 고쳐 판정이 달라지는 경우는 이 테스트가 잡지 못한다.
+    그때는 바뀐 동작을 고정하는 테스트가 따로 깨지므로
+    (``test_확정_분류가_성분이면_확정을_버리고_승급한다`` 가 그렇게 추가됐다) 거기서 걸린다.
+    """
+    digest = hashlib.sha256(TRIAGE_PROMPT.encode()).hexdigest()[:12]
+
+    assert (TRIAGE_VERSION, digest) == ("triage-v4", "7260f0af1fb2")
