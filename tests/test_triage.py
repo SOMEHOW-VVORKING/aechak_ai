@@ -16,6 +16,7 @@ from conftest import FakeLlmClient, backend_model_verified, failed, ok
 from app.inspection import triage
 from app.inspection.perspectives import specs_for
 from app.inspection.pipeline import InspectionPipeline, countable_perspectives
+from app.inspection.policy import POLICY_PREFIX
 from app.inspection.triage import TRIAGE_PROMPT, TRIAGE_VERSION
 from app.schemas.inspection import (
     CallOutcome,
@@ -439,13 +440,39 @@ def test_승급_신호가_정책_분류_전체를_덮는다() -> None:
         ViolationCategory.ABUSE: "초성",
         ViolationCategory.DISPARAGEMENT: "깎아내리는",
         ViolationCategory.PII: "타인의 개인정보",
-        ViolationCategory.IRRELEVANT: "상품과 무관",
+        ViolationCategory.IRRELEVANT: "상품에 대한 내용을 전혀 담지 않은",
     }
     missing = [c.value for c in ViolationCategory if c not in attribution]
     assert missing == [], f"새 분류에 승급 신호를 귀속시키지 않았다: {missing}"
 
+    # 신호를 프롬프트 전체에서 찾지 않는다. 그렇게 보면 **다른 분류의 줄에서 걸려** 공허하게
+    # 통과한다 -- IRRELEVANT 에 "상품과 무관" 을 귀속시켜 두었을 때 그 문구가 SPAM 줄에만
+    # 있어서, IRRELEVANT 항목을 통째로 지워도 이 테스트가 녹색이었다. 그래서 그 분류를
+    # 괄호로 단 목록 항목 안에서만 찾는다.
     for category, signal in attribution.items():
-        assert signal in TRIAGE_PROMPT, f"{category.value} 를 승급시킬 신호가 프롬프트에 없다: {signal}"
+        scope = _signal_scope(category)
+        assert scope, f"{category.value} 를 괄호로 단 목록 항목이 프롬프트에 없다"
+        assert signal in scope, (
+            f"{category.value} 를 승급시킬 신호가 그 항목에 없다: {signal!r} / 항목={scope!r}"
+        )
+
+    # 정책 쪽에도 그 분류의 절이 있어야 한다. 선별이 승급시켜도 관점이 읽을 정의가 없으면
+    # 그 분류는 판정에 실리지 않는다.
+    for category in ViolationCategory:
+        assert f"## {category.value}" in POLICY_PREFIX, f"정책에 {category.value} 절이 없다"
+
+
+def _signal_scope(category: ViolationCategory) -> str:
+    """선별 프롬프트의 판단 대상 목록에서 그 분류를 단 항목 본문을 돌려준다.
+
+    항목이 두 줄에 걸치는 것이 있어 줄 단위로 끊지 않는다. ``(분류)`` 표기 앞에서 가장 가까운
+    항목 머리(``\n- ``)까지를 그 항목으로 본다.
+    """
+    end = TRIAGE_PROMPT.find(f"({category.value})")
+    if end < 0:
+        return ""
+    start = TRIAGE_PROMPT.rfind("\n- ", 0, end)
+    return TRIAGE_PROMPT[start:end] if start >= 0 else ""
 
 
 async def test_비차단_성분_적중은_선별에_묻는다(triage_on: Settings) -> None:
@@ -735,8 +762,8 @@ def test_선별_문구나_판정이_바뀌면_버전도_올리게_한다() -> No
     """버전은 판정 재사용 키에 섞여 나간다. 안 올리면 바뀐 선별로 다시 보지 않는다.
 
     버전만 단언하면 **문구를 고치고 버전을 안 올린 경우를 못 잡는다** -- 실제로 정책 쪽에서
-    그 일이 있었다. 그래서 문구의 지문을 같이 고정한다. 둘을 한 ``assert`` 에 묶어 둔 것은
-    해시만 갱신하고 버전을 빼먹는 길을 막기 위해서다.
+    그 일이 있었다. 그래서 문구의 지문을 같이 고정한다. 해시만 갱신하고 버전을 두면 다시
+    통과하므로 강제가 아니라 알림이고, 그 한계는 ``test_pipeline`` 의 짝 테스트에 적었다.
 
     프롬프트를 그대로 두고 ``decide`` 만 고쳐 판정이 달라지는 경우는 이 테스트가 잡지 못한다.
     그때는 바뀐 동작을 고정하는 테스트가 따로 깨지므로
