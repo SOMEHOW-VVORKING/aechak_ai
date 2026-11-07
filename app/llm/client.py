@@ -414,14 +414,14 @@ class LlmClient:
                 outcome = CallOutcome.SCHEMA_INVALID
                 detail = f"본문이 JSON 객체가 아니다: {str(content)[:200]}"
             else:
-                missing = _missing_required(tool["input_schema"], tool_input)
-                if missing:
-                    # 객체이기만 하면 통과시키면 ``{}`` 가 SUCCESS 로 올라간다. 그러면 호출부가
-                    # 없는 ``findings`` 를 빈 목록으로 읽어 **미검사가 통과로 둔갑한다**.
-                    # llama-server 의 문법 제약 디코딩은 required 를 항상 강제하지는 않으므로
-                    # 여기서 한 번 더 본다.
+                breaches = _schema_breaches(tool["input_schema"], tool_input)
+                if breaches:
+                    # 객체이기만 하면 통과시키면 ``{}`` 나 ``{"findings": null}`` 이 SUCCESS 로
+                    # 올라간다. 그러면 호출부가 그 값을 빈 목록으로 읽어 **미검사가 통과로
+                    # 둔갑한다.** llama-server 의 문법 제약 디코딩은 스키마를 항상 강제하지는
+                    # 않으므로 여기서 한 번 더 본다.
                     outcome = CallOutcome.SCHEMA_INVALID
-                    detail = f"필수 키 누락: {', '.join(missing)}"
+                    detail = f"스키마 불일치: {', '.join(breaches)}"
                     tool_input = None
 
         if outcome is not CallOutcome.SUCCESS:
@@ -486,8 +486,8 @@ def _parse_json_object(content: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _missing_required(schema: Any, payload: dict[str, Any]) -> list[str]:
-    """응답에서 빠져 있으면 안 되는 최상위 키를 돌려준다.
+def _schema_breaches(schema: Any, payload: dict[str, Any]) -> list[str]:
+    """최상위 속성이 선언과 어긋나는 자리를 돌려준다. 빈 목록이면 모양이 맞다.
 
     ``required`` 를 그대로 쓰지 않는다. ``strict`` 모드가 선언한 속성 **전부** 를 거기 넣으라고
     요구해서, 우리 툴들은 선택 항목도 ``required`` 에 적고 대신 타입을 ``["string", "null"]``
@@ -496,9 +496,12 @@ def _missing_required(schema: Any, payload: dict[str, Any]) -> list[str]:
     **null 을 허용하지 않는** 속성이다. 선별이 ``CLEAR`` 를 낼 때 ``category`` 와 ``quote`` 를
     비우는 것은 정상 응답이므로 그 둘을 요구하면 멀쩡한 호출이 실패로 적힌다.
 
-    중첩까지 보지 않는다. 항목 안쪽은 호출부가 이미 방어적으로 읽고(``item.get("quote")
-    or ""``) 인용 검증이 한 번 더 걸러서 누락이 판정을 뒤집지 못한다. 최상위는 다르다 --
-    ``findings`` 하나가 비면 "위반 없음" 과 구별되지 않는다.
+    키 존재만으로는 모자라서 타입도 본다. ``{"findings": null}`` 은 키가 있지만 배열이 아니고,
+    그 값은 "읽었고 위반이 없다"(빈 배열)와 **구별되어야 한다.**
+
+    중첩은 보지 않는다. 항목 안쪽은 ``pipeline._perspective`` 가 항목마다 모양을 보고 틀린
+    것을 미검증으로 세어 버린다 -- 거기서 보는 이유는 이 함수가 Anthropic 경로에는 걸리지
+    않기 때문이다. 이쪽은 로컬 전송에서 더 이른 실패를 만들어 사유를 정확히 남기는 몫이다.
     """
     if not isinstance(schema, dict):
         return []
@@ -506,16 +509,47 @@ def _missing_required(schema: Any, payload: dict[str, Any]) -> list[str]:
     properties = schema.get("properties")
     if not isinstance(required, list) or not isinstance(properties, dict):
         return []
-    missing: list[str] = []
+    breaches: list[str] = []
     for key in required:
-        if not isinstance(key, str) or key in payload:
+        if not isinstance(key, str):
             continue
         declared = properties.get(key)
         types = declared.get("type") if isinstance(declared, dict) else None
-        nullable = types == "null" or (isinstance(types, list) and "null" in types)
-        if not nullable:
-            missing.append(key)
-    return missing
+        allowed = types if isinstance(types, list) else [types] if isinstance(types, str) else []
+        if key not in payload:
+            if "null" not in allowed:
+                breaches.append(f"{key} 누락")
+            continue
+        if allowed and not _matches_json_type(payload[key], allowed):
+            breaches.append(f"{key} 타입({type(payload[key]).__name__})")
+    return breaches
+
+
+# JSON Schema 타입 이름과 파이썬 타입의 대응. ``integer`` 를 따로 두지 않는다 -- 우리 툴
+# 스키마에 없고, 있다면 ``number`` 로 적힐 자리다. ``bool`` 이 ``int`` 의 하위형이라
+# ``number`` 검사에서 먼저 걸러 ``true`` 가 수로 통과하는 것을 막는다.
+_JSON_TYPE_CHECKS: dict[str, Any] = {
+    "object": lambda value: isinstance(value, dict),
+    "array": lambda value: isinstance(value, list),
+    "string": lambda value: isinstance(value, str),
+    "number": lambda value: isinstance(value, (int, float)) and not isinstance(value, bool),
+    "boolean": lambda value: isinstance(value, bool),
+    "null": lambda value: value is None,
+}
+
+
+def _matches_json_type(value: Any, allowed: list[Any]) -> bool:
+    """선언된 타입 중 하나에 맞는지 본다. 모르는 타입 이름은 통과시킨다 -- 검증기를 넓히는
+    것이 목적이 아니라 통과와 미검사를 섞지 않는 것이 목적이고, 모르는 이름에서 멀쩡한
+    응답을 떨어뜨리면 그 반대가 된다.
+    """
+    for name in allowed:
+        check = _JSON_TYPE_CHECKS.get(name) if isinstance(name, str) else None
+        if check is None:
+            return True
+        if check(value):
+            return True
+    return False
 
 
 def _extract_tool_input(response: Any, tool_name: str) -> dict[str, Any] | None:

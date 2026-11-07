@@ -343,3 +343,70 @@ def test_정책_문구가_바뀌면_버전도_올리게_한다() -> None:
     digest = hashlib.sha256(POLICY_PREFIX.encode()).hexdigest()[:12]
 
     assert (POLICY_VERSION, digest) == ("policy-v2", "227891222abe")
+
+
+# --- 관점 응답의 모양 --------------------------------------------------------------
+#
+# 이 블록이 지키는 것은 불변식 하나다. **아무것도 읽지 못한 응답을 "위반 없음"으로 읽지
+# 않는다.** 모델이 계약을 어기는 모양은 둘로 갈린다 -- findings 자리가 배열이 아닌 것과,
+# 배열 안 항목이 계약과 다른 것이다. 전자는 관점 전체가 미검사이고, 후자는 그 항목만
+# 버린다(원문에 없는 문장을 인용한 것과 같은 취급).
+
+NO_FINDING_SHAPES: list[Any] = [None, {}, False, "findings", 0]
+
+
+@pytest.mark.parametrize("broken", NO_FINDING_SHAPES)
+async def test_findings가_배열이_아니면_통과가_아니라_미검사다(
+    settings: Settings,
+    broken: Any,
+) -> None:
+    llm = FakeLlmClient([ok({"findings": broken}), ok({"findings": broken})])
+
+    verdict = await InspectionPipeline(llm=llm, settings=settings).run(
+        product("글루코사민 함유 영양제입니다")
+    )
+
+    rows = {p.perspective: p for p in verdict.perspectives}
+    for perspective in (Perspective.DISPLAY_ADS, Perspective.CONDUCT_TRADE):
+        assert rows[perspective].outcome is PerspectiveOutcome.UNCHECKED, broken
+        assert rows[perspective].skipReason == CallOutcome.SCHEMA_INVALID.value
+    assert verdict.verdict is not Verdict.PASS, "관점 둘이 미검사인데 통과로 적으면 무검수 노출이다"
+
+
+async def test_항목이_객체가_아니면_그_항목만_버리고_미검사로_떨어진다(settings: Settings) -> None:
+    """``item.get`` 이 터지면 예외가 소비 루프까지 올라가 상품이 PENDING 에 남는다."""
+    llm = FakeLlmClient([ok({"findings": [None]}), ok({"findings": [None]})])
+
+    verdict = await InspectionPipeline(llm=llm, settings=settings).run(
+        product("글루코사민 함유 영양제입니다")
+    )
+
+    rows = {p.perspective: p for p in verdict.perspectives}
+    assert rows[Perspective.DISPLAY_ADS].outcome is PerspectiveOutcome.UNCHECKED
+    assert verdict.verdict is not Verdict.PASS
+
+
+async def test_분류가_없거나_열거에_없으면_인용이_맞아도_버린다(settings: Settings) -> None:
+    """인용 검증만으로는 모자라다. ``Violation`` 의 분류가 열거라 모르는 값은 생성에서 터진다."""
+    quote = "관절염 치료에 효과가 있습니다"
+    for finding in ({"quote": quote}, {"category": "NOT_A_CATEGORY", "quote": quote}):
+        llm = FakeLlmClient([ok({"findings": [finding]}), ok({"findings": [finding]})])
+
+        verdict = await InspectionPipeline(llm=llm, settings=settings).run(product(quote))
+
+        rows = {p.perspective: p for p in verdict.perspectives}
+        assert rows[Perspective.DISPLAY_ADS].outcome is PerspectiveOutcome.UNCHECKED, finding
+        assert verdict.violations == [], finding
+
+
+async def test_빈_배열은_읽었고_위반이_없다는_뜻이다(settings: Settings) -> None:
+    """위 셋과 가르는 자리다. 빈 배열까지 미검사로 떨어뜨리면 통과가 아예 나오지 않는다."""
+    llm = FakeLlmClient([ok(NO_FINDING), ok(NO_FINDING)])
+
+    verdict = await InspectionPipeline(llm=llm, settings=settings).run(
+        product("글루코사민 함유 영양제입니다")
+    )
+
+    assert verdict.verdict is Verdict.PASS
+    rows = {p.perspective: p for p in verdict.perspectives}
+    assert rows[Perspective.DISPLAY_ADS].outcome is PerspectiveOutcome.CLEAR

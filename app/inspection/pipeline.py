@@ -69,6 +69,7 @@ from app.schemas.inspection import (
     TargetType,
     Verdict,
     Violation,
+    ViolationCategory,
 )
 from app.settings import JUDGE_RETRY_DELAY_SECONDS, Settings
 
@@ -533,29 +534,54 @@ class InspectionPipeline:
                 [],
             )
 
-        raw = (result.tool_input or {}).get("findings") or []
+        raw = (result.tool_input or {}).get("findings")
+        if not isinstance(raw, list):
+            # ``or []``로 받지 않는다. 키가 없는 것과 빈 배열은 뜻이 정반대다 -- 빈 배열이
+            # "읽었고 위반이 없다"이고, 없거나 ``null``·객체인 것은 **아무것도 읽지 못한
+            # 응답**이다. 섞으면 미검사가 통과로 둔갑한다. 스키마는 이 키를 배열로 요구하므로
+            # 여기 오는 것은 모델이 계약을 어긴 경우뿐이다.
+            log.warning(
+                "findings 가 배열이 아니다. perspective=%s type=%s",
+                spec.perspective.value,
+                type(raw).__name__,
+            )
+            return (
+                PerspectiveResult(
+                    perspective=spec.perspective,
+                    outcome=PerspectiveOutcome.UNCHECKED,
+                    skipReason=CallOutcome.SCHEMA_INVALID.value,
+                ),
+                [],
+                [],
+            )
         verified: list[Violation] = []
         reported: list[FindingRecord] = []
         unverified = 0
         for item in raw:
-            quote = str(item.get("quote") or "")
-            start = redacted.find(quote) if quote else -1
+            # 항목의 모양을 먼저 본다. 인용 검증만으로는 모자라다 -- 인용이 원문에 있는데
+            # 분류가 없거나 열거에 없는 값이면 ``Violation`` 생성이 터져 검수 전체가 실패로
+            # 떨어지고, 항목이 객체가 아니면 그 앞의 ``get``에서 터진다. 모양이 틀린 항목은
+            # 원문에 없는 문장을 인용한 것과 같게 **미검증으로 세고 버린다.**
+            category = _finding_category(item)
+            quote = item.get("quote") if isinstance(item, dict) else None
+            quote = quote.strip() if isinstance(quote, str) else ""
+            start = redacted.find(quote) if quote and category is not None else -1
             reported.append(
                 FindingRecord(
-                    category=str(item.get("category") or ""),
+                    category=category.value if category is not None else "",
                     quote=quote,
-                    reason=item.get("reason"),
-                    suggestion=item.get("suggestion"),
+                    reason=item.get("reason") if isinstance(item, dict) else None,
+                    suggestion=item.get("suggestion") if isinstance(item, dict) else None,
                     verified=start >= 0,
                 )
             )
             if start < 0:
-                # 모델이 원문에 없는 문장을 인용했다. 그 판정은 믿지 않는다.
+                # 모델이 원문에 없는 문장을 인용했거나, 항목 모양이 계약과 다르다.
                 unverified += 1
                 continue
             verified.append(
                 Violation(
-                    category=item["category"],
+                    category=category,
                     perspective=spec.perspective,
                     spanStart=start,
                     spanEnd=start + len(quote),
@@ -786,6 +812,24 @@ class InspectionPipeline:
             promptVersion=self._prompt_version(),
             decidedAt=datetime.now(UTC),
         )
+
+
+def _finding_category(item: Any) -> ViolationCategory | None:
+    """보고 항목의 분류를 열거로 접는다. 항목 모양이 틀리거나 모르는 값이면 ``None``이다.
+
+    ``Violation``의 필드가 열거라 모르는 값을 넣으면 검증 오류가 나고, 그 예외는 소비 루프까지
+    올라가 커밋되지 않은 메시지로 남는다. 통과로 둔갑하지는 않지만 상품이 기한 정리가 닫을
+    때까지 PENDING 에 머문다. 그래서 여기서 걸러 그 항목만 버린다.
+    """
+    if not isinstance(item, dict):
+        return None
+    raw = item.get("category")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return ViolationCategory(raw.strip())
+    except ValueError:
+        return None
 
 
 def _triage_violation(outcome: triage.TriageOutcome, redacted: str) -> Violation | None:
