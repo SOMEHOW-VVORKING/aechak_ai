@@ -170,6 +170,20 @@ def test_잠근_필드를_화면이_다른_사유로_그린다(client: TestClien
     assert "직접 고친" in draft_view.FIELD_STATUS_SENTENCES[FieldStatus.KEPT_LOCKED.value]
 
 
+def test_다시_쓰기가_셀러_원문을_모델_문구로_바꾼다(client: TestClient) -> None:
+    """``KEPT_LOCKED`` 로 남으면 다시 쓰기가 아무 일도 하지 않은 것이다.
+
+    옵션은 같은 응답에서 ``KEPT_LOCKED`` 로 남아야 한다 -- 모드의 범위가 설명 하나다.
+    """
+    variant = _variants(_run(client, "draft-refine"))[0]
+
+    statuses = {row["name"]: row["status"] for row in variant.fields}
+    assert statuses["description"] == FieldStatus.FILLED.value
+    assert statuses["optionGroups"] == FieldStatus.KEPT_LOCKED.value
+    assert "응고형 벤토나이트" in (variant.description or "")
+    assert "재구매 많아요" not in (variant.description or "")
+
+
 # --- 비교표 -------------------------------------------------------------------------
 
 

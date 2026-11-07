@@ -191,6 +191,21 @@ def test_기능이_꺼져_있으면_503_이다(monkeypatch: pytest.MonkeyPatch) 
     assert "꺼져" in response.json()["error"]
 
 
+def test_모드를_보내도_보내지_않아도_받는다(draft_client: Any) -> None:
+    """셀러센터가 닿는 경계에서 필드 이름과 기본값을 고정한다.
+
+    모르는 모드 값은 **조용히 FILL 로 접지 않고** 거절한다 -- 오타가 다시 쓰기를 빈
+    채우기로 바꾸면 셀러는 버튼이 먹지 않았다고 읽는다.
+    """
+    from app.draft_api.app import DRAFT_PATH, SECRET_HEADER
+
+    headers = {SECRET_HEADER: SECRET}
+    assert draft_client.post(DRAFT_PATH, json=_body(), headers=headers).status_code == 200
+    assert draft_client.post(DRAFT_PATH, json=_body(mode="FILL"), headers=headers).status_code == 200
+    assert draft_client.post(DRAFT_PATH, json=_body(mode="REFINE"), headers=headers).status_code == 200
+    assert draft_client.post(DRAFT_PATH, json=_body(mode="REWRITE"), headers=headers).status_code == 422
+
+
 def test_모르는_계약_버전은_떨어뜨리지_않고_거절한다(draft_client: Any) -> None:
     """``runner.py`` 와 같은 규약이다."""
     from app.draft_api.app import DRAFT_PATH, SECRET_HEADER
@@ -209,7 +224,7 @@ def test_정상_요청이_초안_모양으로_돌아온다(draft_client: Any) ->
     assert response.status_code == 200
     payload = response.json()
     assert payload["requestId"] == "r-1"
-    assert payload["draftVersion"] == "draft-v1+catalog-v1"
+    assert payload["draftVersion"] == "draft-v2+catalog-v1"
     assert payload["skipReason"] == "LLM_UNAVAILABLE"
     assert payload["itemSignal"]["grade"] == "PINNED"
     # 응답이 ``ProductDraftSaveRequest`` 모양 그대로다 -- 백엔드 변환 코드가 사실상 없다.

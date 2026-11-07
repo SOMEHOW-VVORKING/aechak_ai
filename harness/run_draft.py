@@ -18,13 +18,19 @@
 깨지 않으므로 두 변형이 같은 캐시 엔트리를 공유한다. **변수가 하나다.**
 즉 (가)는 별 기능이 아니라 (나)의 축퇴이고 ``imageUsability = NO_IMAGE_SENT`` 로 표현된다.
 
-## 모드 다섯
+## 모드 여섯
 
     lexicon-only   모델 0회. 0단 어휘 게이트만.          ** 무료 기준선 **
     a              이름 + 카테고리(주어진 대로)           <- (가)
     a-blind        이름만. 카테고리를 숨긴다              <- 카테고리의 한계 이득 대조군
     b              a + 이미지 1장 (base64)                <- (나)
     gated          어휘 게이트가 확정하지 못했을 때만 이미지 <- 조건부 멀티모달 (제3안)
+    refine         a + 셀러 원문을 다시 쓸 대상으로 준다    <- 다시 쓰기(``DraftMode.REFINE``)
+
+``refine`` 이 재는 숫자는 하나다 -- **다시 쓴 결과를 쓴 비율 대 셀러 원문으로 되돌린
+비율.** 되돌림이 많으면 유료 호출이 아무 일도 하지 않는다는 뜻이고(프롬프트의 세 층이
+서로 반대로 말하면 슬롯이 전멸한다), 그 수를 보지 않고 FE 버튼을 열면 셀러는 "눌렀는데
+아무것도 안 바뀐다"를 겪는다. 분모는 ``draft_cases.REFINE_DESCRIPTIONS`` 다.
 
 ## 키 없이 뽑는 숫자 — 값비싼 것부터
 
@@ -48,7 +54,7 @@ import json
 import statistics
 import sys
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -59,6 +65,7 @@ from app.inspection import rules
 from app.llm.client import cost_micro_usd
 from app.schemas.draft import (
     Basis,
+    DraftMode,
     FieldStatus,
     ImageMode,
     ImageUsability,
@@ -72,13 +79,16 @@ from app.seller_draft.tool import DRAFT_TOOL
 from app.settings import Settings
 from harness import imagecontent
 from harness.draft_cases import (
+    BY_ID,
     CASES,
     NAME_GATE_ORDINARY_NAMES,
+    REFINE_DESCRIPTIONS,
     DraftCase,
     ImageVariant,
     NameReveals,
     by_stratum,
     covered_leaves,
+    refine_cases,
     scorable,
 )
 from harness.run import HAIKU_CACHE_MIN_TOKENS, KRW_PER_USD, SONNET_CACHE_MIN_TOKENS, CachePrefixTarget
@@ -86,7 +96,7 @@ from harness.run import HAIKU_CACHE_MIN_TOKENS, KRW_PER_USD, SONNET_CACHE_MIN_TO
 OUT_ROOT = Path(__file__).parent / "out"
 IMAGE_ROOT = Path(__file__).parent / "draft_images"
 
-MODES = ("lexicon-only", "a", "a-blind", "b", "gated")
+MODES = ("lexicon-only", "a", "a-blind", "b", "gated", "refine")
 VARIANTS = (640, 768, 896, 1024, 1500)
 
 # 오사진 안전율을 숫자로 찍기 위한 최소 케이스 수. 미달이면 "판정 불가"로 찍는다.
@@ -192,6 +202,25 @@ class Record:
     # 아무것도 못 냈다는 사실이 어디에도 안 적혔다. 분모를 이 필드로 따로 들면
     # 미측정을 숫자로 적을 수 있다.
     option_group_scorable: bool = False
+    # **이 건이 다시 쓸 원문을 들고 갔는가.** 되돌림률의 분모다.
+    #
+    # 원문이 없는 ``REFINE`` 은 ``FILL`` 과 바이트 단위로 같은 프롬프트를 쏘므로
+    # (``prompt.refine_active``) 분모에 넣으면 되돌림률이 희석된다.
+    refine_locked: bool = False
+    # **응답 초안에 서버 내부 표식이 실렸는가.** 0 이 정상이고, 1 이라도 있으면 셀러가
+    # 자기 상품 설명에서 ``[가림]``·``[태그]`` 를 본 것이다. 숫자로 남겨야 "가드가 막는다"가
+    # 주장이 아니라 측정이 된다(오사진 안전율과 같은 성격의 줄이다).
+    server_marker_in_draft: bool = False
+    # **설명 필드에서만 적중한 가드 종류.** ``guard_kinds`` 와 별 축이어야 한다.
+    #
+    # ``guard_kinds`` 는 응답의 ``guardDrops`` 전부라서 옵션 쪽 적중이 섞인다. 되돌림 사유를
+    # 그 값으로 세면 **설명과 무관한 적중이 "되돌림 사유" 로 찍히고**, 거꾸로 설명이 사유 없이
+    # 되돌아간 건이 옵션 적중 때문에 "사유 있는 되돌림" 으로 세어진다. 되돌림은 설명 한 필드의
+    # 사건이므로 그 필드로 좁힌 축이 따로 있어야 한다.
+    description_guard_kinds: list[str] = field(default_factory=list)
+    # **그 측정이 어느 프롬프트로 돌았는가.** ``--compare-from`` 이 다른 버전의 raw 를 대면
+    # 프롬프트 변경분이 층별 이득에 섞여 들어간다. 비교할 때 경고를 내기 위한 축이다.
+    draft_version: str = ""
 
     def as_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -411,6 +440,19 @@ def _self_check() -> int:
             "합성 플레이스홀더의 신호다 -- 측정 전에 실제 사진인지 확인해라."
         )
 
+    # (9) 다시 쓰기 corpus 가 **모델에 닿는 케이스**만 가리키는가.
+    #     모르는 id 나 0원 케이스에 원문을 붙이면 그 건은 모델에 닿지 않고 분모만 부풀린다 --
+    #     되돌림률이 조용히 희석되고, 그 숫자가 이 모드의 유일한 산출물이다.
+    reachable = {case.id for case in model_called_cases("refine")}
+    for case_id in REFINE_DESCRIPTIONS:
+        if case_id not in BY_ID:
+            problems.append(f"다시 쓰기 corpus 에 모르는 케이스 id {case_id} 가 있다")
+        elif case_id not in reachable:
+            problems.append(
+                f"{case_id}: 다시 쓰기 corpus 에 있는데 모델에 닿지 않는 0원 케이스다 "
+                "(되돌림률 분모만 부풀린다)"
+            )
+
     if problems:
         print("[치명] 케이스 기대값이 코드와 어긋난다. 측정 전에 멈춘다.")
         for problem in problems:
@@ -422,6 +464,7 @@ def _self_check() -> int:
         f"자기검사 통과. 케이스 {len(CASES)}건 / 리프 {len(covered_leaves())}개 덮음 / "
         + " · ".join(f"{k.value} {len(v)}" for k, v in strata.items())
         + f" / 채점 분모 {len(scorable())}건"
+        + f" / 다시 쓰기 corpus {len(refine_cases())}건"
     )
     return 0
 
@@ -805,6 +848,14 @@ def _report_mode_plan(*, repeat: int, variant: int, selected: str | None = None)
     scorable_ids = {case.id for case in scorable()}
     parts: list[str] = []
     for mode in MODES:
+        if mode == "refine":
+            # **분모가 corpus 다.** 전수를 돌리면 원문 없는 건이 FILL 과 같은 프롬프트를
+            # 쏘면서 비용만 늘린다.
+            parts.append(
+                f"{mode}: 호출 {len(refine_cases())}건(다시 쓸 원문이 있는 건만) · "
+                f"{_mode_cost(mode, 0, repeat) / 1_000_000:.3f}USD(원문의 입력 증분 미반영 **하한**)"
+            )
+            continue
         calls = len(model_called_cases(mode)) if mode != "lexicon-only" else 0
         images = image_reachable_cases(mode)
         scored = sum(1 for case in images if case.id in scorable_ids)
@@ -855,6 +906,11 @@ def _report_mode_plan(*, repeat: int, variant: int, selected: str | None = None)
         )
         if selected == "lexicon-only":
             note = "없음 — 키도 사진도 필요 없다. 0원 기준선이 이 모드의 산출물이다"
+        elif selected == "refine":
+            note = (
+                f"키 하나. 사진은 쓰지 않고 **다시 쓸 원문이 있는 {len(refine_cases())}건만** 돈다 "
+                "(corpus 는 draft_cases.REFINE_DESCRIPTIONS). 재는 것은 되돌림률이다"
+            )
         elif selected in ("a", "a-blind"):
             note = "키 하나. 사진은 쓰지 않는 모드다"
         else:
@@ -893,7 +949,7 @@ def _report_estimate(repeat: int) -> list[tuple[str, str]]:
                 f"({_mode_cost(mode, called, repeat) * KRW_PER_USD / 1_000_000:,.0f}원)"
                 for mode in MODES
             )
-            + f" (호출 대상 {called}건 x 반복 {repeat})",
+            + f" (반복 {repeat}, 호출 대상은 모드마다 다르다 -- 위 '모드별 계획' 줄이 분모다)",
         ),
         (
             "일 예산 상한",
@@ -920,6 +976,10 @@ def _mode_cost(mode: str, called: int, repeat: int) -> int:
     image = _DRAFT_ESTIMATE_MICRO_USD["draft_image_896_haiku"]
     if mode == "lexicon-only":
         return 0
+    if mode == "refine":
+        # corpus 건수만 돈다. 그리고 원문이 입력에 더해지므로 건당 입력 토큰이 (가)보다 크다 --
+        # 추정에 그 증분을 반영하지 않으므로 이 수는 **하한이다.**
+        return text * len(refine_cases()) * repeat
     calls = len(model_called_cases(mode)) if mode == "a-blind" else called
     images = len(image_reachable_cases(mode))
     return (text * calls + image * images) * repeat
@@ -1060,6 +1120,9 @@ def _settings_for(mode: str, model: str, variant: int) -> Settings:
         "a-blind": ImageMode.OFF,
         "b": ImageMode.ALWAYS,
         "gated": ImageMode.GATED,
+        # 다시 쓰기는 **요청의 ``mode``** 로 갈린다. 설정은 (가)와 같아야 공정하다 --
+        # 변수가 "셀러 원문을 다시 쓸 대상으로 주는가" 하나뿐이다.
+        "refine": ImageMode.OFF,
     }[mode]
     return Settings(
         anthropic_api_key=Settings().anthropic_api_key,
@@ -1074,7 +1137,7 @@ def _settings_for(mode: str, model: str, variant: int) -> Settings:
 
 
 def _request_for(case: DraftCase, mode: str, variant: int) -> SellerDraftRequest:
-    from app.schemas.draft import DraftImage
+    from app.schemas.draft import DraftImage, DraftMode, LockedFields
 
     category = None if mode == "a-blind" else case.category_given
     image = None
@@ -1090,10 +1153,19 @@ def _request_for(case: DraftCase, mode: str, variant: int) -> SellerDraftRequest
                 declaredWidthPx=width,
                 declaredHeightPx=height,
             )
+    # **다시 쓰기는 잠근 설명이 있어야 실효다**(``prompt.refine_active``). 원문이 없으면
+    # 같은 프롬프트를 쏘면서 분모만 늘리므로 corpus 에 있는 건만 모드를 싣는다.
+    locked = None
+    draft_mode = DraftMode.FILL
+    if mode == "refine" and case.id in REFINE_DESCRIPTIONS:
+        locked = LockedFields(description=REFINE_DESCRIPTIONS[case.id])
+        draft_mode = DraftMode.REFINE
     return SellerDraftRequest(
         requestId=f"harness-{mode}-{case.id}",
         productName=case.product_name,
         categoryId=category,
+        lockedFields=locked,
+        mode=draft_mode,
         image=image,
     )
 
@@ -1113,6 +1185,12 @@ async def _measure(
             except DraftUnprocessable as error:
                 records.append(_unprocessable_record(case, mode, round_no, str(error), scorable_ids))
                 continue
+            locked_text = request.lockedFields.description if request.lockedFields else None
+            refine_locked = request.mode is DraftMode.REFINE and bool(locked_text)
+            marker_in_draft = any(
+                marker in (response.draft.description or "")
+                for marker in (rules.REDACTION_MARKER, rules.NEUTRALIZED_MARKER)
+            )
             signal = catalog.resolve(case.product_name, request.categoryId)
             predicted = response.draft.categoryId or signal.pinned_leaf_id
             if response.fieldStatus.get("categoryId") in (
@@ -1147,11 +1225,17 @@ async def _measure(
                     option_group_scorable=bool(case.acceptable_option_group_names),
                     field_status={k: v.value for k, v in response.fieldStatus.items()},
                     guard_kinds=[drop.kind.value for drop in response.guardDrops],
+                    description_guard_kinds=[
+                        drop.kind.value for drop in response.guardDrops if drop.field == "description"
+                    ],
+                    draft_version=draft_version_string(),
                     basis={k: v.value for k, v in response.basis.items()},
                     cost_micro_usd=response.total_cost_micro_usd(),
                     latency_ms=sum(call.latencyMs for call in response.usage),
                     cache_read_tokens=sum(call.cacheReadInputTokens for call in response.usage),
                     note=response.skipReason.value if response.skipReason else "",
+                    refine_locked=refine_locked,
+                    server_marker_in_draft=marker_in_draft,
                 )
             )
     return records
@@ -1296,8 +1380,79 @@ def _accuracy_rows(mode: str, records: list[Record]) -> list[tuple[str, str]]:
     return rows
 
 
+def _refine_rows(mode: str, records: list[Record]) -> list[tuple[str, str]]:
+    """**다시 쓴 결과를 쓴 비율 대 셀러 원문으로 되돌린 비율.** 이 모드의 산출물이 그것이다.
+
+    없으면 측정 공백이다 -- 되돌림이 100%면 유료 호출이 한 건도 일을 하지 않은 것이고,
+    그 사실이 어디에도 안 적히면 FE 버튼을 열어도 셀러는 "눌렀는데 아무것도 안 바뀐다"를
+    겪는다. 분모는 **다시 쓸 원문을 실제로 들고 간 건**이다(``refine_locked``).
+
+    되돌림이 늘 나쁜 것은 아니다. 원문에 사실이 거의 없는 건("좋아요 많이 사주세요")에서는
+    되돌리는 것이 정답이다 -- 없는 사실을 새로 만들어 채우는 쪽이 더 나쁘다. 그래서 비율
+    하나로 합격·불합격을 찍지 않고 **케이스별 결과를 함께 적어** 사람이 raw 를 읽게 한다.
+    """
+    pool = [record for record in records if record.refine_locked]
+    if not pool:
+        return []
+
+    filled = [r for r in pool if r.field_status.get("description") == FieldStatus.FILLED.value]
+    kept = [r for r in pool if r.field_status.get("description") == FieldStatus.KEPT_LOCKED.value]
+    other = len(pool) - len(filled) - len(kept)
+    rows = [
+        (
+            f"[{mode}] 다시 쓰기 반영률",
+            f"다시 씀 {len(filled)}/{len(pool)}({len(filled) / len(pool):.0%}) / "
+            f"원문 유지(되돌림) {len(kept)}({len(kept) / len(pool):.0%})"
+            + (f" / 그 밖 {other}" if other else "")
+            + " — **되돌림이 많으면 유료 호출이 아무 일도 하지 않는다.** 다만 원문에 사실이 "
+            "거의 없는 건에서는 되돌리는 것이 정답이다. 아래 케이스별 줄과 함께 읽어라",
+        ),
+        (
+            f"[{mode}] 다시 쓰기 케이스별",
+            " / ".join(
+                f"{record.case_id}="
+                + {
+                    FieldStatus.FILLED.value: "다시 씀",
+                    FieldStatus.KEPT_LOCKED.value: "되돌림",
+                }.get(record.field_status.get("description", ""), record.field_status.get("description", "?"))
+                for record in sorted(pool, key=lambda r: (r.case_id, r.repeat))
+            )
+            + " — 어느 모양의 원문에서 되돌아갔는지는 `draft_cases.REFINE_DESCRIPTIONS` 의 "
+            "항목 주석이 말한다(가드에 걸리는 글·사실이 없는 글은 되돌림이 정답이다)",
+        ),
+    ]
+    # 설명 필드로 좁힌 축을 쓴다. ``guard_kinds`` 로 세면 옵션 쪽 적중이 되돌림 사유로 찍히고,
+    # 설명이 사유 없이 되돌아간 건이 옵션 적중 때문에 "사유 있는 되돌림" 으로 세어진다.
+    reverted_kinds: Counter[str] = Counter()
+    for record in kept:
+        reverted_kinds.update(record.description_guard_kinds)
+    rows.append(
+        (
+            f"[{mode}] 되돌림 사유",
+            (", ".join(f"{k}={v}" for k, v in sorted(reverted_kinds.items())) or "없음")
+            + f" / 사유 없는 되돌림 {sum(1 for r in kept if not r.description_guard_kinds)}건"
+            " — 사유가 비는 되돌림은 **모델이 조각을 하나도 내지 않은 건**이다(가드가 떨어뜨린 "
+            "것이 아니다). 그 수가 크면 프롬프트가 다시 쓰기를 못 끌어내고 있다는 신호이고, "
+            "유료 호출이 아무 일도 하지 않은 건수가 바로 그것이다",
+        )
+    )
+    unsafe = [r.case_id for r in pool if r.server_marker_in_draft]
+    rows.append(
+        (
+            f"[{mode}] 표식 유출",
+            f"{len(unsafe)}/{len(pool)}"
+            + (f" — **{sorted(set(unsafe))}**" if unsafe else " — 없음")
+            + ". 서버가 가린 자리의 표식(`[가림]`·`[태그]`)이 셀러 폼에 실린 건수다. "
+            "**0 이 아니면 정확도와 무관하게 이 모드를 켜지 않는다** — 비용 문제가 아니라 "
+            "거짓 문제다",
+        )
+    )
+    return rows
+
+
 def _summarize(records: list[Record], mode: str) -> list[tuple[str, str]]:
     rows = _accuracy_rows(mode, records)
+    rows.extend(_refine_rows(mode, records))
     called = [r for r in records if r.model_called]
     if not called:
         rows.append((f"[{mode}] 비용", "모델을 0회 불렀다. 0원이다"))
@@ -1332,9 +1487,9 @@ def _summarize(records: list[Record], mode: str) -> list[tuple[str, str]]:
     )
     statuses: Counter[str] = Counter()
     for record in records:
-        for field, value in record.field_status.items():
-            if field in ("categoryId", "description", "optionGroups"):
-                statuses[f"{field}:{value}"] += 1
+        for field_name, value in record.field_status.items():
+            if field_name in ("categoryId", "description", "optionGroups"):
+                statuses[f"{field_name}:{value}"] += 1
     rows.append((f"[{mode}] 필드 사유", ", ".join(f"{k}={v}" for k, v in sorted(statuses.items()))))
 
     with_image = [r for r in records if r.image_variant is not None and r.model_called]
@@ -1569,6 +1724,15 @@ async def _main(args: argparse.Namespace) -> int:
     #   픽스처 검사 메시지는 잘 쓰여 있었지만 키가 생기기 전까지 절대 보이지 않는다.
     blockers: list[str] = []
     cases = [case for case in CASES if not args.only or case.id in args.only]
+    if args.mode == "refine":
+        # **원문이 있는 건만 돈다.** 없는 건은 FILL 과 같은 프롬프트를 쏘면서 되돌림률의
+        # 분모만 부풀린다(``prompt.refine_active``).
+        cases = [case for case in cases if case.id in REFINE_DESCRIPTIONS]
+        if not cases:
+            blockers.append(
+                "--mode refine 인데 돌릴 케이스가 없다. --only 가 다시 쓰기 corpus "
+                "(draft_cases.REFINE_DESCRIPTIONS) 밖의 id 만 골랐다"
+            )
 
     if args.compare_from is not None and not await asyncio.to_thread(Path(args.compare_from).is_file):
         blockers.append(f"--compare-from 경로가 없다: {args.compare_from}")
@@ -1668,6 +1832,20 @@ async def _main(args: argparse.Namespace) -> int:
     if args.compare_from:
         baseline = await asyncio.to_thread(load_records, args.compare_from)
         rows.extend(_compare(baseline, records, label=f"({args.mode} - {baseline[0].mode})"))
+        # 프롬프트가 달라진 raw 를 대면 층별 이득에 프롬프트 변경분이 섞인다. 막지 않고 적는다 --
+        # 옛 raw 에는 이 축이 없어 빈 문자열로 읽히고, 그것도 "모른다" 는 사실이라 적을 값이다.
+        base_version = baseline[0].draft_version
+        now_version = draft_version_string()
+        if base_version != now_version:
+            rows.append(
+                (
+                    "비교 주의",
+                    f"기준선 프롬프트 {base_version or '(미기록)'} vs 지금 {now_version} -- "
+                    "두 raw 가 다른 프롬프트로 돌았다. 아래 차이에는 층별 이득과 프롬프트 "
+                    "변경분이 함께 들어 있으므로 '이 층이 얼마를 벌었나' 로 읽지 말 것. "
+                    "같은 프롬프트로 기준선을 다시 떠야 그 수가 쓸 수 있는 값이 된다",
+                )
+            )
 
     out = _write_out(records, rows, f"{args.mode}-{args.model}-{args.variant}")
     _print(rows)
@@ -1710,5 +1888,6 @@ __all__ = [
     "image_reachable_cases",
     "load_records",
     "model_called_cases",
+    "refine_cases",
     "wrong_photo_reachable_cases",
 ]

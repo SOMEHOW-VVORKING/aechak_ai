@@ -164,6 +164,23 @@ class DraftState(StrEnum):
     FAILED = "FAILED"
 
 
+class DraftMode(StrEnum):
+    """초안을 **어떻게** 채우는가. 셀러가 쓴 값을 어떻게 다루는지만 가른다.
+
+    - ``FILL``: 빈 칸만 채운다. 셀러가 쓴 설명은 입력으로만 주고 그대로 돌려준다.
+    - ``REFINE``: 셀러 원문을 **다시 쓸 대상으로** 모델에 주고 다시 쓴 결과를 쓴다.
+
+    생략하면 ``FILL`` 이다 -- 모드를 모르는 기존 호출자가 깨지지 않아야 한다.
+
+    **``REFINE`` 이 가드를 우회하지 않는다.** 다시 쓴 문구도 0단 규칙·금지 성분·효능 사전을
+    그대로 지나고, 걸리면 셀러 원문으로 되돌린다. 초안이 만든 문구가 등록 검수에서 막히면
+    셀러가 두 번 일한다.
+    """
+
+    FILL = "FILL"
+    REFINE = "REFINE"
+
+
 class ImageMode(StrEnum):
     """이미지를 쓰는 방식. 기본은 ``OFF`` 이고 하네스 숫자가 켠다.
 
@@ -288,6 +305,8 @@ class SellerDraftRequest(BaseModel):
     categoryId: int | None = None
     sellerId: int | None = None
     lockedFields: LockedFields | None = None
+    # 셀러가 쓴 설명을 그대로 둘지(``FILL``) 다시 쓸지(``REFINE``). 생략하면 ``FILL`` 이다.
+    mode: DraftMode = DraftMode.FILL
     image: DraftImage | None = None
     schemaVersion: int = DRAFT_SCHEMA_VERSION
 
@@ -412,6 +431,7 @@ __all__ = [
     "Basis",
     "DraftCallUsage",
     "DraftImage",
+    "DraftMode",
     "DraftState",
     "FieldStatus",
     "GuardDrop",

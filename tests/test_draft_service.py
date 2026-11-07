@@ -24,6 +24,7 @@ from conftest import FakeLlmClient, failed, ok
 from app.schemas.draft import (
     DRAFT_FIELDS,
     Basis,
+    DraftMode,
     DraftState,
     FieldStatus,
     GuardKind,
@@ -35,7 +36,7 @@ from app.schemas.draft import (
 )
 from app.schemas.inspection import CallOutcome
 from app.seller_draft.catalog import ItemGrade, ResolvedBy
-from app.seller_draft.prompt import DRAFT_PREFIX, draft_version_string
+from app.seller_draft.prompt import DRAFT_PREFIX, REFINE_DIRECTIVE, draft_version_string
 from app.seller_draft.service import DraftService, DraftUnprocessable
 from app.seller_draft.tool import DRAFT_TOOL, DRAFT_TOOL_NAME, LEAF_DECLINED
 from app.seller_draft.trace import DraftTraceRecorder
@@ -820,7 +821,7 @@ def test_초안_버전이_검수_promptVersion_에_섞이지_않는다() -> None
     from app.inspection.pipeline import PROMPT_VERSION_MAX_LENGTH
 
     version = draft_version_string()
-    assert version == "draft-v1+catalog-v1"
+    assert version == "draft-v2+catalog-v1"
     assert len(version) < PROMPT_VERSION_MAX_LENGTH
     assert version not in Settings().prompt_version
 
@@ -991,3 +992,391 @@ async def test_효능이_없는_상품명은_그대로_돈다() -> None:
 
     assert response.modelCalled is True
     assert response.skipReason is None
+
+
+# --- 다시 쓰기 모드 ------------------------------------------------------------------
+#
+# ``FILL`` 과 ``REFINE`` 이 **셀러가 쓴 설명 하나를 어떻게 다루는지**만 다르다. 고정하는
+# 것은 그 차이와, 차이가 셀러의 글을 잃게 만들지 않는다는 것이다.
+
+
+def _envelope(llm: FakeLlmClient, index: int = 0) -> str:
+    return next(part["text"] for part in llm.calls[index]["user_content"] if part["type"] == "text")
+
+
+def test_확인_출처를_열거하는_자리가_접두부_하나뿐이다() -> None:
+    """**세 층이 서로 반대로 말하면 다시 쓰기가 유료 호출만 태우고 아무 일도 하지 않는다.**
+
+    모델은 "이 조각을 채울 근거가 있는가"에 대한 답을 세 자리에서 받는다 -- 시스템 접두부의
+    지시 1, 툴 스키마의 슬롯 설명, 그리고 meta 줄의 모드 지시. 앞 두 자리가 "상품명·사진으로
+    확인되지 않으면 비워라" 라고 적고 모드 지시만 "셀러 원문을 다시 적어라" 라고 하면 더 강한
+    자리가 이겨 **슬롯이 전멸하고** 서버는 원문으로 되돌린다(``KEPT_LOCKED``). 호출은 이미
+    과금됐고 셀러 화면은 아무것도 달라지지 않는다.
+
+    그래서 출처를 열거하는 자리를 접두부 하나로 모았다. 이 테스트는 슬롯 설명이 출처를 다시
+    열거하기 시작하면 red 가 된다.
+    """
+    slots = DRAFT_TOOL["input_schema"]["properties"]["descriptionParts"]["properties"]
+    assert slots, "슬롯 스키마가 비었다"
+    for key, field in slots.items():
+        for source in ("상품명", "사진"):
+            assert source not in field["description"], (
+                f"{key} 슬롯 설명이 출처를 열거한다 -- 모드마다 다르므로 접두부에서만 말한다"
+            )
+
+    # 접두부가 모드별 출처를 말하는 유일한 자리다.
+    assert "다시 쓰기" in DRAFT_PREFIX
+    assert "셀러가 쓴 설명" in DRAFT_PREFIX
+    # 모드 지시는 그 허가와 같은 방향이어야 한다.
+    assert "원문에 적힌 사실은 확인된 것으로 쓴다" in REFINE_DIRECTIVE
+    # 슬롯별 근거를 적으라고 하지 않는다 -- ``basis`` 는 필드 단위다.
+    assert "근거를 NONE" not in REFINE_DIRECTIVE
+
+
+def test_모드를_생략하면_FILL_이다() -> None:
+    """모드를 모르는 기존 호출자가 깨지지 않아야 한다."""
+    assert SellerDraftRequest(requestId="t-1", productName="강아지 목줄 M").mode is DraftMode.FILL
+
+
+async def test_FILL_은_셀러_원문을_그대로_두고_모델_출력을_버린다() -> None:
+    """아래 ``REFINE`` 테스트와 **같은 입력·같은 모델 출력**이다. 모드만 다르다."""
+    llm = FakeLlmClient(
+        [
+            ok(
+                _tool_input(leaf=251, slots=_slots(item="응고형 벤토나이트 고양이 모래입니다.")),
+                model="claude-haiku-4-5",
+            )
+        ]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request(
+            "고양이모래 벤토나이트 10L",
+            lockedFields=LockedFields(description="저희 매장에서 직접 소분합니다."),
+        )
+    )
+
+    assert response.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+    assert response.draft.description == "저희 매장에서 직접 소분합니다."
+    # 다시 쓰기 지시도 붙지 않는다 -- 원문은 참고 입력이고 대상이 아니다.
+    assert REFINE_DIRECTIVE not in _envelope(llm)
+    assert "그대로 두고 톤을 맞춘다" in _envelope(llm)
+
+
+async def test_REFINE_은_셀러_원문을_입력으로_주고_다시_쓴_결과를_쓴다() -> None:
+    """원문이 **다시 쓸 대상으로** 모델에 가고, 돌아온 문구가 설명이 된다.
+
+    지시는 봉투 바깥 meta 줄에 있고 원문은 봉투 안에 있다 -- 다시 쓸 대상이라는 것이
+    신뢰할 수 있다는 뜻은 아니므로 레닥션·중성화는 그대로 지난다.
+    """
+    llm = FakeLlmClient(
+        [
+            ok(
+                _tool_input(leaf=251, slots=_slots(item="응고형 벤토나이트 고양이 모래입니다.")),
+                model="claude-haiku-4-5",
+            )
+        ]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request(
+            "고양이모래 벤토나이트 10L",
+            lockedFields=LockedFields(description="저희 매장에서 직접 소분합니다."),
+            mode=DraftMode.REFINE,
+        )
+    )
+
+    assert response.fieldStatus["description"] is FieldStatus.FILLED
+    assert response.draft.description == "응고형 벤토나이트 고양이 모래입니다."
+
+    text = _envelope(llm)
+    head, body = text.split("<본문>", 1)
+    assert REFINE_DIRECTIVE in head, "지시가 봉투 안으로 들어갔다"
+    assert "셀러가 쓴 설명(다시 쓸 대상):" in body
+    assert "저희 매장에서 직접 소분합니다." in body, "다시 쓸 원문이 모델에 가지 않았다"
+
+
+async def test_다시_쓸_원문이_없으면_REFINE_이_FILL_과_같다() -> None:
+    """빈 칸을 채우는 일에 다시 쓰기 지시를 붙이지 않는다. 출력 토큰만 태운다."""
+    llm = FakeLlmClient([ok(_tool_input(leaf=152), model="claude-haiku-4-5")])
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request("강아지 목줄 M", mode=DraftMode.REFINE)
+    )
+
+    assert response.fieldStatus["description"] is FieldStatus.FILLED
+    assert REFINE_DIRECTIVE not in _envelope(llm)
+
+
+async def test_다시_쓸_원문이_없는_REFINE_이_FILL_엔트리를_재사용한다() -> None:
+    """같은 프롬프트를 쏘는 두 요청이 **캐시 엔트리만 따로 만들면** 유료 호출이 낭비된다.
+
+    실효 모드를 ``prompt.refine_active`` 한 자리에서 계산하고 그 값을 키에 섞는다. 조건식을
+    세 벌로 복제하면 어긋나고, 그 어긋남이 그대로 과금이다.
+    """
+    llm = FakeLlmClient([ok(_tool_input(leaf=152), model="claude-haiku-4-5")])
+    service = DraftService(llm=llm, settings=_settings(draft_cache_entries=8))
+
+    first = await service.run(_request("강아지 목줄 M"))
+    second = await service.run(_request("강아지 목줄 M", mode=DraftMode.REFINE))
+
+    assert first.reusedFromCache is False
+    assert second.reusedFromCache is True, "같은 프롬프트인데 캐시가 갈렸다"
+    assert len(llm.calls) == 1, "다시 쓸 원문이 없는 REFINE 이 유료 호출을 한 번 더 태웠다"
+
+
+async def test_REFINE_이_가드를_우회하지_않고_원문으로_되돌린다() -> None:
+    """**다시 쓴 문구도 효능 사전을 지난다.** 우회하면 초안이 셀러를 함정에 빠뜨린다.
+
+    그리고 걸렸을 때 그냥 비우지 않는다 -- 셀러가 타이핑한 글이 응답에서 사라지면 다시
+    쓰기가 고치려던 것보다 나쁘다. 되돌린 이유는 ``guardDrops`` 에 남는다.
+    """
+    llm = FakeLlmClient(
+        [ok(_tool_input(leaf=132, slots=_slots(item="2주 만에 완치됩니다.")), model="claude-haiku-4-5")]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request(
+            "강아지 관절 영양제 글루코사민",
+            lockedFields=LockedFields(description="글루코사민 500mg 이 들어 있습니다."),
+            mode=DraftMode.REFINE,
+        )
+    )
+
+    assert response.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+    assert response.draft.description == "글루코사민 500mg 이 들어 있습니다."
+    assert "완치" not in (response.draft.description or ""), "가드에 걸린 문구가 초안에 남았다"
+    assert any(drop.kind is GuardKind.CLAIM for drop in response.guardDrops)
+
+
+async def test_REFINE_이_품목을_확정하지_못해도_셀러_원문을_지우지_않는다() -> None:
+    """게이트와 모델이 다른 품목을 지목하면 다시 쓴 문구를 믿을 근거가 없다. 원문을 남긴다."""
+    llm = FakeLlmClient(
+        [ok(_tool_input(leaf=211, slots=_slots(item="고양이용 건식 사료입니다.")), model="claude-haiku-4-5")]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request(
+            "강아지 목줄 M",
+            lockedFields=LockedFields(description="셀러가 직접 쓴 설명입니다."),
+            mode=DraftMode.REFINE,
+        )
+    )
+
+    assert response.fieldStatus["categoryId"] is FieldStatus.EMPTY_CATEGORY_CONFLICT
+    assert response.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+    assert response.draft.description == "셀러가 직접 쓴 설명입니다."
+
+
+async def test_REFINE_도_잠근_옵션은_그대로_둔다() -> None:
+    """다시 쓰기는 문장을 다듬는 일이고 옵션 값은 문장이 아니다.
+
+    모델이 사이즈·색상 이름을 고치면 그 이름에 묶인 가격·재고를 셀러가 전부 다시 맞춰야
+    한다. 모드의 범위를 설명 하나로 둔 결정을 여기서 고정한다.
+    """
+    llm = FakeLlmClient(
+        [
+            ok(
+                _tool_input(leaf=251, groups=[{"name": "향", "values": ["무향"]}]),
+                model="claude-haiku-4-5",
+            )
+        ]
+    )
+    locked = LockedFields(
+        description="저희 매장에서 직접 소분합니다.",
+        optionGroups=[OptionGroupDraft(name="용량", values=["5L", "10L"])],
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request("고양이모래 벤토나이트 10L", lockedFields=locked, mode=DraftMode.REFINE)
+    )
+
+    assert response.fieldStatus["optionGroups"] is FieldStatus.KEPT_LOCKED
+    assert [group.name for group in response.draft.optionGroups or []] == ["용량"]
+
+
+async def test_다시_쓴_설명을_상품명_근거로_적지_않는다() -> None:
+    """**모델이 적은 ``basis`` 를 그대로 내보내면 셀러 화면이 거짓을 읽는다.**
+
+    다시 쓴 설명의 실제 근거는 셀러가 타이핑한 글이고 ``Basis`` 열거에 그 값이 없다. 모델은
+    보통 ``NAME`` 을 적으므로 그대로 내보내면 **셀러 자신이 쓴 사실이 "상품명 근거로 채운
+    사실"로** 표시된다 -- ``service._cache_key`` 주석이 결함으로 기록해 둔 그 모양이다
+    ('2kg 포장' 이 ``FILLED`` + ``basis=NAME`` 으로 나가 다른 상품의 설명이 되었다).
+
+    열거를 늘리는 것은 세 레포 계약 변경이라 ``NONE``("채운 근거를 주장하지 않는다")으로
+    둔다. 다시 쓴 것인지는 ``fieldStatus=FILLED`` 와 요청 모드로 가린다.
+    """
+    llm = FakeLlmClient(
+        [
+            ok(
+                _tool_input(
+                    leaf=251,
+                    slots=_slots(item="응고형 벤토나이트 고양이 모래입니다."),
+                    basis={"categoryId": "NAME", "description": "NAME", "optionGroups": "NAME"},
+                ),
+                model="claude-haiku-4-5",
+            )
+        ]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request(
+            "고양이모래 벤토나이트 10L",
+            lockedFields=LockedFields(description="저희 매장에서 직접 소분합니다."),
+            mode=DraftMode.REFINE,
+        )
+    )
+
+    assert response.fieldStatus["description"] is FieldStatus.FILLED
+    assert response.basis["description"] is Basis.NONE, "모델이 적은 NAME 이 그대로 나갔다"
+    # ``FILL`` 은 모델이 적은 값을 그대로 쓴다 -- 그 경로는 바뀌지 않았다.
+    assert response.basis["categoryId"] is Basis.NAME
+
+
+async def test_다시_쓰기가_서버_가림_표식을_셀러_폼에_싣지_않는다() -> None:
+    """**``REFINE`` 이 열어 놓은 경로다.**
+
+    다시 쓸 원문은 레닥션을 지나 ``[가림]`` 이 박힌 채 모델에 가고(바로 위 레닥션 테스트가
+    그 사실을 고정한다), 모델이 그 글자를 옮겨 적으면 어느 사전에도 없으므로 그대로
+    ``FILLED`` 가 되어 **셀러가 자기 상품 설명에서 서버 내부 표식을 본다.** ``FILL`` 에서는
+    잠근 설명이 있으면 모델 출력을 아예 버렸으므로 생길 수 없던 모양이다.
+    """
+    from app.inspection import rules
+
+    llm = FakeLlmClient(
+        [
+            ok(
+                _tool_input(
+                    leaf=251,
+                    slots=_slots(
+                        item=f"{rules.REDACTION_MARKER} 로 문의 주세요.",
+                        spec=f"봉투 {rules.NEUTRALIZED_MARKER} 안에 적힌 규격입니다.",
+                    ),
+                ),
+                model="claude-haiku-4-5",
+            )
+        ]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request(
+            "고양이모래 벤토나이트 10L",
+            lockedFields=LockedFields(description="저희 매장에서 직접 소분합니다."),
+            mode=DraftMode.REFINE,
+        )
+    )
+
+    body = response.model_dump_json()
+    assert rules.REDACTION_MARKER not in body, "가림 표식이 응답에 실렸다"
+    assert rules.NEUTRALIZED_MARKER not in body, "중성화 표식이 응답에 실렸다"
+    # 두 조각이 다 떨어졌으므로 셀러 원문으로 되돌린다.
+    assert response.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+    assert response.draft.description == "저희 매장에서 직접 소분합니다."
+    assert any(drop.kind is GuardKind.RULE for drop in response.guardDrops)
+
+
+async def test_되돌렸다는_사실이_guardDrops_에_남는다() -> None:
+    """**셀러가 읽는 두 글자가 서로 모순되지 않게 한다.**
+
+    슬롯 가드 적중의 detail 은 "…비웠다" 로 끝나는데 같은 응답의 설명은 비어 있지 않고
+    화면 문장은 "직접 고친 값을 그대로 두었습니다" 다(``demo/draft_view.py``). 되돌림을
+    적는 항목이 없으면 둘 중 하나가 거짓이다. 새 ``GuardKind`` 는 더하지 않는다 --
+    백엔드·FE 거울 열거에 모르는 값이 가면 역직렬화가 깨진다.
+    """
+    llm = FakeLlmClient(
+        [ok(_tool_input(leaf=132, slots=_slots(item="2주 만에 완치됩니다.")), model="claude-haiku-4-5")]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request(
+            "강아지 관절 영양제 글루코사민",
+            lockedFields=LockedFields(description="글루코사민 500mg 이 들어 있습니다."),
+            mode=DraftMode.REFINE,
+        )
+    )
+
+    reverted = [drop for drop in response.guardDrops if "셀러 원문을 그대로 두었다" in drop.detail]
+    assert len(reverted) == 1, [drop.detail for drop in response.guardDrops]
+    assert reverted[0].field == "description"
+    assert reverted[0].kind is GuardKind.CLAIM, "되돌림을 유발한 겹의 사유를 그대로 쓴다"
+    # 가드 적중 자체도 그대로 남는다 -- 되돌림 기록이 사유를 가리지 않는다.
+    assert any(drop.kind is GuardKind.CLAIM and "비웠다" in drop.detail for drop in response.guardDrops)
+
+
+async def test_모델이_아무것도_내지_않은_되돌림에는_가드_사유를_붙이지_않는다() -> None:
+    """**일어나지 않은 적중을 적으면 겹별 탈락률이 거짓이 된다.**
+
+    슬롯이 전부 빈 채로 오면 가드가 떨어뜨린 것이 아니라 모델이 아무것도 내지 않은 것이다.
+    그때 아무 ``GuardKind`` 를 붙이면 하네스가 재는 겹별 탈락률에 없는 적중이 쌓인다.
+    이 건은 **``KEPT_LOCKED`` + 빈 ``guardDrops``** 라는 모양으로 구별된다.
+    """
+    llm = FakeLlmClient([ok(_tool_input(leaf=251, slots=_slots()), model="claude-haiku-4-5")])
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request(
+            "고양이모래 벤토나이트 10L",
+            lockedFields=LockedFields(description="저희 매장에서 직접 소분합니다."),
+            mode=DraftMode.REFINE,
+        )
+    )
+
+    assert response.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+    assert response.draft.description == "저희 매장에서 직접 소분합니다."
+    assert response.guardDrops == [], [drop.detail for drop in response.guardDrops]
+
+
+async def test_모델을_부르지_못한_건도_셀러_원문을_지우지_않는다() -> None:
+    """**불변식이 ``_assemble`` 안에서만 성립하면 FE 가 병합 규칙을 두 벌 써야 한다.**
+
+    0원 분기와 호출 실패는 ``description=None`` 을 돌려줬다. ``REFINE`` 은 정의상 셀러가
+    글을 **쓴 뒤에** 누르는 버튼이라 이 경로들에 잠근 설명이 실려 들어올 확률이 ``FILL``
+    보다 높다(특히 타임아웃). 응답 모양은 바뀌지 않는다 -- ``KEPT_LOCKED`` 는 기존 값이다.
+    """
+    locked = LockedFields(description="셀러가 직접 쓴 설명입니다.")
+
+    # (1) 0원 분기: 초안 기능이 꺼져 있다.
+    off = await DraftService(llm=FakeLlmClient([]), settings=_settings(enable_draft=False)).run(
+        _request("강아지 목줄 M", lockedFields=locked, mode=DraftMode.REFINE)
+    )
+    assert off.skipReason is SkipReason.DRAFT_DISABLED
+    assert off.draft.description == "셀러가 직접 쓴 설명입니다."
+    assert off.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+
+    # (2) 0원 분기: 상품명이 0단 규칙에 걸렸다.
+    blocked = await DraftService(llm=FakeLlmClient([]), settings=_settings()).run(
+        _request("문의 010-1234-5678 강아지 목줄 M", lockedFields=locked)
+    )
+    assert blocked.skipReason is SkipReason.NAME_RULE_BLOCKED
+    assert blocked.draft.description == "셀러가 직접 쓴 설명입니다."
+    assert blocked.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+    # 다른 필드의 사유는 물들지 않는다.
+    assert blocked.fieldStatus["categoryId"] is FieldStatus.EMPTY_NAME_RULE_BLOCKED
+
+    # (3) 호출 실패. **"제안할 것이 없었다"가 아니라 "못 봤다"로 남고 원문은 살아 있다.**
+    llm = FakeLlmClient([failed(CallOutcome.TIMEOUT), failed(CallOutcome.TIMEOUT)])
+    dead = await DraftService(llm=llm, settings=_settings()).run(
+        _request("강아지 목줄 M", lockedFields=locked, mode=DraftMode.REFINE)
+    )
+    assert dead.state is DraftState.FAILED
+    assert dead.draft.description == "셀러가 직접 쓴 설명입니다."
+    assert dead.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+    assert dead.fieldStatus["categoryId"] is FieldStatus.EMPTY_CALL_FAILED
+
+    # 잠근 설명이 없으면 전건이 그대로다 -- 기존 사유가 바뀌지 않는다.
+    bare = await DraftService(llm=FakeLlmClient([]), settings=_settings(enable_draft=False)).run(
+        _request("강아지 목줄 M")
+    )
+    assert bare.draft.description is None
+    assert bare.fieldStatus["description"] is FieldStatus.EMPTY_NOT_ATTEMPTED
+
+
+async def test_재사용_키가_초안_모드로_갈린다() -> None:
+    """안 갈리면 ``FILL`` 이 만든 응답(= 원문 그대로)이 ``REFINE`` 요청에 돌아가고
+    **다시 쓰기가 아무 일도 하지 않는다.**
+    """
+    llm = FakeLlmClient([ok(_tool_input(leaf=251), model="claude-haiku-4-5") for _ in range(2)])
+    service = DraftService(llm=llm, settings=_settings(draft_cache_entries=8))
+    locked = LockedFields(description="저희 매장에서 직접 소분합니다.")
+
+    first = await service.run(_request("고양이모래 벤토나이트 10L", lockedFields=locked))
+    second = await service.run(
+        _request("고양이모래 벤토나이트 10L", lockedFields=locked, mode=DraftMode.REFINE)
+    )
+    third = await service.run(
+        _request("고양이모래 벤토나이트 10L", lockedFields=locked, mode=DraftMode.REFINE)
+    )
+
+    assert first.reusedFromCache is False
+    assert second.reusedFromCache is False, "FILL 응답이 REFINE 요청에 돌아갔다"
+    assert third.reusedFromCache is True, "같은 모드끼리는 여전히 재사용해야 한다"
+    assert len(llm.calls) == 2

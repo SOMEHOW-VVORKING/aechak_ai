@@ -9,6 +9,10 @@
   등급 금지 성분**. 순수 함수 하나이고 ``Settings`` 도 ``LlmClient`` 도 받지 않는다.
 - 4겹: ``claims.screen(text)`` -- 0단이 **하나도 잡지 못하는** 효능·의료·인증 단정.
 
+여기에 **서버 내부 표식**(``rules.REDACTION_MARKER``·``NEUTRALIZED_MARKER``) 한 겹이
+더 붙는다. 사전 적중이 아니라 "서버가 가린 자리를 모델이 베꼈다"이고, 사유는 3겹과 같은
+``RULE`` 로 적는다.
+
 ``banned.find_terms`` 를 따로 부르지 않는다. ``rules.screen`` 이 이미 그 사전을 태워
 적중마다 ``blocking`` 플래그를 붙여 돌려주므로, 따로 부르면 같은 적중을 두 번 센다.
 그리고 **권고 등급(``ADVISORY_TERMS``) 적중은 떨어뜨리지 않는다** -- 코코넛오일·우유·감귤은
@@ -92,15 +96,37 @@ class TextVerdict:
 _PASS = TextVerdict(None, None, "")
 
 
+# 봉투에 들어가기 전에 서버가 박는 내부 표식. **사전에 없으므로 따로 떨어뜨린다.**
+#
+# ``rules`` 에서 가져온다 -- 문자열을 베껴 두면 저쪽 문구를 고치는 날 이 가드가 조용히
+# 아무것도 잡지 않는다.
+_SERVER_MARKERS: tuple[str, ...] = (rules.REDACTION_MARKER, rules.NEUTRALIZED_MARKER)
+
+
 def screen_text(text: str) -> TextVerdict:
     """생성 문구 한 조각을 3겹과 4겹에 태운다. **차단 적중만 본다.**
 
     권고 등급 성분 적중은 통과시킨다 -- 이유는 모듈 머리에 적었다. 규칙 적중과 성분 적중을
     다른 사유로 가르는 것도 중요하다. 셀러에게 전할 말이 "연락처를 뺐다"와 "그 성분을 뺐다"로
     다르고, 하네스가 겹별 탈락률을 재는 축이 그 구분이다.
+
+    **서버 내부 표식을 가장 먼저 본다.** ``REFINE`` 이 열어 놓은 경로다 -- 다시 쓸 원문은
+    레닥션을 지나 ``[가림]``·``[태그]`` 가 박힌 채 모델에 가고, 모델이 그 글자를 옮겨 적으면
+    어느 사전에도 없으므로 ``FILLED`` 로 셀러 폼까지 간다. ``FILL`` 에서는 잠근 설명이 있으면
+    모델 출력을 아예 버렸으므로 생길 수 없었던 모양이다.
     """
     if not text or not text.strip():
         return _PASS
+
+    for marker in _SERVER_MARKERS:
+        if marker in text:
+            # **사유에 마커를 인용하지 않는다.** 인용하면 그 글자가 ``guardDrops`` 와
+            # ``sellerNotice`` 를 타고 다시 셀러 화면에 나타난다 -- 막으려던 것과 같다.
+            return TextVerdict(
+                FieldStatus.EMPTY_GUARD_RULE,
+                GuardKind.RULE,
+                "서버가 가린 자리의 표식을 그대로 옮겨 적어 비웠다",
+            )
 
     for hit in rules.screen(text).blocking:
         if hit.category is ViolationCategory.BANNED_INGREDIENT:
