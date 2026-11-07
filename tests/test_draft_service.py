@@ -1408,3 +1408,37 @@ async def test_재사용_키가_초안_모드로_갈린다() -> None:
     assert second.reusedFromCache is False, "FILL 응답이 REFINE 요청에 돌아갔다"
     assert third.reusedFromCache is True, "같은 모드끼리는 여전히 재사용해야 한다"
     assert len(llm.calls) == 2
+
+
+def test_종이_다른_리프는_모델이_골라도_채우지_않는다() -> None:
+    """게이트 후보가 없는 경로의 백스톱이다. 안내문이 스스로 틀렸다고 쓰는 리프를 채우지 않는다."""
+    from app.seller_draft.catalog import ItemSignal, Species
+
+    signal = ItemSignal(
+        grade=ItemGrade.OPAQUE,
+        resolved_by=ResolvedBy.NONE,
+        matched_terms=(),
+        candidate_leaf_ids=(),
+        species=Species.CAT,
+        given_category_id=None,
+    )
+    service = DraftService(llm=FakeLlmClient([]), settings=_settings())
+
+    status, value, _basis, drop = service._resolve_leaf(signal, 113, Basis.NAME)
+
+    assert status is FieldStatus.EMPTY_CATEGORY_CONFLICT
+    assert value is None
+    assert drop is not None and drop.kind is GuardKind.CATEGORY_CONFLICT
+    # 공통 리프는 어느 종에도 올 수 있다.
+    assert service._resolve_leaf(signal, 331, Basis.NAME)[0] is FieldStatus.FILLED
+
+
+async def test_셀러_안내에서_리프_번호를_지운다() -> None:
+    """셀러 화면에는 분류 이름만 있다. 번호는 프롬프트 목록에서 옮겨 온 내부 값이다."""
+    notice = "고양이 간식(221 츄르/캔, 223 캣닢/트릿) 중에서 고르세요. 관절 영양제라면 (132 관절/뼈). 50g 2개"
+    llm = FakeLlmClient([ok(_tool_input(leaf=152, notice=notice), model="claude-haiku-4-5")])
+    response = await DraftService(llm=llm, settings=_settings()).run(_request())
+
+    assert response.sellerNotice == (
+        "고양이 간식(츄르/캔, 캣닢/트릿) 중에서 고르세요. 관절 영양제라면 (관절/뼈). 50g 2개"
+    )

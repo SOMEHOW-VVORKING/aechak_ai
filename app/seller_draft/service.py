@@ -30,6 +30,7 @@ import base64
 import binascii
 import hashlib
 import logging
+import re
 import unicodedata
 from collections import OrderedDict
 from datetime import UTC, datetime
@@ -56,7 +57,14 @@ from app.schemas.draft import (
 )
 from app.schemas.inspection import CallOutcome
 from app.seller_draft import claims, guard, imagemeta
-from app.seller_draft.catalog import LEAF_BY_ID, ItemGrade, ItemSignal, leaf_path, resolve
+from app.seller_draft.catalog import (
+    LEAF_BY_ID,
+    ItemGrade,
+    ItemSignal,
+    leaf_path,
+    resolve,
+    species_compatible,
+)
 from app.seller_draft.prompt import CATALOG_VERSION as _CATALOG_VERSION
 from app.seller_draft.prompt import (
     DRAFT_VERSION,
@@ -707,6 +715,24 @@ class DraftService:
                 ),
             )
 
+        if not species_compatible(model_leaf, signal.species):
+            # 상품명이나 셀러가 고른 대분류가 말하는 종과 리프의 종이 다르다. 모델이 안내문에
+            # "고양이 제품인데 강아지 분류"라고 스스로 적으면서 그 리프를 채운 경우가 이 자리다.
+            assert signal.species is not None
+            return (
+                FieldStatus.EMPTY_CATEGORY_CONFLICT,
+                None,
+                Basis.NONE,
+                GuardDrop(
+                    field="categoryId",
+                    kind=GuardKind.CATEGORY_CONFLICT,
+                    detail=(
+                        f"상품의 종은 {signal.species.value} 인데 모델이 지목한 "
+                        f"{model_leaf}({leaf_path(model_leaf)}) 는 다른 종의 리프다"
+                    ),
+                ),
+            )
+
         return FieldStatus.FILLED, model_leaf, (reported_basis or Basis.NAME), None
 
     # --- 0원으로 끝나는 응답 ----------------------------------------------------------
@@ -948,9 +974,35 @@ def _option_groups(raw: Any) -> list[Any]:
     return groups
 
 
+# 안내문 속 리프 id. 모델은 프롬프트의 리프 목록을 ``113 동결건조/생식`` 모양으로 보므로
+# 그 번호를 그대로 옮겨 적는다. 셀러 화면에는 이름만 있어 번호가 뜻이 없다.
+_LEAF_ID_BEFORE_LABEL = re.compile(r"(?<![\d.,])(\d{3})(?:번)?\s*(?=[^\d\s])")
+_LEAF_ID_WITH_PAREN = re.compile(r"(?<![\d.,])(\d{3})(?:번)?\s*\(([^()]*)\)")
+
+
+def _strip_leaf_ids(text: str) -> str:
+    """리프 이름 앞에 붙은 리프 id 만 지운다. 무게·용량 같은 다른 숫자는 남긴다."""
+
+    def label_follows(leaf_id: int, rest: str) -> bool:
+        leaf = LEAF_BY_ID.get(leaf_id)
+        if leaf is None:
+            return False
+        rest = rest.lstrip()
+        return any(rest.startswith(head) for head in (leaf.leaf_label, leaf.path, leaf.mid_label))
+
+    def paren(m: re.Match[str]) -> str:
+        return m.group(2) if label_follows(int(m.group(1)), m.group(2)) else m.group(0)
+
+    def bare(m: re.Match[str]) -> str:
+        return "" if label_follows(int(m.group(1)), text[m.end() :]) else m.group(0)
+
+    text = _LEAF_ID_WITH_PAREN.sub(paren, text)
+    return _LEAF_ID_BEFORE_LABEL.sub(bare, text)
+
+
 def _notice(raw: Any, drops: list[GuardDrop]) -> str | None:
     """셀러 안내 문구도 가드를 지난다. 폼 필드가 아니지만 셀러가 읽는 글자다."""
-    text = str(raw or "").strip()
+    text = _strip_leaf_ids(str(raw or "").strip())
     if not text:
         return None
     verdict = guard.screen_text(text)

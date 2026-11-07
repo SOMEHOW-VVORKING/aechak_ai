@@ -282,7 +282,9 @@ def species_of_category(category_id: int | None) -> Species | None:
     return {"1": Species.DOG, "2": Species.CAT, "3": Species.COMMON}.get(top)
 
 
-def match_item_terms(product_name: str) -> tuple[tuple[str, ...], frozenset[int]]:
+def match_item_terms(
+    product_name: str, species: Species | None = None
+) -> tuple[tuple[str, ...], frozenset[int]]:
     """상품명에서 품목 표면형을 찾는다. **가장 긴 적중만 쓴다.**
 
     길이 선호가 선택이 아니라 필수다. ``자동급식기`` 는 ``자동급식기``(332)와
@@ -292,6 +294,10 @@ def match_item_terms(product_name: str) -> tuple[tuple[str, ...], frozenset[int]
 
     같은 길이의 적중이 여러 리프를 가리키면 그대로 후보에 남긴다. ``소뼈껌`` 이 ``뼈``(132)와
     ``껌``(121)에 걸리는 것이 그 경우이고, 그것은 사전으로 가릴 수 없는 진짜 모호성이다.
+
+    ``species`` 가 강아지나 고양이면 **길이를 비교하기 전에** 다른 종의 리프를 지운다.
+    지우지 않으면 ``고양이 닭가슴살 동결건조 트릿`` 에서 강아지 전용 ``동결건조``(113)가
+    ``트릿``(124·223)보다 길어 이기고, 종 단서가 있는데도 강아지 리프로 확정됐다.
     """
     folded = fold(product_name)
     if not folded:
@@ -305,6 +311,12 @@ def match_item_terms(product_name: str) -> tuple[tuple[str, ...], frozenset[int]
         key = fold(term)
         if key in folded:
             hits.append((len(key), key, frozenset(manual_ids)))
+    if species in (Species.DOG, Species.CAT):
+        hits = [
+            (length, term, kept_ids)
+            for length, term, ids in hits
+            if (kept_ids := frozenset(i for i in ids if species_compatible(i, species)))
+        ]
     if not hits:
         return (), frozenset()
 
@@ -314,6 +326,14 @@ def match_item_terms(product_name: str) -> tuple[tuple[str, ...], frozenset[int]
     for _term, ids in kept:
         candidates |= ids
     return tuple(sorted({term for term, _ids in kept})), frozenset(candidates)
+
+
+def species_compatible(leaf_id: int, species: Species | None) -> bool:
+    """리프가 그 종의 상품에 올 수 있는가. 공통 대분류와 종 미상은 늘 참이다."""
+    leaf = LEAF_BY_ID.get(leaf_id)
+    if leaf is None or species is None or species is Species.COMMON:
+        return True
+    return leaf.species in (species, Species.COMMON)
 
 
 def match_species(product_name: str) -> Species | None:
@@ -356,7 +376,7 @@ def resolve(product_name: str, category_id: int | None = None) -> ItemSignal:
             given_category_id=category_id,
         )
 
-    terms, candidates = match_item_terms(product_name)
+    terms, candidates = match_item_terms(product_name, species)
     if not candidates:
         # 품목어가 하나도 안 걸렸다. 카테고리가 있으면 그 서브트리를 후보로 적어 둔다 --
         # 모델이 고를 범위가 되고, 없으면 모델을 아예 부르지 않는 분기가 된다.
@@ -370,6 +390,13 @@ def resolve(product_name: str, category_id: int | None = None) -> ItemSignal:
         )
 
     resolved_by = ResolvedBy.NAME_TERM
+    if candidates != match_item_terms(product_name)[1]:
+        # 종이 다른 종의 리프를 지워 후보가 바뀌었다. 종으로 좁힌 것과 같은 출처로 적는다.
+        resolved_by = (
+            ResolvedBy.NAME_TERM_WITH_CATEGORY
+            if given_species is not None
+            else ResolvedBy.NAME_TERM_WITH_SPECIES
+        )
     narrowed = set(candidates)
 
     if len(narrowed) > 1 and species is not None:
@@ -490,6 +517,7 @@ __all__ = [
     "match_species",
     "render_leaf_paths",
     "resolve",
+    "species_compatible",
     "species_of_category",
     "subtree_leaf_ids",
 ]
