@@ -41,8 +41,11 @@ _PHONE = re.compile(
 _ACCOUNT = re.compile(r"\d{2,3}[\-\s]\d{2,6}[\-\s]\d{2,8}")
 _BANK = re.compile(r"(국민|신한|우리|하나|농협|기업|카카오\s*뱅크|토스\s*뱅크|새마을|신협|우체국)\s*(은행)?")
 # 외부 메신저·마켓 유도
+# 영문 약어는 앞뒤가 영문자가 아닐 때만 본다. 경계가 없으면 admin, HDMI, instant 안의
+# 글자가 걸린다. 한글·숫자·기호와 붙은 표기("인스타DM", "DM주세요")는 그대로 잡는다.
 _MESSENGER = re.compile(
-    r"(카톡|카카오\s*톡|오픈\s*채팅|open\.kakao|텔레\s*그램|telegram|라인\s*아이디|insta|디엠|dm)",
+    r"(카톡|카카오\s*톡|오픈\s*채팅|open\.kakao|텔레\s*그램|telegram|라인\s*아이디"
+    r"|(?<![a-z])insta(?:gram)?(?![a-z])|디엠|(?<![a-z])dms?(?![a-z]))",
     re.I,
 )
 # 부정 전방탐색 끝에 **호스트 경계**를 둔다. 경계가 없으면 자사 도메인이 접두사로 쓰여

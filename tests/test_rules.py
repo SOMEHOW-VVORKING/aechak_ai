@@ -132,3 +132,39 @@ def test_보강_셋은_모델에_보낼_본문에서_가리지_않는다() -> No
     redacted = rules.screen(text).redacted
 
     assert redacted == text
+
+
+def contact_quotes(text: str) -> list[str]:
+    return [h.quote for h in rules.screen(text).hits if h.category is ViolationCategory.CONTACT_INFO]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "E2E-ADM 순면 손수건 C",
+        "E2E-ADM-MON 산책 물병 D",
+        "admin 전용 샘플",
+        "HDMI 케이블 정리 파우치",
+        "instant 사료 보관통",
+        "randomly 섞인 간식 세트",
+    ],
+)
+def test_영문_단어_안의_dm_insta는_연락처가_아니다(text: str) -> None:
+    """11/7 데모 점검에서 상품명 "E2E-ADM" 의 DM 이 차단으로 걸려 실제 위반을 모델이 못 봤다."""
+    assert contact_quotes(text) == [], text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "DM 주세요",
+        "문의는 dm으로",
+        "인스타DM 환영",
+        "DMs open",
+        "insta 아이디로 연락",
+        "instagram 문의",
+        "디엠 주세요",
+    ],
+)
+def test_메신저_약어는_한글_기호와_붙어도_잡는다(text: str) -> None:
+    assert contact_quotes(text), text
