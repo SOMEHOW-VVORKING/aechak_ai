@@ -103,6 +103,18 @@ _PASS = TextVerdict(None, None, "")
 _SERVER_MARKERS: tuple[str, ...] = (rules.REDACTION_MARKER, rules.NEUTRALIZED_MARKER)
 
 
+def quotable(text: str) -> str:
+    """사유에 인용해도 되는 모양으로 깎는다. **표식을 지운다.**
+
+    사유는 ``guardDrops`` 를 타고 셀러 화면까지 간다. 어느 값이 문제였는지는 알려야 하므로
+    인용을 없애지 않고 표식만 뺀다 -- 인용째 지우면 옵션 값 여러 개 중 어느 것인지 셀러가
+    알 수 없다.
+    """
+    for marker in _SERVER_MARKERS:
+        text = text.replace(marker, "")
+    return text.strip()
+
+
 def screen_text(text: str) -> TextVerdict:
     """생성 문구 한 조각을 3겹과 4겹에 태운다. **차단 적중만 본다.**
 
@@ -369,7 +381,7 @@ def _registration_invariants(
 
     flat = [value for group in cleaned for value in group.values]
     if len(set(flat)) != len(flat):
-        dupes = sorted({value for value in flat if flat.count(value) > 1})
+        dupes = sorted({quotable(value) for value in flat if flat.count(value) > 1})
         return reject(
             GuardKind.OPTION_RULE,
             FieldStatus.EMPTY_GUARD_OPTION_RULE,
@@ -388,7 +400,9 @@ def _registration_invariants(
         verdict = screen_text(text)
         if not verdict.ok:
             assert verdict.status is not None and verdict.kind is not None
-            return reject(verdict.kind, verdict.status, f"'{text}': {verdict.detail}")
+            # 표식을 깎아 인용한다. 원문을 그대로 감싸면 설명 쪽에서 막은 유출이 옵션
+            # 사유를 타고 다시 셀러 화면에 나타난다.
+            return reject(verdict.kind, verdict.status, f"'{quotable(text)}': {verdict.detail}")
     return None
 
 

@@ -1163,6 +1163,34 @@ async def test_REFINE_이_품목을_확정하지_못해도_셀러_원문을_지�
     assert response.draft.description == "셀러가 직접 쓴 설명입니다."
 
 
+async def test_셀러가_고른_카테고리와_모델이_다르면_다시_쓴_문구를_버린다() -> None:
+    """위 테스트의 빈 자리였다.
+
+    셀러가 리프를 골라 두면 ``_resolve_leaf`` 는 채울 것이 없어 ``EMPTY_NOT_ATTEMPTED`` 를
+    돌려주고 불일치를 드롭에만 적는다. 상태만 보면 충돌이 사라져, **셀러가 고른 품목과 다른
+    품목으로 쓴 문구가 그대로 실렸다**(강아지 목줄에 "고양이용 건식 사료입니다"). 셀러가 직접
+    고른 값은 어휘 게이트보다 더 믿을 근거이므로 같은 이유가 더 세게 적용된다.
+    """
+    llm = FakeLlmClient(
+        [ok(_tool_input(leaf=211, slots=_slots(item="고양이용 건식 사료입니다.")), model="claude-haiku-4-5")]
+    )
+    response = await DraftService(llm=llm, settings=_settings()).run(
+        _request(
+            "강아지 목줄 M",
+            categoryId=152,
+            lockedFields=LockedFields(description="셀러가 직접 쓴 설명입니다."),
+            mode=DraftMode.REFINE,
+        )
+    )
+
+    assert response.fieldStatus["description"] is FieldStatus.KEPT_LOCKED
+    assert response.draft.description == "셀러가 직접 쓴 설명입니다."
+    assert "고양이" not in (response.draft.description or "")
+    # 셀러가 고른 카테고리는 그대로 둔다 -- 충돌은 설명을 버리는 근거이고 분류를 바꾸는
+    # 근거가 아니다.
+    assert response.fieldStatus["categoryId"] is FieldStatus.EMPTY_NOT_ATTEMPTED
+
+
 async def test_REFINE_도_잠근_옵션은_그대로_둔다() -> None:
     """다시 쓰기는 문장을 다듬는 일이고 옵션 값은 문장이 아니다.
 

@@ -74,7 +74,7 @@ from app.schemas.draft import (
 from app.seller_draft import catalog, claims, imagemeta
 from app.seller_draft.catalog import ItemGrade
 from app.seller_draft.prompt import DRAFT_PREFIX, draft_system_blocks, draft_version_string
-from app.seller_draft.service import DraftService, DraftUnprocessable
+from app.seller_draft.service import REFINE_REVERTED_PREFIX, DraftService, DraftUnprocessable
 from app.seller_draft.tool import DRAFT_TOOL
 from app.settings import Settings
 from harness import imagecontent
@@ -218,6 +218,13 @@ class Record:
     # 되돌아간 건이 옵션 적중 때문에 "사유 있는 되돌림" 으로 세어진다. 되돌림은 설명 한 필드의
     # 사건이므로 그 필드로 좁힌 축이 따로 있어야 한다.
     description_guard_kinds: list[str] = field(default_factory=list)
+    # **모델이 실제로 조각을 낼 기회가 있었는가.** 호출 실패·미호출과 "모델이 빈 조각을
+    # 냈다" 를 가르는 축이다.
+    #
+    # 0원 분기와 호출 실패도 셀러 원문을 에코하므로(``service._locked_echo``) 응답만 보면
+    # ``KEPT_LOCKED`` 로 같다. 그 둘을 뭉개면 **타임아웃이 "프롬프트가 다시 쓰기를 못
+    # 끌어낸다" 로 세어진다** -- 그 수를 보고 모드를 켤지 판단하므로 거짓이면 판단이 무너진다.
+    model_produced: bool = False
     # **그 측정이 어느 프롬프트로 돌았는가.** ``--compare-from`` 이 다른 버전의 raw 를 대면
     # 프롬프트 변경분이 층별 이득에 섞여 들어간다. 비교할 때 경고를 내기 위한 축이다.
     draft_version: str = ""
@@ -1226,8 +1233,14 @@ async def _measure(
                     field_status={k: v.value for k, v in response.fieldStatus.items()},
                     guard_kinds=[drop.kind.value for drop in response.guardDrops],
                     description_guard_kinds=[
-                        drop.kind.value for drop in response.guardDrops if drop.field == "description"
+                        drop.kind.value
+                        for drop in response.guardDrops
+                        if drop.field == "description"
+                        # 되돌림 요약은 유발한 겹의 종류를 빌려 쓰므로, 그대로 세면 한 건이
+                        # 적중과 요약으로 두 번 세어져 겹별 탈락률이 배로 찍힌다.
+                        and not drop.detail.startswith(REFINE_REVERTED_PREFIX)
                     ],
+                    model_produced=not response.skipReason and bool(response.usage),
                     draft_version=draft_version_string(),
                     basis={k: v.value for k, v in response.basis.items()},
                     cost_micro_usd=response.total_cost_micro_usd(),
@@ -1426,14 +1439,18 @@ def _refine_rows(mode: str, records: list[Record]) -> list[tuple[str, str]]:
     reverted_kinds: Counter[str] = Counter()
     for record in kept:
         reverted_kinds.update(record.description_guard_kinds)
+    no_reason = sum(1 for r in kept if r.model_produced and not r.description_guard_kinds)
+    not_called = sum(1 for r in kept if not r.model_produced)
     rows.append(
         (
             f"[{mode}] 되돌림 사유",
             (", ".join(f"{k}={v}" for k, v in sorted(reverted_kinds.items())) or "없음")
-            + f" / 사유 없는 되돌림 {sum(1 for r in kept if not r.description_guard_kinds)}건"
-            " — 사유가 비는 되돌림은 **모델이 조각을 하나도 내지 않은 건**이다(가드가 떨어뜨린 "
-            "것이 아니다). 그 수가 크면 프롬프트가 다시 쓰기를 못 끌어내고 있다는 신호이고, "
-            "유료 호출이 아무 일도 하지 않은 건수가 바로 그것이다",
+            + f" / 사유 없는 되돌림 {no_reason}건"
+            f" / 호출이 안 된 되돌림 {not_called}건"
+            " -- 앞의 수가 **모델이 조각을 하나도 내지 않은 건**이다(가드가 떨어뜨린 것이 "
+            "아니다). 그 수가 크면 프롬프트가 다시 쓰기를 못 끌어내고 있다는 신호이고, 유료 "
+            "호출이 아무 일도 하지 않은 건수가 바로 그것이다. 뒤의 수는 호출 실패·미호출이라 "
+            "프롬프트와 무관하다 -- 둘을 뭉개면 타임아웃이 프롬프트 탓으로 세어진다",
         )
     )
     unsafe = [r.case_id for r in pool if r.server_marker_in_draft]

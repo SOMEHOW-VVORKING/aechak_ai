@@ -483,8 +483,17 @@ class DraftService:
         # 충돌에는 ``pinned_leaf_id`` 조건을 붙이지 않는다. 어휘 게이트가 리프를 집었더라도
         # 모델은 다른 품목을 보고 문구를 썼으므로 그 문구를 믿을 근거가 없다. 셀러가 잠근
         # 값은 아래 ``locked`` 분기가 **앞에** 있어 그대로 보존된다.
-        item_unknown = leaf_status is FieldStatus.EMPTY_CATEGORY_CONFLICT or (
-            leaf_status is FieldStatus.EMPTY_MODEL_DECLINED and signal.pinned_leaf_id is None
+        #
+        # **셀러가 리프를 골라 둔 경우도 충돌이다.** 그때 ``_resolve_leaf`` 는 채울 것이 없어
+        # ``EMPTY_NOT_ATTEMPTED`` 를 돌려주고 불일치를 드롭에만 적는데, 상태만 보면 충돌이
+        # 사라진다 -- 셀러가 고른 품목과 다른 품목으로 쓴 문구가 그대로 실린다(강아지 목줄에
+        # "고양이용 건식 사료입니다"). 셀러가 직접 고른 값은 어휘 게이트보다 더 믿을 근거이므로
+        # 같은 이유가 더 세게 적용된다. 드롭의 종류로 가린다.
+        leaf_conflicted = leaf_drop is not None and leaf_drop.kind is GuardKind.CATEGORY_CONFLICT
+        item_unknown = (
+            leaf_status is FieldStatus.EMPTY_CATEGORY_CONFLICT
+            or leaf_conflicted
+            or (leaf_status is FieldStatus.EMPTY_MODEL_DECLINED and signal.pinned_leaf_id is None)
         )
 
         # (ㄷ) 설명 슬롯. **모드가 여기서 갈린다.**
@@ -1011,6 +1020,13 @@ def _locked_echo(
     return ProductDraftSaveRequest(description=text), {"description": FieldStatus.KEPT_LOCKED}
 
 
+# 되돌림 기록의 사유 접두. **하네스가 집계에서 이 항목을 가리는 표식이다.**
+#
+# 되돌림 기록은 ``GuardKind`` 를 유발한 겹에서 빌려 쓰므로(새 열거값을 더하지 않는다) 종류만
+# 보면 실제 적중과 구별되지 않는다. 그대로 세면 한 건이 두 번 세어져 겹별 탈락률이 배로 찍힌다.
+REFINE_REVERTED_PREFIX = "다시 쓴 문구를 쓸 수 없어 셀러 원문을 그대로 두었다: "
+
+
 def _refine_reverted(kind: GuardKind, why: str) -> GuardDrop:
     """다시 쓴 문구를 버리고 셀러 원문을 복원했다는 기록.
 
@@ -1024,7 +1040,7 @@ def _refine_reverted(kind: GuardKind, why: str) -> GuardDrop:
     return GuardDrop(
         field="description",
         kind=kind,
-        detail=f"다시 쓴 문구를 쓸 수 없어 셀러 원문을 그대로 두었다: {why}",
+        detail=f"{REFINE_REVERTED_PREFIX}{why}",
     )
 
 

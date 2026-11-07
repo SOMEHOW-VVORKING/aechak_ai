@@ -960,6 +960,7 @@ def _refine_record(
     description_status: str,
     guard_kinds: list[str],
     description_guard_kinds: list[str],
+    model_produced: bool = True,
 ) -> run_draft.Record:
     """되돌림 집계만 보기 위한 최소 기록. 필드 대부분은 이 집계가 읽지 않는다."""
     return run_draft.Record(
@@ -987,6 +988,7 @@ def _refine_record(
         cache_read_tokens=0,
         refine_locked=True,
         description_guard_kinds=description_guard_kinds,
+        model_produced=model_produced,
     )
 
 
@@ -1031,3 +1033,45 @@ def test_설명_적중은_되돌림_사유로_센다() -> None:
     reason = rows["[refine] 되돌림 사유"]
     assert "RULE=1" in reason
     assert "사유 없는 되돌림 0건" in reason
+
+
+def test_호출이_안_된_되돌림을_프롬프트_탓으로_세지_않는다() -> None:
+    """0원 분기와 호출 실패도 셀러 원문을 에코하므로 응답만 보면 ``KEPT_LOCKED`` 로 같다.
+
+    뭉개면 **타임아웃이 "프롬프트가 다시 쓰기를 못 끌어낸다" 로 세어진다.** 그 수를 보고
+    모드를 켤지 판단하므로 거짓이면 판단이 무너진다.
+    """
+    case_id = next(iter(draft_cases.REFINE_DESCRIPTIONS))
+    records = [
+        _refine_record(
+            case_id,
+            description_status="KEPT_LOCKED",
+            guard_kinds=[],
+            description_guard_kinds=[],
+            model_produced=False,
+        ),
+    ]
+
+    rows = dict(run_draft._refine_rows("refine", records))
+
+    reason = rows["[refine] 되돌림 사유"]
+    assert "사유 없는 되돌림 0건" in reason, "호출 실패가 프롬프트 탓으로 세어졌다"
+    assert "호출이 안 된 되돌림 1건" in reason
+
+
+async def test_되돌림_사유가_실제_응답에서도_한_번만_세어진다() -> None:
+    """위 둘은 기록을 손으로 만든다. **그 경로만 보면 중복 집계를 놓친다.**
+
+    되돌림 기록은 ``GuardKind`` 를 유발한 겹에서 빌려 쓰므로, 서비스 응답에는 같은 종류가
+    적중과 요약으로 **두 번** 들어 있다. 기록 시점에서 요약을 가리지 않으면 10건에서
+    ``RULE=20`` 이 찍힌다. 서비스부터 집계까지 이어 확인한다.
+    """
+    records = await _measure_refine(slots="marker")
+
+    assert records, "표식 경로가 기록을 만들지 못했다"
+    for record in records:
+        assert record.description_guard_kinds == ["RULE"], record.description_guard_kinds
+
+    rows = dict(run_draft._summarize(records, "refine"))
+
+    assert f"RULE={len(records)}" in rows["[refine] 되돌림 사유"]
