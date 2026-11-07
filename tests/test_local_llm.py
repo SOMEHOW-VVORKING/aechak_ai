@@ -19,6 +19,7 @@ import httpx2
 import pytest
 
 from app.inspection import triage
+from app.inspection.perspectives import findings_tool, specs_for
 from app.inspection.triage import TRIAGE_TOOL
 from app.llm.client import LlmClient, cost_micro_usd, is_local_model, validate_pricing
 from app.schemas.inspection import CallOutcome
@@ -319,3 +320,53 @@ async def test_주소_끝_슬래시가_경로를_망가뜨리지_않는다(trail
     await call_triage(local_client(recorder, base_url=trailing))
 
     assert recorder.urls[0] == "http://127.0.0.1:8080/v1/chat/completions"
+
+
+async def test_빈_객체는_SCHEMA_INVALID다() -> None:
+    """``{}`` 를 SUCCESS 로 올리면 호출부가 누락을 "값이 없다" 로 읽는다.
+
+    선별은 ``decision`` 이 비면 승급으로 떨어져 버티지만, 관점은 아니다 --
+    ``test_관점_응답에_findings가_없으면_SCHEMA_INVALID다`` 가 그쪽을 고정한다.
+    """
+    result = await call_triage(local_client(LocalRecorder(content="{}")))
+
+    assert result.outcome is CallOutcome.SCHEMA_INVALID
+    assert result.tool_input is None, "부분 응답을 호출부에 넘기지 않는다"
+    assert "decision" in (result.detail or "")
+
+
+async def test_확정이_아닌_선별은_분류와_인용을_비워도_통과한다() -> None:
+    """``strict`` 모드가 선택 항목까지 ``required`` 에 넣게 하므로 그 목록을 그대로 요구하면
+    멀쩡한 ``CLEAR`` 응답이 전건 실패로 적힌다. 검증 기준은 null 허용 여부다.
+    """
+    content = json.dumps({"decision": "NEEDS_REVIEW", "reason": "효능 문구가 의심스럽다"}, ensure_ascii=False)
+
+    result = await call_triage(local_client(LocalRecorder(content=content)))
+
+    assert result.ok is True
+    assert triage.decide(result).skip is False
+
+
+async def test_관점_응답에_findings가_없으면_SCHEMA_INVALID다() -> None:
+    """미검사가 통과로 둔갑하는 유일한 자리다.
+
+    ``pipeline._perspective`` 는 ``result.ok`` 면 ``tool_input.get("findings") or []`` 를
+    읽으므로, 키가 없는 응답이 SUCCESS 로 올라오면 **아무도 본문을 읽지 않은 건이 CLEAR**
+    가 되고 그 관점이 통과에 실린다.
+    """
+    recorder = LocalRecorder(content="{}")
+    (spec,) = specs_for(fanout=False)
+
+    result = await local_client(recorder).call_tool(
+        model=LOCAL_MODEL,
+        effort=None,
+        max_tokens=4096,
+        system_blocks=[{"type": "text", "text": "관점 지침"}],
+        user_content=[{"type": "text", "text": "글루코사민 함유 영양제입니다"}],
+        tool=findings_tool(spec),
+        request_id="insp-local-2",
+    )
+
+    assert result.ok is False
+    assert result.outcome is CallOutcome.SCHEMA_INVALID
+    assert "findings" in (result.detail or "")

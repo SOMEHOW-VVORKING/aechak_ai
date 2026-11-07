@@ -413,6 +413,16 @@ class LlmClient:
             if tool_input is None:
                 outcome = CallOutcome.SCHEMA_INVALID
                 detail = f"본문이 JSON 객체가 아니다: {str(content)[:200]}"
+            else:
+                missing = _missing_required(tool["input_schema"], tool_input)
+                if missing:
+                    # 객체이기만 하면 통과시키면 ``{}`` 가 SUCCESS 로 올라간다. 그러면 호출부가
+                    # 없는 ``findings`` 를 빈 목록으로 읽어 **미검사가 통과로 둔갑한다**.
+                    # llama-server 의 문법 제약 디코딩은 required 를 항상 강제하지는 않으므로
+                    # 여기서 한 번 더 본다.
+                    outcome = CallOutcome.SCHEMA_INVALID
+                    detail = f"필수 키 누락: {', '.join(missing)}"
+                    tool_input = None
 
         if outcome is not CallOutcome.SUCCESS:
             log.warning(
@@ -474,6 +484,38 @@ def _parse_json_object(content: Any) -> dict[str, Any] | None:
     except ValueError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _missing_required(schema: Any, payload: dict[str, Any]) -> list[str]:
+    """응답에서 빠져 있으면 안 되는 최상위 키를 돌려준다.
+
+    ``required`` 를 그대로 쓰지 않는다. ``strict`` 모드가 선언한 속성 **전부** 를 거기 넣으라고
+    요구해서, 우리 툴들은 선택 항목도 ``required`` 에 적고 대신 타입을 ``["string", "null"]``
+    로 넓혀 둔다(``triage.TRIAGE_TOOL`` 머리에 그 사정을 적었다). 그래서 ``required`` 는
+    "반드시 있어야 한다" 가 아니라 "선언했다" 는 뜻이고, 실제로 빠지면 안 되는 것은
+    **null 을 허용하지 않는** 속성이다. 선별이 ``CLEAR`` 를 낼 때 ``category`` 와 ``quote`` 를
+    비우는 것은 정상 응답이므로 그 둘을 요구하면 멀쩡한 호출이 실패로 적힌다.
+
+    중첩까지 보지 않는다. 항목 안쪽은 호출부가 이미 방어적으로 읽고(``item.get("quote")
+    or ""``) 인용 검증이 한 번 더 걸러서 누락이 판정을 뒤집지 못한다. 최상위는 다르다 --
+    ``findings`` 하나가 비면 "위반 없음" 과 구별되지 않는다.
+    """
+    if not isinstance(schema, dict):
+        return []
+    required = schema.get("required")
+    properties = schema.get("properties")
+    if not isinstance(required, list) or not isinstance(properties, dict):
+        return []
+    missing: list[str] = []
+    for key in required:
+        if not isinstance(key, str) or key in payload:
+            continue
+        declared = properties.get(key)
+        types = declared.get("type") if isinstance(declared, dict) else None
+        nullable = types == "null" or (isinstance(types, list) and "null" in types)
+        if not nullable:
+            missing.append(key)
+    return missing
 
 
 def _extract_tool_input(response: Any, tool_name: str) -> dict[str, Any] | None:
