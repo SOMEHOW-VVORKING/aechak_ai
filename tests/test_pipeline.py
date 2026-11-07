@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from typing import Any
 
@@ -14,6 +15,7 @@ from conftest import FakeLlmClient, failed, ok
 
 from app.inspection import rules
 from app.inspection.pipeline import InspectionPipeline
+from app.inspection.policy import POLICY_PREFIX, POLICY_VERSION
 from app.schemas.inspection import (
     CallOutcome,
     Perspective,
@@ -328,3 +330,16 @@ def test_같은_규칙_적중_두_건이_서로_다른_구간을_가리킨다() 
 
     assert spans == [(3, 16), (19, 32)], "두 적중이 같은 구간을 가리킨다"
     assert [text[s:e] for s, e in spans] == ["010-1234-5678"] * 2
+
+
+def test_정책_문구가_바뀌면_버전도_올리게_한다() -> None:
+    """``POLICY_VERSION`` 은 판정 재사용 키의 일부다. 백엔드는 내용 해시와 이 값이 같으면
+    기존 검수를 그대로 쓰므로, 문구를 고치고 버전을 안 올리면 **바뀐 정책으로 다시 보지 않는다.**
+
+    모듈 머리에 "문구를 고치면 올린다" 고 적어 두었는데도 한 번 놓쳤다. 적어 두는 것으로는
+    모자라서 문구의 지문을 고정한다. 문구를 고치면 이 테스트가 깨지고, 깨진 자리에서
+    버전까지 함께 올리게 된다 -- 둘을 한 ``assert`` 에 묶은 이유가 그것이다.
+    """
+    digest = hashlib.sha256(POLICY_PREFIX.encode()).hexdigest()[:12]
+
+    assert (POLICY_VERSION, digest) == ("policy-v2", "227891222abe")

@@ -40,7 +40,7 @@ def verdict_of(
         perspectives=perspectives,
         violations=[],
         calls=calls,
-        promptVersion="inspection-v1+policy-v1+triage-v2",
+        promptVersion="inspection-v2+policy-v2+triage-v4",
         decidedAt=datetime.now(UTC),
     )
 

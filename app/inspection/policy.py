@@ -10,7 +10,10 @@
 
 from __future__ import annotations
 
-POLICY_VERSION = "policy-v1"
+# 자사 도메인 예외를 더하면서 올렸다(policy-v1 -> v2). 재사용 키의 일부라 올리지 않으면
+# 바뀐 정책으로 다시 보지 않고 옛 판정을 그대로 쓴다 -- 백엔드가 내용 해시와 이 값이 같으면
+# 기존 검수를 재사용하기 때문이다.
+POLICY_VERSION = "policy-v2"
 
 POLICY_PREFIX = """\
 당신은 반려동물 용품 오픈마켓 '애착'의 콘텐츠 검수자입니다.

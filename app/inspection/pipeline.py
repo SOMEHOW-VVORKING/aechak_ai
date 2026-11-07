@@ -78,7 +78,7 @@ log = logging.getLogger(__name__)
 #
 # 두 자리다 -- V33 의 ``content_inspections.prompt_version VARCHAR(40)`` 과
 # ``ai_call_ledger.prompt_version VARCHAR(40) NOT NULL``. 기본값으로 합성한 값이
-# "inspection-v1+policy-v1+triage-v3" 33자여서 여유가 7자뿐이다. 백엔드가 칼럼을 늘리면
+# "inspection-v2+policy-v2+triage-v4" 33자여서 여유가 7자뿐이다. 백엔드가 칼럼을 늘리면
 # 이 상수도 함께 올린다.
 PROMPT_VERSION_MAX_LENGTH = 40
 

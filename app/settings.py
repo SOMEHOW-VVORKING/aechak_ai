@@ -213,7 +213,9 @@ class Settings(BaseSettings):
     kafka_publish_attempts: int = 3
     kafka_publish_retry_seconds: float = 2.0
 
-    prompt_version: str = "inspection-v1"
+    # 판정 동작을 바꾸면 올린다. 비평 단계를 빼고 관점을 하나로 줄이면서 v2 로 올렸다 --
+    # 이 값과 정책 버전이 재사용 키라, 올리지 않으면 옛 구성으로 낸 판정이 그대로 쓰인다.
+    prompt_version: str = "inspection-v2"
 
     # 계약 버전. 모르는 major를 받으면 떨어뜨리지 않고 거절한다.
     supported_schema_version: int = 1
