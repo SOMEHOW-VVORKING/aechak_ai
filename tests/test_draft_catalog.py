@@ -203,3 +203,23 @@ def test_사전의_알려진_구멍을_숫자로_남긴다() -> None:
     다음 사람이 "사전이 완전하다"고 오해하지 않는다.
     """
     assert catalog.resolve("연어 건사료 2kg", None).grade is ItemGrade.OPAQUE
+
+
+def test_종_단서가_있으면_다른_종의_긴_품목어가_이기지_않는다() -> None:
+    """11/7 데모 점검에서 고양이 상품이 강아지 ``동결건조/생식``(113)으로 확정됐던 자리다.
+
+    ``동결건조`` 가 ``트릿`` 보다 길어 이겼다. 종을 알면 길이를 비교하기 전에 다른 종의
+    리프를 지운다.
+    """
+    signal = catalog.resolve("E2E 고양이 닭가슴살 동결건조 트릿 50g", None)
+
+    assert signal.candidate_leaf_ids == (223,)
+    assert signal.resolved_by is ResolvedBy.NAME_TERM_WITH_SPECIES
+    # 같은 종이면 그대로 확정한다.
+    assert catalog.resolve("강아지 동결건조 사료", None).candidate_leaf_ids == (113,)
+    # 다른 종의 품목어만 있으면 확정하지 않는다. 틀린 PINNED 보다 미확정이 낫다.
+    assert catalog.resolve("고양이 동결건조 50g", None).grade is ItemGrade.OPAQUE
+    # 셀러가 고른 대분류도 같은 방식으로 지운다.
+    assert set(catalog.resolve("동결건조 50g", 2).candidate_leaf_ids) <= {
+        leaf.category_id for leaf in catalog.LEAVES if leaf.species is Species.CAT
+    }
