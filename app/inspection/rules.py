@@ -98,6 +98,17 @@ _CTA = re.compile(
 # "축하 ... 당첨" 은 순서가 있다. 당첨을 먼저 적고 축하가 뒤에 오는 정상 공지는 안 걸린다.
 _FAKE_PRIZE = re.compile(r"(당첨\s*(되셨|되었습니다|됐습니다)|당첨자로\s*선정|축하[^\n]{0,20}?당첨)")
 
+# 처방이 필요한 동물용 의약품 이름. **처방이라는 단어로 잡지 않는다** -- 정상 상품인
+# 처방식사료가 걸린다. **비차단이다.** 복약 주의문처럼 약 이름을 언급만 한 정상 문구가 있어서,
+# 적중하면 선별을 건너뛰고 관점 검수가 판단한다. 글자 사이를 띄운 표기는 못 잡고, 그건 모델 단계가 본다.
+_PRESCRIPTION_DRUG = re.compile(
+    r"(아목시실린|amoxicillin|클라바목스|clavamox|세팔렉신|cephalexin|엔로플록사신|enrofloxacin"
+    r"|바이트릴|baytril|독시사이클린|doxycycline|메트로니다졸|metronidazole|프레드니솔론|prednisolone"
+    r"|덱사메타손|dexamethasone|멜록시캄|meloxicam|카프로펜|carprofen|트라마돌|tramadol"
+    r"|가바펜틴|gabapentin|아포퀠|apoquel|오클라시티닙|oclacitinib)",
+    re.I,
+)
+
 # 같은 구절의 반복. 어절 이 수만큼 이어진 창을 단위로 보고, 이 횟수 이상 나오면 적중이다.
 #
 # 창을 어절 4개로 고정한다. "4개 이상" 짜리 반복 구절은 그 안에 반복되는 4어절 창을
@@ -271,6 +282,7 @@ def screen(text: str) -> RuleResult:
         # 상품이 모델 한 번 없이 막힌다. 비차단이어도 선별은 건너뛰고 관점 둘이 본다.
         (_CTA, ViolationCategory.SPAM, "클릭·이동을 유도하는 문구", False),
         (_FAKE_PRIZE, ViolationCategory.SPAM, "거짓 당첨 안내로 읽히는 문구", False),
+        (_PRESCRIPTION_DRUG, ViolationCategory.PRESCRIPTION_DRUG, "처방이 필요한 동물용 의약품 이름", False),
     ):
         for m in pattern.finditer(probe):
             result.hits.append(RuleHit(category, m.group(0), m.start(), m.end(), reason, blocking))

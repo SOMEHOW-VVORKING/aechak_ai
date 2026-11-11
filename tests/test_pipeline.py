@@ -346,7 +346,7 @@ def test_정책_문구가_바뀌면_버전도_올리게_한다() -> None:
     """
     digest = hashlib.sha256(POLICY_PREFIX.encode()).hexdigest()[:12]
 
-    assert (POLICY_VERSION, digest) == ("policy-v2", "227891222abe")
+    assert (POLICY_VERSION, digest) == ("policy-v3", "973919c4315a")
 
 
 # --- 관점 응답의 모양 --------------------------------------------------------------

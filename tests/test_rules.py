@@ -26,6 +26,8 @@ CLEAN: tuple[str, ...] = (
     "상세 정보는 https://shop.aechak.co.kr/p/1 에서 확인해 주세요",
     "글루코사민과 MSM이 들어간 영양제입니다. 관절 건강에 도움을 줄 수 있습니다.",
     "소형견용 60정 1개 무료배송\n중형견용 60정 1개 무료배송\n대형견용 60정 1개 무료배송",
+    "처방식사료 신장 케어 건식사료입니다",
+    "수의사 처방식 사료입니다",
 )
 
 
@@ -69,6 +71,26 @@ def test_거짓_당첨_안내를_SPAM으로_적는다(text: str) -> None:
 
     assert hits, text
     assert {h.category for h in hits} == {ViolationCategory.SPAM}
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "아목시실린 50정 처방전 없이 바로 발송",
+        "Amoxicillin 250mg 소분 판매",
+        "아포퀠 16mg 남은 거 팝니다",
+    ),
+)
+def test_처방약_이름은_PRESCRIPTION_DRUG로_적고_선별을_건너뛰게_한다(text: str) -> None:
+    """차단하지 않는다. 복약 주의문처럼 약 이름을 언급만 한 정상 문구가 있어 판단은 관점에 맡기고,
+    선별이 CLEAR 로 흘려보내지 못하게 승급만 시킨다.
+
+    처방이라는 단어만 있는 정상 문구는 위 CLEAN 이 고정한다.
+    """
+    result = rules.screen(text)
+    assert [h.category for h in result.hits] == [ViolationCategory.PRESCRIPTION_DRUG], text
+    assert result.blocking == [], text
+    assert [h.category for h in result.triage_trumping] == [ViolationCategory.PRESCRIPTION_DRUG], text
 
 
 def test_같은_구절을_세_번_반복하면_적중이다() -> None:

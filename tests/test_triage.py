@@ -441,6 +441,8 @@ def test_승급_신호가_정책_분류_전체를_덮는다() -> None:
         ViolationCategory.DISPARAGEMENT: "깎아내리는",
         ViolationCategory.PII: "타인의 개인정보",
         ViolationCategory.IRRELEVANT: "상품에 대한 내용을 전혀 담지 않은",
+        ViolationCategory.PRESCRIPTION_DRUG: "동물용 의약품",
+        ViolationCategory.LIVE_ANIMAL: "살아 있는 동물",
     }
     missing = [c.value for c in ViolationCategory if c not in attribution]
     assert missing == [], f"새 분류에 승급 신호를 귀속시키지 않았다: {missing}"
@@ -771,4 +773,4 @@ def test_선별_문구나_판정이_바뀌면_버전도_올리게_한다() -> No
     """
     digest = hashlib.sha256(TRIAGE_PROMPT.encode()).hexdigest()[:12]
 
-    assert (TRIAGE_VERSION, digest) == ("triage-v4", "7260f0af1fb2")
+    assert (TRIAGE_VERSION, digest) == ("triage-v5", "fba69317ecac")

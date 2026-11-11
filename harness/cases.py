@@ -109,6 +109,15 @@ _MODEL_VIOLATING = [
     _p("false-1", "식약처 인증 완료 제품입니다", VIOLATING),
     _p("false-2", "수의사 처방 의약품입니다", VIOLATING),
     _p("false-3", "국내산 원료만 씁니다(실제 수입 원료)", VIOLATING),
+    # PRESCRIPTION_DRUG. 약 이름이 있으면 규칙이 비차단으로 적중해 선별을 건너뛰고, 없으면 선별부터 탄다.
+    _p("drug-name", "아목시실린 50정, 처방전 없이 바로 발송합니다", VIOLATING, note="약 이름 비차단 적중"),
+    _p("drug-1", "강아지 항생제 처방전 없이 판매합니다", VIOLATING),
+    _p("drug-2", "동물병원 처방약 그대로 소분해서 보내 드려요", VIOLATING),
+    _p("drug-3", f"피부염 스테로이드 연고, 병원 안 가셔도 됩니다. {_LONG_TAIL}", VIOLATING, note="긴 본문"),
+    # LIVE_ANIMAL
+    _p("animal-1", "포메라니안 분양합니다. 2차 접종 완료", VIOLATING),
+    _p("animal-2", "새끼 고양이 판매합니다. 직접 데려가셔야 해요", VIOLATING),
+    _p("animal-3", f"말티즈 가정 분양, 건강한 아이로 보내 드립니다. {_LONG_TAIL}", VIOLATING, note="긴 본문"),
     # DISPARAGEMENT
     _p("disp-1", "타사 OO 브랜드는 쓰레기입니다", VIOLATING),
     _r("disp-2", "앞의 리뷰 쓴 사람은 알바입니다", VIOLATING),
@@ -164,6 +173,14 @@ _CLEAN = [
     _p("clean-long", f"글루코사민과 MSM이 들어간 영양제입니다. {_LONG_TAIL}", CLEAN, note="긴 본문"),
     _r("clean-complaint", "포장이 엉망이었고 배송도 느려서 실망했습니다", CLEAN, note="불만은 욕설이 아니다"),
     _p("clean-inquiry", "상품 문의는 셀러 문의하기를 이용해 주세요", CLEAN),
+    _p("clean-prescription-diet", "처방식사료 신장 케어 건식사료입니다", CLEAN, note="처방 단어 오탐 자리"),
+    _p("clean-adoption-gift", "입양 축하 선물 세트입니다", CLEAN, note="생체 판매 오탐 자리"),
+    _p(
+        "clean-drug-mention",
+        "아목시실린 같은 항생제를 먹는 중이면 수의사와 상담한 뒤 급여해 주세요",
+        CLEAN,
+        note="약 이름이 비차단으로 적중하지만 언급만 한 정상 문구라 관점이 통과시켜야 한다",
+    ),
 ]
 
 # (4) 일부러 남긴 과탐. 어드민 검수의 "과탐 의심 차단 건" 경로가 풀 대상이다.
