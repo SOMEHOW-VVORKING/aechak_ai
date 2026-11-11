@@ -46,6 +46,9 @@ KEYWORD_TABLE: tuple[tuple[str, ViolationCategory, str, str | None], ...] = (
         "급여 전 수의사와 상담해 주세요",
     ),
     ("인증", ViolationCategory.FALSE_CLAIM, "확인되지 않은 인증을 주장한다", "자체 품질 기준을 따릅니다"),
+    # 실제 약 판매를 먼저 본다. 아래 "처방" 줄이 먼저 걸리면 약 판매가 허위 표시로 나온다.
+    ("처방전 없이", ViolationCategory.PRESCRIPTION_DRUG, "처방이 필요한 의약품을 판매한다", None),
+    ("항생제", ViolationCategory.PRESCRIPTION_DRUG, "처방이 필요한 의약품을 판매한다", None),
     ("처방", ViolationCategory.FALSE_CLAIM, "의약품으로 오인될 수 있다", "수의사와 상담해 주세요"),
     ("쓰레기", ViolationCategory.DISPARAGEMENT, "다른 대상을 깎아내린다", None),
     ("싸구려", ViolationCategory.DISPARAGEMENT, "다른 상품을 깎아내린다", None),
@@ -60,6 +63,7 @@ KEYWORD_TABLE: tuple[tuple[str, ViolationCategory, str, str | None], ...] = (
     ("동 ", ViolationCategory.PII, "타인의 주소로 읽히는 표기다", None),
     ("님이", ViolationCategory.PII, "타인의 이름으로 읽히는 표기다", None),
     ("날씨", ViolationCategory.IRRELEVANT, "상품과 무관한 내용이다", None),
+    ("분양", ViolationCategory.LIVE_ANIMAL, "살아 있는 동물을 판매한다", None),
 )
 
 # 모의 선별이 ``CLEAR``를 내는 **유일한** 조건.

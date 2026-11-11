@@ -157,7 +157,7 @@ def test_접두부가_금지_예시를_인용한다() -> None:
     for example in covered:
         assert example in DRAFT_PREFIX, f"금지 예시가 접두부에 없다: {example!r}"
     # 정책 전문이 섞여 들어가지 않았는지. 분류 해설 절 제목이 있으면 전문을 붙인 것이다.
-    assert "# 위반 분류 11종" not in DRAFT_PREFIX
+    assert "# 위반 분류 13종" not in DRAFT_PREFIX
 
 
 def test_표현_하나당_한_번만_보고한다() -> None:

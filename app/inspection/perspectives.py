@@ -1,6 +1,6 @@
 """관점 정의와 툴 스키마.
 
-분류 11종을 한 프롬프트에 몰아넣지 않는다. 근거는 둘이다.
+분류 13종을 한 프롬프트에 몰아넣지 않는다. 근거는 둘이다.
 
 첫째, 긴 지시 목록에서 개별 규칙의 준수율이 떨어진다. 지시 하나당 95%를 지켜도
 열 개를 동시에 지킬 확률은 그보다 훨씬 낮아진다.
@@ -44,12 +44,13 @@ _DISPLAY_ADS = PerspectiveSpec(
         ViolationCategory.FALSE_CLAIM,
         ViolationCategory.DISPARAGEMENT,
         ViolationCategory.BANNED_INGREDIENT,
+        ViolationCategory.PRESCRIPTION_DRUG,
     ),
     question=(
         "당신의 관점은 **표시와 광고**입니다. 위 정책의 MEDICAL_CLAIM, EFFICACY_OVERCLAIM, "
-        "FALSE_CLAIM, DISPARAGEMENT, BANNED_INGREDIENT 다섯 분류만 보십시오. 효능을 어디까지 "
-        "말할 수 있는지가 판단의 핵심이고, 도움을 줄 수 있다는 표현과 치료한다는 단정을 가르는 "
-        "것이 당신의 일입니다.\n"
+        "FALSE_CLAIM, DISPARAGEMENT, BANNED_INGREDIENT, PRESCRIPTION_DRUG 여섯 분류만 보십시오. "
+        "효능을 어디까지 말할 수 있는지가 판단의 핵심이고, 도움을 줄 수 있다는 표현과 치료한다는 "
+        "단정을 가르는 것이 당신의 일입니다.\n"
         "BANNED_INGREDIENT 는 앞 단계의 사전이 이미 대부분을 차단했습니다. **사전이 차단한 것을 "
         "중복 보고하지 마십시오.** 당신이 볼 것은 사전이 글자 모양으로 잡지 못하는 것 하나입니다 -- "
         "성분명을 비틀어 지칭하거나 한글과 영문을 섞어 적은 표기, 그리고 섭취용 제품인지 "
@@ -66,10 +67,11 @@ _CONDUCT_TRADE = PerspectiveSpec(
         ViolationCategory.ABUSE,
         ViolationCategory.PII,
         ViolationCategory.IRRELEVANT,
+        ViolationCategory.LIVE_ANIMAL,
     ),
     question=(
         "당신의 관점은 **행위와 거래**입니다. 위 정책의 CONTACT_INFO, OFF_PLATFORM, SPAM, "
-        "ABUSE, PII, IRRELEVANT 여섯 분류만 보십시오. 효능 표현은 보지 마십시오. "
+        "ABUSE, PII, IRRELEVANT, LIVE_ANIMAL 일곱 분류만 보십시오. 효능 표현은 보지 마십시오. "
         "명백한 연락처는 이미 규칙이 가렸으므로, 당신은 우회 표기와 맥락상의 유도를 찾으십시오."
     ),
 )

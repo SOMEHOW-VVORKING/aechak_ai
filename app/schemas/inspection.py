@@ -30,6 +30,8 @@ class ViolationCategory(StrEnum):
     SPAM = "SPAM"
     PII = "PII"
     IRRELEVANT = "IRRELEVANT"
+    PRESCRIPTION_DRUG = "PRESCRIPTION_DRUG"
+    LIVE_ANIMAL = "LIVE_ANIMAL"
 
 
 class Perspective(StrEnum):
